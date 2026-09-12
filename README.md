@@ -153,7 +153,7 @@ Conduit takes privacy seriously:
 - **No analytics** — we don't track you
 - **Open source** — audit the code yourself
 
-Found a security vulnerability? Please report it privately to: **[Your contact email]**
+Found a security vulnerability? Please report it via [GitHub Security Advisories](https://github.com/Snehishere/Conduit/security/advisories/new).
 
 ---
 
@@ -175,10 +175,9 @@ Built with:
 
 ## Support
 
-- 📧 Email: **[Your support email]**
-- 💬 Discord: **[Your Discord server]**
-- 🐦 Twitter: **[Your Twitter]**
+- 📧 Email: **150748998+Snehishere@users.noreply.github.com**
 - 💬 Discussions: [GitHub Discussions](https://github.com/Snehishere/Conduit/discussions)
+- 🐛 Issues: [GitHub Issues](https://github.com/Snehishere/Conduit/issues)
 
 ---
 
