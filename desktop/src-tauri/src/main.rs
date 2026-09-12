@@ -8,6 +8,9 @@ mod tray;
 mod file_transfer;
 mod automation;
 mod audio;
+mod error;
+
+pub use error::{ConduitError, Result};
 
 use std::sync::Arc;
 use tokio::sync::RwLock;

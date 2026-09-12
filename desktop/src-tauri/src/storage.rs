@@ -1,8 +1,9 @@
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use crate::commands::ConduitSettings;
+use crate::error::{ConduitError, Result};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredDevice {
@@ -156,7 +157,7 @@ impl Storage {
     }
 
     pub fn save_device(&self, device: &StoredDevice) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "INSERT OR REPLACE INTO devices (id, name, device_type, os, public_key, shared_secret, paired_at, last_seen, battery, signal, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -178,7 +179,7 @@ impl Storage {
     }
 
     pub fn get_device(&self, id: &str) -> Result<Option<StoredDevice>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, device_type, os, public_key, shared_secret, paired_at, last_seen, battery, signal, status
              FROM devices WHERE id = ?1",
@@ -207,7 +208,7 @@ impl Storage {
     }
 
     pub fn get_all_devices(&self) -> Result<Vec<StoredDevice>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, device_type, os, public_key, shared_secret, paired_at, last_seen, battery, signal, status
              FROM devices ORDER BY last_seen DESC",
@@ -236,13 +237,13 @@ impl Storage {
     }
 
     pub fn delete_device(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute("DELETE FROM devices WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     pub fn save_notification(&self, p: &NotificationParams<'_>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "INSERT OR REPLACE INTO notifications (id, device_id, app, title, body, timestamp, actions)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -252,7 +253,7 @@ impl Storage {
     }
 
     pub fn get_notifications(&self, limit: i64) -> Result<Vec<StoredNotification>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT id, device_id, app, title, body, timestamp, actions, dismissed
              FROM notifications ORDER BY timestamp DESC LIMIT ?1",
@@ -278,7 +279,7 @@ impl Storage {
     }
 
     pub fn dismiss_notification(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "UPDATE notifications SET dismissed = 1 WHERE id = ?1",
             params![id],
@@ -293,7 +294,7 @@ impl Storage {
         source_device: &str,
         timestamp: i64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "INSERT INTO clipboard_history (content, mime, source_device, timestamp)
              VALUES (?1, ?2, ?3, ?4)",
@@ -314,7 +315,7 @@ impl Storage {
     }
 
     pub fn get_settings(&self) -> Result<ConduitSettings> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let default_apps = serde_json::to_string(&vec![
             "WhatsApp".to_string(),
             "Telegram".to_string(),
@@ -338,7 +339,7 @@ impl Storage {
     }
 
     pub fn save_settings(&self, settings: &ConduitSettings) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let upsert = "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)";
 
         conn.execute(upsert, params!["device_name", settings.device_name])?;
@@ -358,7 +359,7 @@ impl Storage {
     }
 
     pub fn save_file_transfer(&self, p: &FileTransferParams<'_>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "INSERT OR REPLACE INTO file_transfers (id, name, size, mime, from_device, to_device, status, chunks_received, total_chunks, saved_path, timestamp)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -374,7 +375,7 @@ impl Storage {
         chunks_received: i32,
         saved_path: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "UPDATE file_transfers SET status = ?2, chunks_received = ?3, saved_path = COALESCE(?4, saved_path) WHERE id = ?1",
             params![id, status, chunks_received, saved_path],
@@ -386,7 +387,7 @@ impl Storage {
         &self,
         rule: &crate::automation::AutomationRule,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let trigger_json = serde_json::to_string(&rule.trigger).unwrap_or_default();
         let action_json = serde_json::to_string(&rule.action).unwrap_or_default();
         let trigger_tag = crate::automation::trigger_tag(&rule.trigger);
@@ -416,7 +417,7 @@ impl Storage {
     }
 
     pub fn get_all_automation_rules(&self) -> Result<Vec<crate::automation::AutomationRule>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, enabled, trigger_type, trigger_config, action_type, action_config
              FROM automation_rules ORDER BY created_at DESC",
@@ -446,7 +447,7 @@ impl Storage {
     }
 
     pub fn delete_automation_rule(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute("DELETE FROM automation_rules WHERE id = ?1", params![id])?;
         conn.execute("DELETE FROM automation_logs WHERE rule_id = ?1", params![id])?;
         Ok(())
@@ -460,7 +461,7 @@ impl Storage {
         success: bool,
         message: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         conn.execute(
             "INSERT INTO automation_logs (rule_id, trigger_type, timestamp, success, message)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -470,7 +471,7 @@ impl Storage {
     }
 
     pub fn get_automation_logs(&self, limit: i64) -> Result<Vec<crate::automation::RuleExecutionLog>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT rule_id AS id, trigger_type, timestamp, success, message
              FROM automation_logs ORDER BY timestamp DESC LIMIT ?1",
@@ -493,7 +494,7 @@ impl Storage {
     }
 
     pub fn get_file_transfers(&self, limit: i64) -> Result<Vec<crate::file_transfer::FileTransferInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| ConduitError::LockPoisoned(format!("Storage lock poisoned: {}", e)))?;
         let mut stmt = conn.prepare(
             "SELECT id, name, size, mime, from_device, to_device, status, chunks_received, total_chunks, saved_path, timestamp
              FROM file_transfers ORDER BY timestamp DESC LIMIT ?1",

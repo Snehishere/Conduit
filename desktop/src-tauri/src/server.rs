@@ -68,7 +68,7 @@ impl WsServer {
             Ok(a) => a,
             Err(e) => {
                 error!("Invalid WS address, falling back to 0.0.0.0:9527: {}", e);
-                "0.0.0.0:9527".parse().expect("fallback address invalid")
+                "0.0.0.0:9527".parse().unwrap() // guaranteed valid
             }
         };
         let clients: Clients = Arc::new(RwLock::new(HashMap::new()));

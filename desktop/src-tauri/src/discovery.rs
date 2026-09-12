@@ -53,7 +53,7 @@ impl DiscoveryService {
                     .to_string_lossy()
                     .to_string();
 
-                let service_info = ServiceInfo::new(
+                let service_info = match ServiceInfo::new(
                     &format!("{}.{}", SERVICE_TYPE, SERVICE_DOMAIN),
                     &format!("conduit-{}", &self.device_id[..8.min(self.device_id.len())]),
                     &format!("{}.{}", hostname, SERVICE_DOMAIN),
@@ -64,8 +64,13 @@ impl DiscoveryService {
                         ("device_type".to_string(), "desktop".to_string()),
                         ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
                     ]),
-                )
-                .expect("Failed to create service info");
+                ) {
+                    Ok(info) => info,
+                    Err(e) => {
+                        error!("Failed to create mDNS service info: {}", e);
+                        return;
+                    }
+                };
 
                 match mdns.register(service_info) {
                     Ok(_) => {
