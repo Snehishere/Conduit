@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Conduit</string>
+    <string name="accessibility_service_description">Conduit uses this to receive remote input from your desktop device. This allows your phone to be controlled remotely for screen mirroring and remote input features.</string>
+</resources>

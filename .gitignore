@@ -1,0 +1,78 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+.pnpm-debug.log*
+*.log
+
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+*.g.dart
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tauri
+src-tauri/target/
+
+# Build artifacts
+*.apk
+*.ipa
+*.exe
+*.dmg
+*.app
+*.deb
+*.rpm
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+logs/
+
+# Development
+*.local
+.cache/
+
+# Android
+android/local.properties
+android/.gradle/
+android/captures/
+android/gradlew
+android/gradlew.bat
+
+# iOS
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+
+# Project specific
+progress-tracker-free.html
+Screenshot*.png
