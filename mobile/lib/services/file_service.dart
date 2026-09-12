@@ -62,8 +62,18 @@ class FileService extends ChangeNotifier {
   final List<FileTransfer> _transfers = [];
   String? _deviceId;
   void Function(Map<String, dynamic>)? _sendMessage;
+  Function(String)? _onError;
 
   List<FileTransfer> get transfers => List.unmodifiable(_transfers);
+
+  void onError(Function(String) callback) {
+    _onError = callback;
+  }
+
+  void _handleError(String message) {
+    debugPrint('[FileService] Error: $message');
+    _onError?.call(message);
+  }
 
   void setDeviceId(String id) {
     _deviceId = id;
@@ -83,7 +93,7 @@ class FileService extends ChangeNotifier {
   Future<void> sendFile(String targetDeviceId, String filePath) async {
     final file = File(filePath);
     if (!await file.exists()) {
-      debugPrint('File does not exist: $filePath');
+      _handleError('File does not exist: $filePath');
       return;
     }
 
@@ -284,7 +294,7 @@ class FileService extends ChangeNotifier {
     } catch (e) {
       transfer.status = TransferStatus.failed;
       notifyListeners();
-      debugPrint('Failed to reassemble file: $e');
+      _handleError('Failed to save file: $e');
     }
   }
 

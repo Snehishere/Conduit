@@ -47,10 +47,20 @@ class CallService extends ChangeNotifier {
   bool _initialized = false;
   StreamSubscription? _callSubscription;
   void Function(Map<String, dynamic>)? _sendMessage;
+  Function(String)? _onError;
 
   CallState get state => _state;
   CallEvent? get currentCall => _currentCall;
   AudioOutputRoute get currentRoute => _currentRoute;
+
+  void onError(Function(String) callback) {
+    _onError = callback;
+  }
+
+  void _handleError(String message) {
+    debugPrint('[CallService] Error: $message');
+    _onError?.call(message);
+  }
 
   void setSendFunction(void Function(Map<String, dynamic>) sendFn) {
     _sendMessage = sendFn;
@@ -93,12 +103,12 @@ class CallService extends ChangeNotifier {
           }
         },
         onError: (error) {
-          debugPrint('Call event stream error: $error');
+          _handleError('Call event stream error: $error');
         },
       );
       debugPrint('CallService initialized with native listener');
     } catch (e) {
-      debugPrint('Failed to initialize CallService: $e');
+      _handleError('Failed to initialize CallService: $e');
     }
   }
 

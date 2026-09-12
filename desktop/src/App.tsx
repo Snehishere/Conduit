@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { Toaster } from 'react-hot-toast';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import TitleBar from './components/layout/TitleBar';
 import Sidebar from './components/layout/Sidebar';
 import StatusBar from './components/layout/StatusBar';
@@ -209,8 +211,29 @@ function App() {
   ).length;
 
   return (
-    <div className="app">
-      <TitleBar />
+    <ErrorBoundary fallback={(error, reset) => (
+      <div style={{ padding: '40px', textAlign: 'center' }}>
+        <h1 style={{ color: '#ff4444' }}>Application Error</h1>
+        <p style={{ color: '#666' }}>{error.message}</p>
+        <button
+          onClick={reset}
+          style={{
+            padding: '12px 24px',
+            backgroundColor: '#1976d2',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '16px'
+          }}
+        >
+          Restart Application
+        </button>
+      </div>
+    )}>
+      <Toaster position="top-right" />
+      <div className="app">
+        <TitleBar />
       <div className="app-drag-region" />
       <div className="app-content">
         <Sidebar
@@ -345,7 +368,8 @@ function App() {
         onDrop={handleFileDrop}
         onClose={() => setShowDropZone(false)}
       />
-    </div>
+      </div>
+    </ErrorBoundary>
   );
 }
 

@@ -117,7 +117,10 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
         actions: [
           Consumer<WebSocketService>(
-            builder: (_, ws, __) => ConnectionStatus(connected: ws.isConnected),
+            builder: (_, ws, __) => ConnectionStatus(
+              connected: ws.isConnected,
+              lastError: ws.lastError,
+            ),
           ),
           IconButton(
             icon: const Icon(Icons.settings_outlined, color: Color(0xFF9A96A4)),

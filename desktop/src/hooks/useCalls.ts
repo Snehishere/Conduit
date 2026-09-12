@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { showError } from '../lib/toast';
 
 export type CallStatus = 'idle' | 'ringing' | 'active' | 'ended';
 
@@ -111,7 +112,11 @@ export function useCalls(sendMessage?: (msg: Record<string, unknown>) => void) {
 
   const answerCall = useCallback(() => {
     if (activeCall) {
-      sendMessage?.({ type: 'call', action: 'answer', call_id: activeCall.call_id });
+      if (!sendMessage) {
+        showError('Cannot answer call: Not connected to device');
+        return;
+      }
+      sendMessage({ type: 'call', action: 'answer', call_id: activeCall.call_id });
       setActiveCall((prev) =>
         prev ? { ...prev, status: 'active', start_time: Math.floor(Date.now() / 1000) } : prev
       );
@@ -120,14 +125,22 @@ export function useCalls(sendMessage?: (msg: Record<string, unknown>) => void) {
 
   const rejectCall = useCallback(() => {
     if (activeCall) {
-      sendMessage?.({ type: 'call', action: 'reject', call_id: activeCall.call_id });
+      if (!sendMessage) {
+        showError('Cannot reject call: Not connected to device');
+        return;
+      }
+      sendMessage({ type: 'call', action: 'reject', call_id: activeCall.call_id });
       setActiveCall(null);
     }
   }, [activeCall, sendMessage]);
 
   const endCall = useCallback(() => {
     if (activeCall) {
-      sendMessage?.({ type: 'call', action: 'end', call_id: activeCall.call_id });
+      if (!sendMessage) {
+        showError('Cannot end call: Not connected to device');
+        return;
+      }
+      sendMessage({ type: 'call', action: 'end', call_id: activeCall.call_id });
       const ended = { ...activeCall, status: 'ended' as CallStatus, end_time: Math.floor(Date.now() / 1000) };
       setCallHistory((h) => [ended, ...h].slice(0, 50));
       setActiveCall(null);
@@ -136,22 +149,38 @@ export function useCalls(sendMessage?: (msg: Record<string, unknown>) => void) {
 
   const forwardCall = useCallback((toDeviceId: string) => {
     if (activeCall) {
-      sendMessage?.({ type: 'call', action: 'forward', call_id: activeCall.call_id, to_device_id: toDeviceId });
+      if (!sendMessage) {
+        showError('Cannot forward call: Not connected to device');
+        return;
+      }
+      sendMessage({ type: 'call', action: 'forward', call_id: activeCall.call_id, to_device_id: toDeviceId });
     }
   }, [activeCall, sendMessage]);
 
   const setAudioRoute = useCallback((route: 'phone' | 'desktop' | 'bluetooth') => {
+    if (!sendMessage) {
+      showError('Cannot change audio route: Not connected');
+      return;
+    }
     setCurrentRoute(route);
-    sendMessage?.({ type: 'audio', action: 'route', route });
+    sendMessage({ type: 'audio', action: 'route', route });
   }, [sendMessage]);
 
   const startAudioStream = useCallback(() => {
-    sendMessage?.({ type: 'audio', action: 'stream_start' });
+    if (!sendMessage) {
+      showError('Cannot start audio stream: Not connected');
+      return;
+    }
+    sendMessage({ type: 'audio', action: 'stream_start' });
     setIsStreaming(true);
   }, [sendMessage]);
 
   const stopAudioStream = useCallback(() => {
-    sendMessage?.({ type: 'audio', action: 'stream_stop' });
+    if (!sendMessage) {
+      showError('Cannot stop audio stream: Not connected');
+      return;
+    }
+    sendMessage({ type: 'audio', action: 'stream_stop' });
     setIsStreaming(false);
   }, [sendMessage]);
 

@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import { showError, showSuccess } from '../lib/toast';
 
 interface FileTransfer {
   id: string;
@@ -47,7 +48,8 @@ export function useFiles() {
       const result = await invoke<FileTransfer[]>('get_file_transfers', { limit: 50 });
       setTransfers(result);
     } catch (err) {
-      console.error('Failed to load file transfers:', err);
+      console.error('[useFiles] Failed to load file transfers:', err);
+      showError('Failed to load file transfers');
     }
   }, []);
 
@@ -82,9 +84,12 @@ export function useFiles() {
         ...prev,
       ]);
 
+      showSuccess(`File transfer started: ${result.name}`);
       return result.transfer_id;
     } catch (err) {
-      console.error('Failed to send file:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[useFiles] Failed to send file:', err);
+      showError(`Failed to send file: ${message}`);
       return null;
     }
   }, []);
@@ -95,8 +100,11 @@ export function useFiles() {
       setTransfers((prev) =>
         prev.map((t) => (t.id === id ? { ...t, status: 'transferring' } : t))
       );
+      showSuccess('Transfer accepted');
     } catch (err) {
-      console.error('Failed to accept transfer:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[useFiles] Failed to accept transfer:', err);
+      showError(`Failed to accept transfer: ${message}`);
     }
   }, []);
 
@@ -108,8 +116,11 @@ export function useFiles() {
       );
       setActiveTransferId((prev) => (prev === id ? null : prev));
       setActiveProgress(0);
+      showSuccess('Transfer cancelled');
     } catch (err) {
-      console.error('Failed to cancel transfer:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[useFiles] Failed to cancel transfer:', err);
+      showError(`Failed to cancel transfer: ${message}`);
     }
   }, []);
 
@@ -130,8 +141,11 @@ export function useFiles() {
       setTransfers((prev) =>
         prev.map((t) => (t.id === id ? { ...t, status: 'transferring', chunks_received: result.chunks_loaded } : t))
       );
+      showSuccess('Transfer resumed');
     } catch (err) {
-      console.error('Failed to resume transfer:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[useFiles] Failed to resume transfer:', err);
+      showError(`Failed to resume transfer: ${message}`);
     }
   }, [transfers]);
 
@@ -140,7 +154,9 @@ export function useFiles() {
       const { open } = await import('@tauri-apps/plugin-shell');
       await open(path);
     } catch (err) {
-      console.error('Failed to open file:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[useFiles] Failed to open file:', err);
+      showError(`Failed to open file: ${message}`);
     }
   }, []);
 

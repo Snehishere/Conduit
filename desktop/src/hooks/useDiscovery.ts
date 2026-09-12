@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { showError } from '../lib/toast';
 
 interface DiscoveredDevice {
   id: string;

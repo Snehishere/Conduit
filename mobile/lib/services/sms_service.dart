@@ -62,9 +62,19 @@ class SmsService extends ChangeNotifier {
   bool _hasPermission = false;
   bool _initialized = false;
   void Function(Map<String, dynamic>)? _sendMessage;
+  Function(String)? _onError;
 
   List<SmsThread> get threads => _threads;
   bool get hasPermission => _hasPermission;
+
+  void onError(Function(String) callback) {
+    _onError = callback;
+  }
+
+  void _handleError(String message) {
+    debugPrint('[SmsService] Error: $message');
+    _onError?.call(message);
+  }
 
   void setSendFunction(void Function(Map<String, dynamic>) sendFn) {
     _sendMessage = sendFn;
@@ -81,10 +91,12 @@ class SmsService extends ChangeNotifier {
 
       if (_hasPermission) {
         await loadThreads();
+      } else {
+        _handleError('SMS permission denied. Please enable SMS access in Settings.');
       }
       _initialized = true;
     } catch (e) {
-      debugPrint('Failed to initialize SMS: $e');
+      _handleError('Failed to initialize SMS: $e');
     }
   }
 
@@ -131,7 +143,7 @@ class SmsService extends ChangeNotifier {
       _threads.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       notifyListeners();
     } catch (e) {
-      debugPrint('Failed to load SMS threads: $e');
+      _handleError('Failed to load SMS threads: $e');
     }
   }
 
@@ -190,7 +202,7 @@ class SmsService extends ChangeNotifier {
       }
       return false;
     } catch (e) {
-      debugPrint('Failed to send SMS: $e');
+      _handleError('Failed to send SMS: $e');
       return false;
     }
   }

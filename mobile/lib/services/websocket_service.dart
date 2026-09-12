@@ -8,6 +8,7 @@ typedef MessageHandler = void Function(Map<String, dynamic> message);
 class WebSocketService extends ChangeNotifier {
   WebSocketChannel? _channel;
   bool _isConnected = false;
+  String? _lastError;
   String? _deviceName;
   String? _deviceId;
   Timer? _reconnectTimer;
@@ -16,6 +17,7 @@ class WebSocketService extends ChangeNotifier {
   final List<Map<String, dynamic>> _connectedDevices = [];
 
   bool get isConnected => _isConnected;
+  String? get lastError => _lastError;
   String? get deviceName => _deviceName;
   String? get deviceId => _deviceId;
   List<Map<String, dynamic>> get connectedDevices => List.unmodifiable(_connectedDevices);
@@ -48,6 +50,7 @@ class WebSocketService extends ChangeNotifier {
       await _channel!.ready;
 
       _isConnected = true;
+      _lastError = null;
       _reconnectAttempts = 0;
       notifyListeners();
 
@@ -68,6 +71,7 @@ class WebSocketService extends ChangeNotifier {
         },
         onError: (e) {
           debugPrint('WS stream error: $e');
+          _lastError = 'Connection lost: $e';
           _isConnected = false;
           _connectedDevices.clear();
           notifyListeners();
@@ -85,6 +89,7 @@ class WebSocketService extends ChangeNotifier {
       });
     } catch (e) {
       debugPrint('WebSocket error: $e');
+      _lastError = 'Connection failed: $e';
       _isConnected = false;
       notifyListeners();
       _scheduleReconnect(url);

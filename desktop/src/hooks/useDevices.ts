@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
+import { showError, showSuccess } from '../lib/toast';
 
 interface Device {
   id: string;
@@ -19,23 +20,33 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
 export function useDevices() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedDevice, setSelectedDevice] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const refreshDevices = useCallback(async () => {
     try {
+      setError(null);
       const result = await invoke<Device[]>('get_devices');
       setDevices(result);
     } catch (err) {
-      console.error('Failed to refresh devices:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      console.error('[useDevices] Failed to refresh devices:', err);
+      showError(`Failed to refresh devices: ${message}`);
     }
   }, []);
 
   const removeDevice = useCallback(async (id: string) => {
     try {
+      setError(null);
       await invoke('delete_paired_device', { id });
       setDevices((prev) => prev.filter((d) => d.id !== id));
       if (selectedDevice === id) setSelectedDevice(null);
+      showSuccess('Device removed successfully');
     } catch (err) {
-      console.error('Failed to remove device:', err);
+      const message = err instanceof Error ? err.message : String(err);
+      setError(message);
+      console.error('[useDevices] Failed to remove device:', err);
+      showError(`Failed to remove device: ${message}`);
     }
   }, [selectedDevice]);
 
@@ -45,5 +56,5 @@ export function useDevices() {
     return () => clearInterval(interval);
   }, [refreshDevices]);
 
-  return { devices, selectedDevice, setSelectedDevice, refreshDevices, removeDevice };
+  return { devices, selectedDevice, setSelectedDevice, refreshDevices, removeDevice, error };
 }

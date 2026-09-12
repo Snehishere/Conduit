@@ -32,8 +32,16 @@ Future<void> _broadcastBattery(WebSocketService ws) async {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  final encryptionService = EncryptionService();
-  await encryptionService.initialize();
+  // Global Flutter error handler
+  FlutterError.onError = (FlutterErrorDetails details) {
+    FlutterError.presentError(details);
+    debugPrint('[FATAL] Flutter error: ${details.exception}');
+    // In a real app, we'd log to Sentry/Firebase here
+  };
+
+  runZonedGuarded(() async {
+    final encryptionService = EncryptionService();
+    await encryptionService.initialize();
 
   final websocketService = WebSocketService();
   final notificationService = NotificationService();
@@ -293,4 +301,8 @@ void main() async {
       child: const ConduitApp(),
     ),
   );
+  }, (error, stack) {
+    debugPrint('[FATAL] Unhandled error in zone: $error');
+    debugPrint('[FATAL] Stack trace: $stack');
+  });
 }

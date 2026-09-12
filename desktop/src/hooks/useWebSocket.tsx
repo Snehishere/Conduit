@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, createContext, useContext, ReactNode } from 'react';
+import { showError } from '../lib/toast';
 
 interface Notification {
   id: string;
@@ -48,7 +49,8 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
       }>>('get_notifications', { limit: 50 });
       setNotifications(stored);
     } catch (err) {
-      console.error('Failed to load notifications:', err);
+      console.error('[useWebSocket] Failed to load notifications:', err);
+      showError('Failed to load notifications');
     }
   }, []);
 
@@ -96,7 +98,7 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
             typeHandlers.forEach(handler => handler(data));
           }
         } catch (err) {
-          console.error('WS: failed to parse message', err);
+          console.error('[useWebSocket] Failed to parse message:', err);
         }
       };
 
@@ -112,7 +114,8 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
         try { ws.close(); } catch { /* ignore */ }
       };
     } catch (err) {
-      console.error('WS: connection failed', err);
+      console.error('[useWebSocket] Connection failed:', err);
+      showError('WebSocket connection failed');
       scheduleReconnect();
     }
   }, [loadNotifications, scheduleReconnect]);

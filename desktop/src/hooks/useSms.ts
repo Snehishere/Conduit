@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { showError } from '../lib/toast';
 
 export interface SmsMessage {
   id: string;
@@ -95,7 +96,11 @@ export function useSms(sendMessage?: (msg: Record<string, unknown>) => void) {
   }, []);
 
   const sendMessageFn = useCallback((to: string, body: string) => {
-    sendMessage?.({ type: 'sms', action: 'send', to, body });
+    if (!sendMessage) {
+      showError('Cannot send SMS: not connected');
+      return;
+    }
+    sendMessage({ type: 'sms', action: 'send', to, body });
   }, [sendMessage]);
 
   const markRead = useCallback((threadId: string) => {
