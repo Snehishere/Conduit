@@ -1,0 +1,9 @@
+# Pinned so the toolchain cannot drift underneath a build that is already
+# fragile. See docs/DEVELOPMENT.md and the OpenSSL vendoring note in
+# README.md - the desktop crate cannot build on a fresh clone without
+# .tools/openssl-win64, and `cargo update` on a different toolchain can
+# silently change the musl/glibc baseline that SQLCipher links against.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

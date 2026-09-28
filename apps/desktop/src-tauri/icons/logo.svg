@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Conduit">
+  <title>Conduit</title>
+  <!-- GENERATED from assets/brand/conduit.mark.json by scripts/icons/build_icons.py. Do not edit. -->
+  <defs><linearGradient id="conduit-plate" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#11141B"/><stop offset="1" stop-color="#0B0C10"/></linearGradient></defs>
+  <rect width="512" height="512" rx="110.592" fill="url(#conduit-plate)"/>
+  <polygon points="16,172 208,172 208,52 16,52" fill="#00F0FF"/>
+  <polygon points="151.421,131.969 247.421,403.969 360.579,364.031 264.579,92.031" fill="#00F0FF"/>
+  <polygon points="304,444 496,444 496,324 304,324" fill="#00F0FF"/>
+  <circle cx="208" cy="112" r="60" fill="#00F0FF"/>
+  <circle cx="304" cy="384" r="60" fill="#00F0FF"/>
+</svg>

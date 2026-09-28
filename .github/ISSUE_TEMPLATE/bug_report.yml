@@ -1,0 +1,220 @@
+name: Bug report
+description: Something in Conduit does not work as documented. For feature ideas use the feature request form; for anything security-related read the note at the bottom first.
+title: "[bug] "
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing this. The more precisely you can answer the first
+        four questions, the faster it can be reproduced and fixed.
+
+        **Do not file a security vulnerability here.** If this report is
+        exploitable, or reveals a private key, a relay token or a plaintext
+        message, stop and read `SECURITY.md` in the repository root first.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Which component is broken?
+      description: |
+        Desktop = the Tauri app. Mobile = the Flutter app.
+        Protocol = the shared wire format, where a bug means the two
+        clients disagree about a message. Pick the lowest layer that is
+        actually at fault.
+      options:
+        - Desktop app (Tauri, React frontend)
+        - Mobile app (Flutter)
+        - Relay server (self-hosted, services/relay)
+        - Shared protocol (packages/protocol)
+        - Documentation
+        - Something else
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Which platform?
+      description: |
+        The desktop app runs on Windows, macOS and Linux.
+        The mobile app runs on Android and iOS.
+        If both ends are involved, pick the platform of the side that
+        misbehaved.
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Android
+        - iOS
+        - Other / not applicable
+    validations:
+      required: true
+
+  - type: input
+    id: desktop-version
+    attributes:
+      label: Desktop app version
+      description: |
+        From the desktop app's Settings, or `conduit --version` if your
+        build supports it. Leave blank if you are not using the desktop app.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: input
+    id: mobile-version
+    attributes:
+      label: Mobile app version
+      description: |
+        The version shown in the mobile app's settings screen, or the
+        version string in the build you installed. Leave blank if you are
+        not using the mobile app.
+      placeholder: "0.1.0+1"
+    validations:
+      required: false
+
+  - type: input
+    id: relay-version
+    attributes:
+      label: Relay version
+      description: |
+        The `relay` binary version, or the image tag if you deployed the
+        container. Leave blank if you are not running a relay.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: relay-deployment
+    attributes:
+      label: How are you connecting the two devices?
+      description: |
+        Conduit pairs over the local network by default. A relay is
+        optional and only needed to cross networks.
+      options:
+        - Direct, over the local network (no relay)
+        - Through a self-hosted relay
+        - Not paired yet
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+      description: |
+        One or two sentences. If the documentation or the app's own UI
+        promised something specific, quote it.
+      placeholder: |
+        Selecting "Send file" on the phone should queue the file and show
+        progress on the desktop.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+      description: |
+        What you actually observed, including whether it failed silently,
+        failed loudly, or produced a wrong result. A wrong result is more
+        useful than a stack trace here.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Numbered, starting from a freshly launched pair if possible. Note
+        anything that had to be configured first: permissions granted on
+        the phone, a relay token, a pinned certificate.
+      placeholder: |
+        1. Launch the desktop app and pair with the phone over the local network
+        2. On the phone, open Files and pick a 40 MB file
+        3. Tap Send
+        4. Desktop shows "Transfer failed: connection reset" after ~2 seconds
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      description: |
+        "Only once" is worth filing, but say so, because it changes where
+        we look.
+      options:
+        - Every time
+        - Sometimes (more than one in ten attempts)
+        - Rarely (less than one in ten attempts)
+        - Only happened once
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: |
+        Where to find it:
+
+        - **Desktop app**: logs to stderr and, in parallel, to a file.
+          The file is `<data dir>/conduit/logs/conduit.log` - on Windows
+          `%APPDATA%\conduit\logs\conduit.log`, on macOS
+          `~/Library/Application Support/conduit/logs/conduit.log`, on
+          Linux `~/.local/share/conduit/logs/conduit.log`. Set `RUST_LOG`
+          to `debug` to get more. Paste the surrounding 50 lines or so,
+          not the whole file.
+        - **Relay**: logs to stdout, so they land wherever your process
+          manager sends them. Set `RUST_LOG=debug` for more.
+        - **Mobile app**: logs to stdout through `debugPrint`. Use
+          `flutter run` output, or `adb logcat` on a debug Android build.
+          A release build on iOS will not give you much.
+
+        If there is no log for your platform yet, say "none available"
+        rather than leaving this blank. That is itself useful information.
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or screen recordings
+      description: |
+        Optional, and for the mobile app a screenshot of the phone's screen
+        is usually the fastest route to a diagnosis - layout problems,
+        permission dialogs and stuck states are all obvious visually and
+        invisible in a log.
+
+        **Redact anything personal before you attach it.** Phone screens
+        contain notification content, contact names, message text, file
+        names and home-screen apps. Blur or crop them. Never attach a
+        screenshot that shows a QR code, a pairing code or a relay token.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Before filing
+      options:
+        - label: I searched the existing open and closed issues for this.
+        - label: I am on the current release, not an older build.
+        - label: I have redacted personal data from anything I attached.
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+        **Security reports.** If what you found is a vulnerability rather
+        than a bug, do not use this form. `SECURITY.md` in the repository
+        root describes how to report privately and what happens next,
+        including how long you get before details are published.

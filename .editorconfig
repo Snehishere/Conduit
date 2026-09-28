@@ -1,0 +1,31 @@
+# Added after a PowerShell round-trip silently converted
+# apps/desktop/src-tauri/src/commands/settings.rs from CRLF to LF, which
+# made git see a 1343-line rewrite of an 8-line change. That is the kind
+# of diff-noise that hides a real change, so the convention is pinned here.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json,jsonc,md,ts,tsx,js,mjs,css,html}]
+indent_size = 2
+
+[*.py]
+indent_size = 4
+
+[Makefile]
+indent_style = tab
+
+# Generated artifacts - not hand-edited. See docs/DEVELOPMENT.md.
+[apps/desktop/src/types/websocket.ts]
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+
+[apps/mobile/lib/models/protocol.dart]
+insert_final_newline = unset
+trim_trailing_whitespace = unset

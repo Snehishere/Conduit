@@ -1,0 +1,13 @@
+# Conduit rustfmt configuration.
+#
+# Intentionally minimal. The workspace mixes editions - apps/desktop/src-tauri
+# and services/relay are edition 2024, packages/protocol is edition 2021 - and
+# setting `style_edition` here at the root applies to EVERY crate, which
+# reformats the 2021 crate against rules it was not written for.
+#
+# Do NOT add `style_edition` to this file. If a specific crate ever needs a
+# different one, put a `rustfmt.toml` next to that crate's Cargo.toml instead.
+#
+# `cargo fmt --all -- --check` is enforced in CI (.github/workflows/ci.yml)
+# and by scripts/lint-all.ps1.
+edition = "2021"

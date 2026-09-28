@@ -1,0 +1,19 @@
+[package]
+name = "conduit-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Shared wire protocol types for Conduit desktop, mobile, and relay"
+license = "MIT"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = "1"
+hmac = "0.12"
+sha2 = "0.10"
+hex = { workspace = true }
+subtle = "2"
+log = { workspace = true }
+
+[dev-dependencies]
+jsonschema = "0.57.0"

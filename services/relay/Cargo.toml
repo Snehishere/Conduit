@@ -1,0 +1,28 @@
+[package]
+name = "relay"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+tokio-test = "0.4"
+serial_test = "3"
+
+[dependencies]
+env_logger = { workspace = true }
+futures-util = { workspace = true }
+conduit-protocol = { path = "../../packages/protocol" }
+hex = { workspace = true }
+hyper = { version = "1.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+log = { workspace = true }
+rand = "0.8"
+rcgen = "0.13"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = "2"
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = "0.24"
+tungstenite = "0.24"

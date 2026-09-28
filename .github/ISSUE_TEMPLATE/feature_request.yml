@@ -1,0 +1,145 @@
+name: Feature request
+description: Propose a capability Conduit does not have yet. For reporting something that is broken or misbehaving, use the bug report form instead.
+title: "[feature] "
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Features get read most carefully when they describe the problem
+        rather than the solution. The "problem" and "alternatives"
+        sections below are the ones that actually change what happens next.
+
+        This is a solo-maintained project with a small contributor base.
+        A request that fits the existing architecture and needs no wire
+        format change is far more likely to land than one that does.
+        Saying which you think yours is helps nobody guess wrong.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: |
+        Describe the situation you are in and what you cannot do today.
+        Concrete beats abstract: "I need to send a file from my phone
+        before a meeting and currently have to cable it" tells us more than
+        "file transfer needs work".
+      placeholder: |
+        When I am at my desk I want to move a file off my phone without
+        picking it up. Today the only options are a cable or a chat app
+        that needs the internet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed
+    attributes:
+      label: What would you like Conduit to do instead?
+      description: |
+        A sketch is fine. Do not worry about matching the existing code's
+        shape - that is a discussion for review, not a precondition for
+        asking.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?
+      description: |
+        Other apps, workarounds, or a reason you built it yourself. If an
+        existing tool already does this well, knowing that is useful - it
+        may point at a different feature entirely, or at nothing.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which app would this change?
+      description: |
+        Pick the narrowest scope that would actually be useful to you. A
+        single-app change is much easier to review and ship than one that
+        has to land everywhere.
+      options:
+        - Desktop app only
+        - Mobile app only
+        - Both apps
+        - Relay server only
+        - Does not apply
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol-change
+    attributes:
+      label: Does this need a change to the shared protocol?
+      description: |
+        The wire format lives in `packages/protocol/src/types.rs`. A new
+        message type, a new field on an existing message, or a changed
+        meaning for an existing field all need it.
+
+        If it does, the change is not just the Rust: `schema.json` has to
+        be updated and the clients regenerated with `npm run generate` in
+        `apps/desktop`, which rewrites both
+        `src/types/websocket.ts` and
+        `../mobile/lib/models/protocol.dart`. A request that skips that
+        step produces TypeScript that type-checks and is wrong, which is
+        the exact class of defect the codegen drift gate in CI exists to
+        catch.
+
+        A protocol change is a compatibility decision, not just a code
+        change: an older client will be talking to a newer one, and the
+        protocol version may need to move. If you are not sure, say
+        "unsure" - that is a perfectly good answer and it is a question we
+        would want answered anyway.
+      options:
+        - No, it is entirely within one app
+        - Yes, it needs a new message type
+        - Yes, it changes an existing message or field
+        - Yes, it changes how messages are signed or encrypted
+        - Unsure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Are you willing to implement this?
+      description: |
+        Not a commitment, and a "no" is a perfectly good answer. It is the
+        single most useful signal for prioritising, so answer honestly
+        rather than optimistically.
+      options:
+        - Yes, I would like to implement it
+        - I could, with guidance
+        - No, I am proposing it for someone else
+    validations:
+      required: true
+
+  - type: textarea
+    id: duplicate-check
+    attributes:
+      label: Have you searched for an existing request?
+      description: |
+        Search the open **and** closed issues, including pull requests, for
+        the problem and not just the feature name. Then tell us what you
+        found here, including "nothing, I believe this is new".
+
+        If it is a duplicate, say so and link it. That is not a rejected
+        report; it is the most useful thing you can add to an old thread.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: fit
+    attributes:
+      label: Scope check
+      options:
+        - label: This is a feature, not a bug report. Anything that is broken goes in the bug form.
+        - label: I have searched open and closed issues and pull requests for this.
+        - label: If this needs a protocol change, I have said so above and understand that both clients must change together.
+    validations:
+      required: true

@@ -1,0 +1,772 @@
+use log::{error, info, warn};
+use serde_json::Value;
+
+use conduit_protocol::types::*;
+
+use super::{WsContext, broadcast_to_others};
+
+/// Enforce `auto_accept_files` on an inbound file request.
+///
+/// The desktop hub is a potential *receiver* as well as a relay, so a paired
+/// device can push files at it. With `auto_accept_files` on, the transfer is
+/// started immediately and the request is relayed as usual. With it off, the
+/// hub declines the transfer, does not buffer a single chunk, and tells the
+/// sender why (`file_accept_disabled`) instead of leaving it waiting for an ack
+/// that will never come.
+///
+/// `sync_files` is enforced one layer up, in `WsServer::handle_message`.
+pub async fn handle_file_request(msg: Value, client_id: &str, ctx: &WsContext) {
+    if !auto_accept_files_enabled(ctx).await {
+        let name = msg
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        warn!(
+            "File request from {} for '{}' declined: the auto_accept_files setting is off",
+            client_id, name
+        );
+        let err = ErrorMessage {
+            msg_type: "error".into(),
+            code: "file_accept_disabled".into(),
+            message: format!(
+                "This device does not auto-accept files; '{}' was declined (auto_accept_files is off in Settings)",
+                name
+            ),
+            server_version: Some(PROTOCOL_VERSION),
+        };
+        let err = serde_json::to_string(&err).expect("ErrorMessage serializes");
+        let clients_lock = ctx.clients.read().await;
+        if let Some(tx) = clients_lock.get(client_id) {
+            let _ = tx.send(err);
+        }
+        return;
+    }
+
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = msg
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let size = msg.get("size").and_then(|v| v.as_i64()).unwrap_or(0) as u64;
+    let mime = msg
+        .get("mime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/octet-stream");
+    let from = msg.get("from").and_then(|v| v.as_str()).unwrap_or("");
+    let checksum = msg
+        .get("checksum")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    ctx.file_engine
+        .start_incoming(id, name, size, mime, from, checksum)
+        .await;
+
+    let to = msg.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    let clients_lock = ctx.clients.read().await;
+    if to.is_empty() {
+        for (cid, client_tx) in clients_lock.iter() {
+            if cid != client_id {
+                let _ = client_tx.send(msg.to_string());
+            }
+        }
+    } else if let Some(client_tx) = clients_lock.get(to) {
+        let _ = client_tx.send(msg.to_string());
+    }
+}
+
+pub async fn handle_binary_message(bytes: Vec<u8>, client_id: &str, ctx: &WsContext) {
+    let stable_id = ctx
+        .ws_to_device_id
+        .read()
+        .await
+        .get(client_id)
+        .cloned()
+        .unwrap_or_default();
+    let shared_secret = if let Some(client) = ctx.sync_engine.read().await.get_client(&stable_id) {
+        client.shared_secret.clone()
+    } else {
+        warn!(
+            "Received binary message but no shared secret found for {}",
+            client_id
+        );
+        return;
+    };
+
+    if bytes.len() < CHUNK_HEADER_LEN {
+        warn!("Binary message too short from {}", client_id);
+        return;
+    }
+
+    let nonce = &bytes[0..CHUNK_NONCE_LEN];
+    let json_len =
+        u32::from_le_bytes(bytes[CHUNK_NONCE_LEN..CHUNK_HEADER_LEN].try_into().unwrap()) as usize;
+
+    if bytes.len() < CHUNK_HEADER_LEN + json_len {
+        warn!("Binary message metadata length mismatch from {}", client_id);
+        return;
+    }
+
+    let metadata_bytes = &bytes[CHUNK_HEADER_LEN..CHUNK_HEADER_LEN + json_len];
+    let ciphertext = &bytes[CHUNK_HEADER_LEN + json_len..];
+
+    let metadata: BinaryFileMetadata = match serde_json::from_slice(metadata_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                "Failed to parse metadata in binary message from {}: {}",
+                client_id, e
+            );
+            return;
+        }
+    };
+    let total = u64::from(metadata.total.unwrap_or(1));
+
+    match ctx
+        .encryption
+        .decrypt_binary(&shared_secret, nonce, ciphertext)
+    {
+        Ok(chunk_data) => {
+            match ctx
+                .file_engine
+                .receive_chunk_binary(&metadata.id, metadata.index, &chunk_data)
+                .await
+            {
+                Ok(received) => {
+                    if ctx.file_engine.is_complete(&metadata.id).await {
+                        match ctx.file_engine.finalize_incoming(&metadata.id).await {
+                            Ok(path) => {
+                                info!("File transfer complete: {}", path);
+                                let complete_msg = FileComplete {
+                                    msg_type: "file".into(),
+                                    action: "complete".into(),
+                                    id: metadata.id.clone(),
+                                    path: Some(path),
+                                };
+                                let complete_msg = serde_json::to_string(&complete_msg)
+                                    .expect("FileComplete serializes");
+                                broadcast_to_others(ctx, client_id, &complete_msg).await;
+                            }
+                            Err(e) => error!("Failed to finalize file: {}", e),
+                        }
+                    } else {
+                        let progress_msg = FileProgress {
+                            msg_type: "file".into(),
+                            action: "progress".into(),
+                            id: metadata.id.clone(),
+                            percent: (received as f64 / total as f64 * 100.0) as u32,
+                        };
+                        let progress_msg =
+                            serde_json::to_string(&progress_msg).expect("FileProgress serializes");
+                        broadcast_to_others(ctx, client_id, &progress_msg).await;
+                    }
+                }
+                Err(e) => error!("Failed to receive binary chunk: {}", e),
+            }
+        }
+        Err(e) => {
+            warn!("Failed to decrypt binary chunk from {}: {}", client_id, e);
+        }
+    }
+}
+
+pub async fn handle_file_accept(msg: Value, client_id: &str, ctx: &WsContext) {
+    if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+        ctx.file_engine.accept_outgoing(id).await;
+    }
+    broadcast_to_others(ctx, client_id, &msg.to_string()).await;
+}
+
+pub async fn handle_file_chunk(msg: Value, client_id: &str, ctx: &WsContext) {
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let index = msg.get("index").and_then(|v| v.as_i64()).unwrap_or(0) as u32;
+    let data = msg.get("data").and_then(|v| v.as_str()).unwrap_or("");
+
+    match ctx.file_engine.receive_chunk(id, index, data).await {
+        Ok(received) => {
+            if ctx.file_engine.is_complete(id).await {
+                match ctx.file_engine.finalize_incoming(id).await {
+                    Ok(path) => {
+                        info!("File transfer complete: {}", path);
+                        let complete_msg = FileComplete {
+                            msg_type: "file".into(),
+                            action: "complete".into(),
+                            id: id.to_string(),
+                            path: Some(path),
+                        };
+                        let complete_msg =
+                            serde_json::to_string(&complete_msg).expect("FileComplete serializes");
+                        broadcast_to_others(ctx, client_id, &complete_msg).await;
+                    }
+                    Err(e) => error!("Failed to finalize file: {}", e),
+                }
+            } else {
+                let total = msg.get("total").and_then(|v| v.as_i64()).unwrap_or(1);
+                let progress_msg = FileProgress {
+                    msg_type: "file".into(),
+                    action: "progress".into(),
+                    id: id.to_string(),
+                    percent: (received as f64 / total as f64 * 100.0) as u32,
+                };
+                let progress_msg =
+                    serde_json::to_string(&progress_msg).expect("FileProgress serializes");
+                broadcast_to_others(ctx, client_id, &progress_msg).await;
+            }
+        }
+        Err(e) => error!("Failed to receive chunk: {}", e),
+    }
+}
+
+pub async fn handle_file_progress(msg: Value, client_id: &str, ctx: &WsContext) {
+    broadcast_to_others(ctx, client_id, &msg.to_string()).await;
+}
+
+pub async fn handle_file_complete(msg: Value, client_id: &str, ctx: &WsContext) {
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    ctx.file_engine.remove_outgoing(id).await;
+    broadcast_to_others(ctx, client_id, &msg.to_string()).await;
+}
+
+pub async fn handle_file_cancel(msg: Value, client_id: &str, ctx: &WsContext) {
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    ctx.file_engine.cancel_incoming(id).await;
+    ctx.file_engine.remove_outgoing(id).await;
+    broadcast_to_others(ctx, client_id, &msg.to_string()).await;
+}
+
+pub async fn handle_file_resume(msg: Value, client_id: &str, ctx: &WsContext) {
+    let id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let name = msg
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let size = msg.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    let mime = msg
+        .get("mime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("application/octet-stream");
+    let from = msg.get("from").and_then(|v| v.as_str()).unwrap_or("");
+    let checksum = msg
+        .get("checksum")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let chunks_loaded = ctx
+        .file_engine
+        .resume_incoming(id, name, size, mime, from, checksum)
+        .await
+        .unwrap_or(0);
+
+    info!(
+        "File resume requested: {} ({} chunks loaded from disk)",
+        name, chunks_loaded
+    );
+
+    let response = FileResumeAck {
+        msg_type: "file".into(),
+        action: "resume_ack".into(),
+        id: id.to_string(),
+        chunks_loaded,
+    };
+    let response = serde_json::to_string(&response).expect("FileResumeAck serializes");
+
+    broadcast_to_others(ctx, client_id, &response).await;
+}
+
+/// The `auto_accept_files` setting, defaulting to enabled for a row that has
+/// never been written (fresh install) — matching `Storage::get_settings`.
+async fn auto_accept_files_enabled(ctx: &WsContext) -> bool {
+    match ctx.storage.get_setting("auto_accept_files").await {
+        Some(raw) => raw == "true",
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::handlers::test_helpers::{
+        add_test_client, add_test_client_mapped, create_test_ctx,
+    };
+
+    // ── handle_file_request tests ─────────────────────────────────────────────
+
+    /// The default (row never written) must accept, so a fresh install keeps
+    /// working exactly as before the setting was enforced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_valid_accepts_when_auto_accept_files_unset() {
+        let ctx = create_test_ctx();
+        let _tx = add_test_client(&ctx, "c1").await;
+
+        let msg = serde_json::json!({
+            "type": "file", "action": "request", "id": "t_default_accept", "name": "a.bin"
+        });
+
+        handle_file_request(msg, "c1", &ctx).await;
+
+        // Same proof the `file_request_missing_fields_uses_defaults` test uses:
+        // with `size` defaulting to 0 a registered transfer is vacuously
+        // complete, while an unstarted one is not.
+        assert!(
+            ctx.file_engine.is_complete("t_default_accept").await,
+            "unset auto_accept_files defaults to true, so the transfer must be registered"
+        );
+    }
+
+    /// REGRESSION: `auto_accept_files` used to be persisted and rendered as a
+    /// working toggle but read nowhere. With it off, the hub must decline the
+    /// transfer, buffer nothing, and tell the sender why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_invalid_declined_when_auto_accept_files_disabled() {
+        let ctx = create_test_ctx();
+        ctx.storage
+            .save_setting("auto_accept_files", "false")
+            .await
+            .unwrap();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let peer = add_test_client(&ctx, "peer").await;
+        let mut peer_rx = peer.subscribe();
+
+        let msg = serde_json::json!({
+            "type": "file", "action": "request", "id": "t_declined", "name": "secret.bin"
+        });
+
+        handle_file_request(msg, "sender", &ctx).await;
+
+        // Nothing was buffered: an unstarted transfer is not "complete".
+        assert!(
+            !ctx.file_engine.is_complete("t_declined").await,
+            "a declined transfer must never be registered with the file engine"
+        );
+        let relayed =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer_rx.recv()).await;
+        assert!(relayed.is_err(), "a declined request must not be relayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_invalid_declined_sends_error_frame_to_sender() {
+        let ctx = create_test_ctx();
+        ctx.storage
+            .save_setting("auto_accept_files", "false")
+            .await
+            .unwrap();
+        let sender = add_test_client(&ctx, "sender").await;
+        let mut sender_rx = sender.subscribe();
+        let _peer = add_test_client(&ctx, "peer").await;
+
+        let msg = serde_json::json!({
+            "type": "file", "action": "request", "id": "t_err", "name": "secret.bin"
+        });
+
+        handle_file_request(msg, "sender", &ctx).await;
+
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(500), sender_rx.recv())
+            .await
+            .expect("sender must be told why")
+            .unwrap();
+        assert!(
+            resp.contains("file_accept_disabled"),
+            "expected file_accept_disabled, got: {resp}"
+        );
+        assert!(
+            resp.contains("secret.bin"),
+            "the error must name the declined file, got: {resp}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_valid_relays_when_auto_accept_files_enabled() {
+        let ctx = create_test_ctx();
+        ctx.storage
+            .save_setting("auto_accept_files", "true")
+            .await
+            .unwrap();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let peer = add_test_client(&ctx, "peer").await;
+        let mut peer_rx = peer.subscribe();
+
+        let msg = serde_json::json!({
+            "type": "file", "action": "request", "id": "t_ok", "name": "ok.bin", "size": 32
+        });
+
+        handle_file_request(msg, "sender", &ctx).await;
+
+        let relayed = tokio::time::timeout(std::time::Duration::from_millis(500), peer_rx.recv())
+            .await
+            .expect("request must be relayed when auto_accept_files is on")
+            .unwrap();
+        assert!(relayed.contains("t_ok"), "unexpected relay: {relayed}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_happy_path_directed() {
+        let ctx = create_test_ctx();
+        let _sender_tx = add_test_client_mapped(&ctx, "sender_ws", "sender_dev").await;
+        let _receiver_tx = add_test_client_mapped(&ctx, "receiver_ws", "receiver_dev").await;
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "request",
+            "id": "transfer_001",
+            "name": "photo.jpg",
+            "size": 1024,
+            "mime": "image/jpeg",
+            "from": "sender_dev",
+            "to": "receiver_dev"
+        });
+
+        handle_file_request(msg, "sender_ws", &ctx).await;
+
+        // Incoming transfer should be registered
+        assert!(!ctx.file_engine.is_complete("transfer_001").await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_happy_path_broadcast() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+
+        let mut receiver_rx = receiver.subscribe();
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "request",
+            "id": "t_broadcast",
+            "name": "doc.pdf",
+            "size": 2048,
+            "mime": "application/pdf",
+            "from": "dev_a"
+            // No "to" field — should broadcast to all others
+        });
+
+        handle_file_request(msg.clone(), "sender", &ctx).await;
+
+        // Receiver should get the broadcast
+        let received =
+            tokio::time::timeout(std::time::Duration::from_millis(500), receiver_rx.recv()).await;
+        assert!(received.is_ok(), "receiver should get the broadcast");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_request_missing_fields_uses_defaults() {
+        let ctx = create_test_ctx();
+        let _tx = add_test_client(&ctx, "c1").await;
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "request",
+            "id": "t_defaults"
+        });
+
+        handle_file_request(msg, "c1", &ctx).await;
+        // Should not panic — defaults are applied.
+        // Missing size defaults to 0 → total_chunks = 0 → vacuously complete
+        // (0 received >= 0 total). is_complete == true proves the transfer was
+        // registered with defaults; an unstarted transfer would return false.
+        assert!(
+            ctx.file_engine.is_complete("t_defaults").await,
+            "size-0 transfer registered with defaults should be vacuously complete"
+        );
+    }
+
+    // ── handle_binary_message tests ───────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_message_too_short() {
+        let ctx = create_test_ctx();
+        let peer_enc = crate::encryption::EncryptionManager::new_random();
+        let _tx = add_test_client_mapped(&ctx, "c1", "dev1").await;
+
+        // Register the client with a shared secret
+        let secret = ctx
+            .encryption
+            .derive_shared_secret(&peer_enc.public_key_hex())
+            .unwrap();
+        let client = crate::sync::ConnectedClient {
+            device_id: "dev1".to_string(),
+            device_name: "Test".to_string(),
+            device_type: "phone".to_string(),
+            shared_secret: hex::encode(secret),
+            last_heartbeat: chrono::Utc::now().timestamp(),
+            battery_level: None,
+        };
+        ctx.sync_engine.write().await.add_client(client);
+
+        // Send a binary message that is too short (< 28 bytes)
+        let bytes = vec![0u8; 10];
+        handle_binary_message(bytes, "c1", &ctx).await;
+        // Should return early without panic
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_message_no_shared_secret() {
+        let ctx = create_test_ctx();
+        let _tx = add_test_client_mapped(&ctx, "c1", "unknown_dev").await;
+
+        // No client registered in sync_engine — should log warning and return
+        let bytes = vec![0u8; 50];
+        handle_binary_message(bytes, "c1", &ctx).await;
+        // Should not panic
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_message_metadata_length_mismatch() {
+        let ctx = create_test_ctx();
+        let peer_enc = crate::encryption::EncryptionManager::new_random();
+        let _tx = add_test_client_mapped(&ctx, "c1", "dev1").await;
+
+        let secret = ctx
+            .encryption
+            .derive_shared_secret(&peer_enc.public_key_hex())
+            .unwrap();
+        let client = crate::sync::ConnectedClient {
+            device_id: "dev1".to_string(),
+            device_name: "Test".to_string(),
+            device_type: "phone".to_string(),
+            shared_secret: hex::encode(secret),
+            last_heartbeat: chrono::Utc::now().timestamp(),
+            battery_level: None,
+        };
+        ctx.sync_engine.write().await.add_client(client);
+
+        // Build a message: 24-byte nonce + 4-byte LE json_len = 100 + only 10 bytes body
+        let mut bytes = vec![0u8; 28];
+        let json_len: u32 = 100;
+        bytes[24..28].copy_from_slice(&json_len.to_le_bytes());
+        // Total bytes = 28, but json_len says 100 — should return early
+        handle_binary_message(bytes, "c1", &ctx).await;
+    }
+
+    // ── handle_file_accept tests ──────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_accept_broadcasts() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "accept",
+            "id": "transfer_001"
+        });
+
+        handle_file_accept(msg, "sender", &ctx).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+    }
+
+    // ── handle_file_chunk tests ───────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_chunk_receives_and_broadcasts() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        // Start an incoming transfer
+        ctx.file_engine
+            .start_incoming(
+                "t_chunk",
+                "test.bin",
+                64,
+                "application/octet-stream",
+                "dev_a",
+                None,
+            )
+            .await;
+
+        let chunk_data =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0u8; 64]);
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "chunk",
+            "id": "t_chunk",
+            "index": 0,
+            "total": 1,
+            "data": chunk_data
+        });
+
+        handle_file_chunk(msg, "sender", &ctx).await;
+
+        // handle_file_chunk finalizes complete transfers, which removes them
+        // from the incoming map — so is_complete returns false afterwards.
+        // A second finalize attempt must fail, proving the first one ran.
+        assert!(
+            ctx.file_engine.finalize_incoming("t_chunk").await.is_err(),
+            "transfer should already be finalized and removed"
+        );
+
+        // Complete message should be broadcast to others
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+        let text = received.unwrap().unwrap();
+        assert!(
+            text.contains("complete"),
+            "expected complete broadcast: {text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_chunk_unknown_transfer() {
+        let ctx = create_test_ctx();
+        let _tx = add_test_client(&ctx, "c1").await;
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "chunk",
+            "id": "nonexistent",
+            "index": 0,
+            "data": "AAAA"
+        });
+
+        // Should not panic even if transfer doesn't exist
+        handle_file_chunk(msg, "c1", &ctx).await;
+    }
+
+    // ── handle_file_cancel tests ──────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_cancel_removes_incoming_and_broadcasts() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        ctx.file_engine
+            .start_incoming(
+                "t_cancel",
+                "f.bin",
+                128,
+                "application/octet-stream",
+                "dev",
+                None,
+            )
+            .await;
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "cancel",
+            "id": "t_cancel"
+        });
+
+        handle_file_cancel(msg, "sender", &ctx).await;
+
+        assert!(!ctx.file_engine.is_complete("t_cancel").await);
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+    }
+
+    // ── handle_file_complete tests ────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_complete_removes_outgoing() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        // Start an outgoing transfer
+        let dir = std::env::temp_dir().join("conduit_test_file_complete");
+        std::fs::create_dir_all(&dir).ok();
+        let file_path = dir.join("test.bin");
+        std::fs::write(&file_path, vec![0u8; 10]).unwrap();
+
+        ctx.file_engine
+            .start_outgoing("t_out", &file_path.to_string_lossy(), "dev_b")
+            .await
+            .ok();
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "complete",
+            "id": "t_out"
+        });
+
+        handle_file_complete(msg, "sender", &ctx).await;
+
+        // Outgoing should be removed
+        assert!(ctx.file_engine.get_next_chunk("t_out").await.is_none());
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── handle_file_progress tests ────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_progress_broadcasts() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "progress",
+            "id": "t1",
+            "percent": 50
+        });
+
+        handle_file_progress(msg, "sender", &ctx).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+    }
+
+    // ── handle_file_resume tests ──────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_resume_acks_chunks_loaded() {
+        let ctx = create_test_ctx();
+        let _sender = add_test_client(&ctx, "sender").await;
+        let receiver = add_test_client(&ctx, "receiver").await;
+        let mut rx = receiver.subscribe();
+
+        // No existing transfer — resume should ack 0 chunks loaded
+        let msg = serde_json::json!({
+            "type": "file",
+            "action": "resume",
+            "id": "t_resume",
+            "name": "file.bin",
+            "size": 128,
+            "mime": "application/octet-stream",
+            "from": "dev_a"
+        });
+
+        handle_file_resume(msg, "sender", &ctx).await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        assert!(received.is_ok());
+        let text = received.unwrap().unwrap();
+        assert!(text.contains("chunks_loaded"));
+    }
+
+    // ── Rate limiting test ────────────────────────────────────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_rate_limit_enforced() {
+        let ctx = create_test_ctx();
+        let _tx = add_test_client(&ctx, "c1").await;
+
+        // File type allows 500 messages per 60s
+        for _ in 0..500 {
+            assert!(
+                ctx.per_type_limiter.check_type_limit("c1", "file").await,
+                "file messages within limit should pass"
+            );
+        }
+        assert!(
+            !ctx.per_type_limiter.check_type_limit("c1", "file").await,
+            "501st file message should be rate-limited"
+        );
+    }
+}

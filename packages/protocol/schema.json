@@ -1,0 +1,1688 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/protocol/schema.json",
+  "title": "Conduit Wire Protocol",
+  "description": "JSON message schema for the Conduit ecosystem (desktop, mobile, relay).",
+  "definitions": {
+    "DeviceInfo": {
+      "type": "object",
+      "description": "Device metadata exchanged during pairing and discovery.",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "phone",
+            "tablet",
+            "desktop"
+          ]
+        },
+        "os": {
+          "type": "string",
+          "enum": [
+            "ios",
+            "android",
+            "windows",
+            "macos",
+            "linux",
+            "unknown"
+          ]
+        },
+        "battery": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": false
+    },
+    "AutomationTrigger": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "device_connect",
+            "device_disconnect",
+            "time",
+            "battery_level",
+            "wifi_change",
+            "app_open",
+            "audio_device_connect",
+            "audio_device_disconnect"
+          ]
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "time": {
+          "type": "string",
+          "description": "HH:MM 24h format"
+        },
+        "below": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "ssid": {
+          "type": "string"
+        },
+        "app_package": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AutomationActionPayload": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "send_notification",
+            "set_phone_profile",
+            "route_audio",
+            "run_shell_command",
+            "toggle_wifi",
+            "toggle_bluetooth",
+            "open_url",
+            "open_app",
+            "set_window_state"
+          ]
+        },
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "profile": {
+          "type": "string",
+          "enum": [
+            "silent",
+            "vibrate",
+            "ring"
+          ]
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "app_package": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "minimize",
+            "maximize",
+            "restore",
+            "close"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmsMessage": {
+      "type": "object",
+      "description": "A single SMS record as produced by the phone.",
+      "required": [
+        "id",
+        "address",
+        "body",
+        "timestamp",
+        "read",
+        "is_outgoing"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable record ID; prefixed in_ for received, out_ for sent."
+        },
+        "address": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix timestamp (seconds)"
+        },
+        "read": {
+          "type": "boolean"
+        },
+        "is_outgoing": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmsThread": {
+      "type": "object",
+      "description": "One conversation thread within an SMS Sync snapshot.",
+      "required": [
+        "thread_id",
+        "address",
+        "snippet",
+        "unread_count",
+        "timestamp",
+        "messages"
+      ],
+      "properties": {
+        "thread_id": {
+          "type": "string",
+          "description": "Stable thread ID; prefixed t_ on the originating phone."
+        },
+        "address": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Address-book display name, null when unresolved."
+        },
+        "snippet": {
+          "type": "string"
+        },
+        "unread_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix timestamp (seconds) of the most recent message."
+        },
+        "messages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SmsMessage"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "title": "Discovery Announce",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "device_id",
+        "device_name",
+        "device_type"
+      ],
+      "properties": {
+        "type": {
+          "const": "discovery"
+        },
+        "action": {
+          "const": "announce"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "device_name": {
+          "type": "string"
+        },
+        "device_type": {
+          "type": "string",
+          "enum": [
+            "phone",
+            "tablet",
+            "desktop"
+          ]
+        },
+        "os": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "battery": {
+          "type": "integer"
+        },
+        "ws_port": {
+          "type": "integer"
+        },
+        "wss_port": {
+          "type": "integer"
+        },
+        "apns_token": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Discovery Remove",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "device_id"
+      ],
+      "properties": {
+        "type": {
+          "const": "discovery"
+        },
+        "action": {
+          "const": "remove"
+        },
+        "device_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Pairing Request",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "token",
+        "public_key"
+      ],
+      "properties": {
+        "type": {
+          "const": "pairing"
+        },
+        "action": {
+          "const": "request"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "token": {
+          "type": "string",
+          "minLength": 1
+        },
+        "public_key": {
+          "type": "string",
+          "description": "X25519 public key, hex-encoded"
+        },
+        "device_info": {
+          "$ref": "#/definitions/DeviceInfo"
+        }
+      }
+    },
+    {
+      "title": "Pairing Accept",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "public_key"
+      ],
+      "properties": {
+        "type": {
+          "const": "pairing"
+        },
+        "action": {
+          "const": "accept"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "public_key": {
+          "type": "string",
+          "description": "X25519 public key, hex-encoded"
+        },
+        "device_info": {
+          "$ref": "#/definitions/DeviceInfo"
+        }
+      }
+    },
+    {
+      "title": "Pairing Revoke",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "pairing"
+        },
+        "action": {
+          "const": "revoke"
+        },
+        "protocol_version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Clipboard Sync",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "content",
+        "mime",
+        "source_device",
+        "timestamp"
+      ],
+      "properties": {
+        "type": {
+          "const": "clipboard"
+        },
+        "action": {
+          "const": "sync"
+        },
+        "content": {
+          "type": "string"
+        },
+        "mime": {
+          "type": "string"
+        },
+        "source_device": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "integer",
+          "description": "Unix timestamp (seconds)"
+        }
+      }
+    },
+    {
+      "title": "Clipboard Request",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "clipboard"
+        },
+        "action": {
+          "const": "request"
+        },
+        "mime": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Notification Post",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "device_id",
+        "app",
+        "title",
+        "body",
+        "timestamp"
+      ],
+      "properties": {
+        "type": {
+          "const": "notification"
+        },
+        "action": {
+          "const": "post"
+        },
+        "id": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "app": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "integer"
+        },
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    {
+      "title": "Notification Dismiss",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "notification"
+        },
+        "action": {
+          "const": "dismiss"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Notification Reply",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "const": "notification"
+        },
+        "action": {
+          "const": "reply"
+        },
+        "id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Notification Mark Read",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "notification"
+        },
+        "action": {
+          "const": "mark_read"
+        }
+      }
+    },
+    {
+      "title": "File Request",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "name",
+        "size",
+        "mime",
+        "from"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "request"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mime": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "to": {
+          "type": "string"
+        },
+        "checksum": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "File Accept",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "accept"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "File Chunk",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "index",
+        "data"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "chunk"
+        },
+        "id": {
+          "type": "string"
+        },
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "data": {
+          "type": "string",
+          "description": "Base64-encoded chunk data"
+        },
+        "total": {
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "title": "File Progress",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "percent"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "progress"
+        },
+        "id": {
+          "type": "string"
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    },
+    {
+      "title": "File Complete",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "complete"
+        },
+        "id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "File Cancel",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "cancel"
+        },
+        "id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "File Resume",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "name",
+        "size",
+        "mime",
+        "from"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "resume"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "size": {
+          "type": "integer"
+        },
+        "mime": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "checksum": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "File Resume Ack",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "chunks_loaded"
+      ],
+      "properties": {
+        "type": {
+          "const": "file"
+        },
+        "action": {
+          "const": "resume_ack"
+        },
+        "id": {
+          "type": "string"
+        },
+        "chunks_loaded": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    {
+      "title": "Audio Stream Start",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "stream_start"
+        }
+      }
+    },
+    {
+      "title": "Audio Stream Stop",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "stream_stop"
+        }
+      }
+    },
+    {
+      "title": "Audio Stream Started",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "from"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "stream_started"
+        },
+        "from": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Audio Stream Data",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "data",
+        "format",
+        "sample_rate",
+        "channels",
+        "from"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "stream_data"
+        },
+        "data": {
+          "type": "string",
+          "description": "Base64-encoded PCM-16 LE samples"
+        },
+        "format": {
+          "const": "pcm16"
+        },
+        "sample_rate": {
+          "type": "integer"
+        },
+        "channels": {
+          "type": "integer"
+        },
+        "from": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Audio Playback Start",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "playback_start"
+        }
+      }
+    },
+    {
+      "title": "Audio Playback Stop",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "playback_stop"
+        }
+      }
+    },
+    {
+      "title": "Audio Playback Started",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "from"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "playback_started"
+        },
+        "from": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Audio Playback Data",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "data",
+        "format",
+        "sample_rate",
+        "channels"
+      ],
+      "properties": {
+        "type": {
+          "const": "audio"
+        },
+        "action": {
+          "const": "playback_data"
+        },
+        "data": {
+          "type": "string"
+        },
+        "format": {
+          "const": "pcm16"
+        },
+        "sample_rate": {
+          "type": "integer"
+        },
+        "channels": {
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Start",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "start"
+        },
+        "quality": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Stop",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "stop"
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Frame",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "data",
+        "format",
+        "width",
+        "height"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "frame"
+        },
+        "data": {
+          "type": "string",
+          "description": "Base64-encoded JPEG image"
+        },
+        "format": {
+          "const": "jpeg"
+        },
+        "width": {
+          "type": "integer"
+        },
+        "height": {
+          "type": "integer"
+        },
+        "from_desktop": {
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Capture Stopped",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "capture_stopped"
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Touch",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "x",
+        "y"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "touch"
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "actionType": {
+          "type": "string",
+          "enum": [
+            "tap",
+            "double_tap",
+            "long_press",
+            "right_click"
+          ]
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Key",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "key"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "key"
+        },
+        "key": {
+          "type": "string"
+        },
+        "modifiers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "shift",
+              "control",
+              "alt",
+              "meta"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Screen Mirror Scroll",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "dx",
+        "dy"
+      ],
+      "properties": {
+        "type": {
+          "const": "screen_mirror"
+        },
+        "action": {
+          "const": "scroll"
+        },
+        "dx": {
+          "type": "number"
+        },
+        "dy": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "title": "Remote Input Move",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "dx",
+        "dy"
+      ],
+      "properties": {
+        "type": {
+          "const": "remote_input"
+        },
+        "action": {
+          "const": "move"
+        },
+        "dx": {
+          "type": "number"
+        },
+        "dy": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "title": "Remote Input Click",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "button"
+      ],
+      "properties": {
+        "type": {
+          "const": "remote_input"
+        },
+        "action": {
+          "const": "click"
+        },
+        "button": {
+          "type": "string",
+          "enum": [
+            "left",
+            "right",
+            "double_left",
+            "middle"
+          ]
+        }
+      }
+    },
+    {
+      "title": "Remote Input Scroll",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "dx",
+        "dy"
+      ],
+      "properties": {
+        "type": {
+          "const": "remote_input"
+        },
+        "action": {
+          "const": "scroll"
+        },
+        "dx": {
+          "type": "number"
+        },
+        "dy": {
+          "type": "number"
+        }
+      }
+    },
+    {
+      "title": "Automation Rule",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "name",
+        "trigger",
+        "rule_action",
+        "enabled"
+      ],
+      "properties": {
+        "type": {
+          "const": "automation"
+        },
+        "action": {
+          "const": "rule"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "trigger": {
+          "$ref": "#/definitions/AutomationTrigger"
+        },
+        "rule_action": {
+          "$ref": "#/definitions/AutomationActionPayload"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "title": "Automation Delete",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "rule_id"
+          ]
+        },
+        {
+          "required": [
+            "id"
+          ]
+        }
+      ],
+      "properties": {
+        "type": {
+          "const": "automation"
+        },
+        "action": {
+          "const": "delete"
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string",
+          "description": "Alias for rule_id"
+        }
+      }
+    },
+    {
+      "title": "Automation Sync",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "rules"
+      ],
+      "properties": {
+        "type": {
+          "const": "automation"
+        },
+        "action": {
+          "const": "sync"
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "full_sync": {
+          "type": "boolean"
+        }
+      }
+    },
+    {
+      "title": "Automation Triggered",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "id",
+        "trigger_type"
+      ],
+      "properties": {
+        "type": {
+          "const": "automation"
+        },
+        "action": {
+          "const": "triggered"
+        },
+        "id": {
+          "type": "string"
+        },
+        "trigger_type": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Call Message",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "call"
+        },
+        "action": {
+          "type": "string"
+        },
+        "call_id": {
+          "type": "string"
+        },
+        "to_device_id": {
+          "type": "string"
+        },
+        "route": {
+          "type": "string"
+        },
+        "number": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "SMS Send",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "to",
+        "body"
+      ],
+      "properties": {
+        "type": {
+          "const": "sms"
+        },
+        "action": {
+          "const": "send"
+        },
+        "to": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Status Update",
+      "type": "object",
+      "required": [
+        "type",
+        "action"
+      ],
+      "properties": {
+        "type": {
+          "const": "status"
+        },
+        "action": {
+          "const": "update"
+        },
+        "battery": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "wifi_ssid": {
+          "type": "string"
+        },
+        "device_info": {
+          "$ref": "#/definitions/DeviceInfo"
+        }
+      }
+    },
+    {
+      "title": "Ping",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "ping"
+        }
+      }
+    },
+    {
+      "title": "Pong",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "pong"
+        }
+      }
+    },
+    {
+      "title": "Error",
+      "type": "object",
+      "required": [
+        "type",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "const": "error"
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "server_version": {
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "title": "Relay Auth",
+      "type": "object",
+      "required": [
+        "type",
+        "device_id",
+        "relay_token"
+      ],
+      "properties": {
+        "type": {
+          "const": "relay_auth"
+        },
+        "device_id": {
+          "type": "string"
+        },
+        "relay_token": {
+          "type": "string"
+        },
+        "apns_token": {
+          "type": "string"
+        }
+      }
+    },
+    {
+      "title": "Relay Auth OK",
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "const": "relay_auth_ok"
+        }
+      }
+    },
+    {
+      "title": "Relay Auth Rejected",
+      "type": "object",
+      "required": [
+        "type",
+        "reason"
+      ],
+      "properties": {
+        "type": {
+          "const": "relay_auth_rejected"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "invalid_token",
+            "missing_token"
+          ]
+        }
+      }
+    },
+    {
+      "title": "Relay Route",
+      "type": "object",
+      "required": [
+        "type",
+        "to_device_id",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "relay_route"
+        },
+        "to_device_id": {
+          "type": "string"
+        },
+        "payload": {
+          "type": "object",
+          "description": "Complete JSON message to forward"
+        }
+      }
+    },
+    {
+      "title": "Encrypted Envelope",
+      "type": "object",
+      "required": [
+        "type",
+        "nonce",
+        "hmac",
+        "data"
+      ],
+      "properties": {
+        "type": {
+          "const": "encrypted"
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Hex-encoded XChaCha20-Poly1305 nonce"
+        },
+        "hmac": {
+          "type": "string",
+          "description": "Hex-encoded HMAC-SHA256"
+        },
+        "data": {
+          "type": "string",
+          "description": "Hex-encoded ciphertext"
+        },
+        "source_device": {
+          "type": "string",
+          "description": "Sender device ID"
+        },
+        "protocol_version": {
+          "type": "integer"
+        }
+      }
+    },
+    {
+      "title": "SMS Sync",
+      "type": "object",
+      "required": [
+        "type",
+        "action",
+        "threads"
+      ],
+      "properties": {
+        "type": {
+          "const": "sms"
+        },
+        "action": {
+          "const": "sync"
+        },
+        "threads": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/SmsThread"
+          }
+        }
+      }
+    },
+    {
+      "title": "SMS New",
+      "type": "object",
+      "description": "A newly received SMS. Both sender ({from, body, timestamp}) and receiver ({thread_id, message}) shapes are accepted; see PROTOCOL.md on the unresolved divergence.",
+      "required": [
+        "type",
+        "action"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "from",
+            "body",
+            "timestamp"
+          ]
+        },
+        {
+          "required": [
+            "thread_id",
+            "message"
+          ]
+        }
+      ],
+      "properties": {
+        "type": {
+          "const": "sms"
+        },
+        "action": {
+          "const": "new"
+        },
+        "from": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "integer"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/definitions/SmsMessage"
+        }
+      }
+    },
+    {
+      "title": "SMS Sent",
+      "type": "object",
+      "description": "Confirmation of a successfully sent SMS. Both sender ({to, body, timestamp}) and receiver ({thread_id, message}) shapes are accepted; see PROTOCOL.md on the unresolved divergence.",
+      "required": [
+        "type",
+        "action"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "to",
+            "body",
+            "timestamp"
+          ]
+        },
+        {
+          "required": [
+            "thread_id",
+            "message"
+          ]
+        }
+      ],
+      "properties": {
+        "type": {
+          "const": "sms"
+        },
+        "action": {
+          "const": "sent"
+        },
+        "to": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "timestamp": {
+          "type": "integer"
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "message": {
+          "$ref": "#/definitions/SmsMessage"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+name: conduit
+description: >-
+  Conduit links a phone to a desktop over your local network so you can share
+  the clipboard, send files, and relay SMS, notifications and calls between
+  the two devices.
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.3
+  cryptography: ^2.2.0
+  crypto: ^3.0.3
+  permission_handler: ^13.0.2
+  flutter_local_notifications: ^22.3.1
+  provider: ^6.1.1
+  file_picker: ^13.1.0
+  path_provider: ^2.1.0
+  path: ^1.8.0
+  sqflite_sqlcipher: ^3.4.1
+  shared_preferences: ^2.2.0
+  flutter_secure_storage: ^11.2.0
+  record: ^7.1.1
+  just_audio: ^0.10.6
+  audio_session: ^0.2.4
+  mobile_scanner: ^7.4.2
+  multicast_dns: ^0.3.3+1
+  url_launcher: ^6.2.0
+  flutter_animate: ^4.5.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+# Launcher icons are NOT generated from here. They are produced, together with
+# every other Conduit brand asset, by scripts/icons/build_icons.py from
+# assets/brand/conduit.mark.json - run `npm run icons` from apps/desktop.
+#
+# flutter_launcher_icons used to be configured here with
+# android: "launcher_icon", but AndroidManifest.xml points android:icon at
+# @mipmap/ic_launcher, so the tool would have written five files nothing
+# referenced while leaving the five that ARE referenced untouched. One
+# generator, not two.
+flutter:
+  uses-material-design: true

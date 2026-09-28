@@ -1,0 +1,183 @@
+{
+  "$comment": [
+    "NORMATIVE BRAND SPECIFICATION FOR THE CONDUIT MARK.",
+    "",
+    "This file is the single source of truth for Conduit's identity geometry.",
+    "Every other representation - the PNG/ICO/ICNS rasters, logo.svg,",
+    "ConduitLogo.tsx and conduit_logo.dart - is GENERATED from this file by",
+    "scripts/icons/build_icons.py. Never hand-edit a generated file; edit the",
+    "numbers here and run `npm run icons` (from apps/desktop).",
+    "",
+    "The verifier (scripts/icons/verify_icons.py) fails if any generated file",
+    "differs from a fresh regeneration, so the assets cannot silently drift apart",
+    "the way four independent definitions previously did."
+  ],
+
+  "name": "conduit-mark",
+  "version": 2,
+  "grid": 64,
+  "rationale": {
+    "concept": "Z-offset pipe",
+    "summary": "One unbroken channel of constant thickness, bending from a horizontal run into a diagonal descent and back out to a horizontal run. The two terminals are flat-cut sections, perpendicular to the tube axis, so the mark reads as a sectioned conduit rather than a letterform.",
+    "why": [
+      "It is a real pipe offset. 'Conduit' is the product's name and the mark is a length of conduit, so the name is rendered rather than decorated.",
+      "One channel, exactly two terminals. There is no third exit, which is the product's architectural claim: LAN peer to phone, no cloud account, no telemetry.",
+      "The channel bends to reach across two devices and still arrives unbroken - continuity is the product's headline feature.",
+      "Constant thickness and flat-cut terminals read as engineering, not as the letter Z: no typeface sets Z with perpendicular end cuts and a constant-width spine.",
+      "Inherently asymmetric, so it cannot collapse into a cross, a plus, or a centred collar."
+    ],
+    "deliberately_not": [
+      "chain link or any interlocking-link glyph (this was the previous mark; also reads as KDE Connect / LocalSend / Join)",
+      "cloud, globe or WiFi arcs (a cloud would be a false statement about the architecture)",
+      "lock, padlock, key or shield (docs/decisions/0007 and docs/SECURITY.md 4.9 state the encryption is NOT end-to-end; a padlock would be a claim the security docs forbid)",
+      "chat or speech bubble (SMS is one of nine features; a bubble would brand this as a messenger)",
+      "two device outlines or a network graph (reads as generic 'any app' or as enterprise MDM)",
+      "any gradient, glow filter, or stroke thinner than the tube width inside the mark"
+    ]
+  },
+
+  "palette": {
+    "$comment": "Hex, sRGB. `ink` is the on-light-surface counterpart required by the design system; raw accent must never land on a light surface.",
+    "accent": "#00F0FF",
+    "ink": "#155E75",
+    "plateTop": "#11141B",
+    "plateBottom": "#0B0C10",
+    "templateBlack": "#000000"
+  },
+
+  "mark": {
+    "$comment": "Centreline of the tube, in 64-grid units, top-left origin, y down. The conduit is the union of one rotated rectangle per segment plus a disc at each interior joint. Terminals are NOT capped with a disc - they are flat sections, cut perpendicular to the axis.",
+    "tubeWidth": 15,
+    "centerline": [
+      { "x": 2, "y": 14 },
+      { "x": 26, "y": 14 },
+      { "x": 38, "y": 48 },
+      { "x": 62, "y": 48 }
+    ],
+    "jointRadius": 7.5,
+    "terminalCap": "flat"
+  },
+
+  "rendering": {
+    "$comment": "The rasteriser is Pillow, pinned, and renders at SS x the target size then box-filters down. Supersampling is what gives the icons real antialiasing; the previous generator drew straight to the final size and produced alpha levels of only {0, 255}.",
+    "rasterizer": "pillow",
+    "supersample": 8,
+    "resample": "LANCZOS"
+  },
+
+  "variants": {
+    "$comment": [
+      "A variant is DATA, not a fork. Same geometry, same mark colour, same rasteriser",
+      "for all of them; only the plate treatment differs, and only because the",
+      "hosting OS mandates it:",
+      "  - Apple rejects alpha in AppIcon PNGs and applies its own squircle mask,",
+      "  - Android launchers apply their own mask to the legacy mipmap PNGs,",
+      "  - Windows and Linux do not mask a window icon, so the desktop ships a",
+      "    rounded plate that keeps transparent corners,",
+      "  - macOS NSStatusItem template images use ONLY the alpha channel, so the",
+      "    tray variant has no plate at all and is monochrome.",
+      "This is the one and only legitimate source of difference between platforms,",
+      "and it affects corner pixels only - never the mark, never the interior."
+    ],
+    "plate": {
+      "description": "Rounded plate, transparent corners. Desktop bundle icons, favicon.",
+      "plate": true,
+      "plateStyle": "gradient",
+      "cornerRadius": 0.216,
+      "opaque": false,
+      "markColor": "accent"
+    },
+    "plate-square": {
+      "description": "Full-bleed opaque plate. iOS AppIcon and Android mipmap, both of which are masked by the OS.",
+      "plate": true,
+      "plateStyle": "gradient",
+      "cornerRadius": 0,
+      "opaque": true,
+      "markColor": "accent"
+    },
+    "tray": {
+      "description": "Monochrome mark on transparency, no plate. macOS template image. Sits in the 22pt menu-bar slot, so the mark is inset to ~78% and uses a flatter optical weight.",
+      "plate": false,
+      "plateStyle": "none",
+      "cornerRadius": 0,
+      "opaque": false,
+      "markColor": "templateBlack",
+      "markScale": 0.78
+    },
+    "mark": {
+      "description": "The bare mark on transparency, no plate. In-app React component, Flutter widget, tray fallback.",
+      "plate": false,
+      "plateStyle": "none",
+      "cornerRadius": 0,
+      "opaque": false,
+      "markColor": "accent",
+      "markScale": 1.0
+    }
+  },
+
+  "targets": {
+    "$comment": "Every platform asset in the repository, declared once. `npm run icons` renders every entry; `npm run icons:verify` proves every committed file matches and that nothing guarded is missing.",
+
+    "tauriPng": [
+      { "path": "apps/desktop/src-tauri/icons/32x32.png",      "size": 32,   "variant": "plate" },
+      { "path": "apps/desktop/src-tauri/icons/128x128.png",    "size": 128,  "variant": "plate" },
+      { "path": "apps/desktop/src-tauri/icons/128x128@2x.png", "size": 256,  "variant": "plate" },
+      { "path": "apps/desktop/src-tauri/icons/icon.png",       "size": 512,  "variant": "plate" }
+    ],
+    "tauriIco": [
+      { "path": "apps/desktop/src-tauri/icons/icon.ico", "sizes": [16, 32, 48, 64, 128, 256], "variant": "plate" }
+    ],
+    "tauriIcns": [
+      { "path": "apps/desktop/src-tauri/icons/icon.icns", "sizes": [16, 32, 64, 128, 256, 512, 1024], "variant": "plate" }
+    ],
+    "desktopWeb": [
+      { "path": "apps/desktop/public/favicon.png",         "size": 32,  "variant": "plate" },
+      { "path": "apps/desktop/public/apple-touch-icon.png","size": 180, "variant": "plate" },
+      { "path": "apps/desktop/public/icon-192.png",       "size": 192, "variant": "plate" },
+      { "path": "apps/desktop/public/icon-512.png",       "size": 512, "variant": "plate" }
+    ],
+    "tray": [
+      { "path": "apps/desktop/src-tauri/icons/trayTemplate.png", "size": 44, "variant": "tray" },
+      { "path": "apps/desktop/src-tauri/icons/trayTemplate@2x.png","size": 88, "variant": "tray" }
+    ],
+    "mobileAsset": [
+      { "path": "apps/mobile/assets/icon.png", "size": 512, "variant": "plate" }
+    ],
+    "iosAppIcon": [
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-20.png",       "size": 20,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-20@2x.png",    "size": 40,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-20@3x.png",    "size": 60,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-29.png",       "size": 29,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-29@2x.png",    "size": 58,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-29@3x.png",    "size": 87,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-40.png",       "size": 40,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-40@2x.png",    "size": 80,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-40@3x.png",    "size": 120,  "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-60@2x.png",    "size": 120,  "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-60@3x.png",    "size": 180,  "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-76.png",       "size": 76,   "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-76@2x.png",    "size": 152,  "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-83.5@2x.png",  "size": 167,  "variant": "plate-square" },
+      { "path": "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-1024.png",     "size": 1024, "variant": "plate-square" }
+    ],
+    "androidMipmap": [
+      { "path": "apps/mobile/android/app/src/main/res/mipmap-mdpi/ic_launcher.png",    "size": 48,  "variant": "plate-square" },
+      { "path": "apps/mobile/android/app/src/main/res/mipmap-hdpi/ic_launcher.png",    "size": 72,  "variant": "plate-square" },
+      { "path": "apps/mobile/android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",   "size": 96,  "variant": "plate-square" },
+      { "path": "apps/mobile/android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png",  "size": 144, "variant": "plate-square" },
+      { "path": "apps/mobile/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png", "size": 192, "variant": "plate-square" }
+    ]
+  },
+
+  "emittedSources": {
+    "$comment": "Code files generated from the same geometry. These are in-app UI, so they stay vector; every raster above is pre-rendered so the OS never re-rasterises on a machine we do not control.",
+    "svg":      { "path": "apps/desktop/src-tauri/icons/logo.svg",                     "grid": 512 },
+    "tsx":      { "path": "apps/desktop/src/components/icons/ConduitLogo.tsx" },
+    "dart":     { "path": "apps/mobile/lib/widgets/conduit_logo.dart" }
+  },
+
+  "excluded": {
+    "$comment": "Build output. Vite copies public/ verbatim into dist/; the copy is never committed and never hashed.",
+    "paths": ["apps/desktop/dist/**"]
+  }
+}

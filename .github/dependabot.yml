@@ -1,0 +1,201 @@
+# Dependabot configuration for Conduit.
+#
+# Four package managers plus the pinned Rust toolchain, and one deliberate
+# omission. Every `directory` below exists in the repository; the omissions
+# are stated where they occur rather than left to be discovered.
+#
+# ECOSYSTEM NOTES, so nobody has to re-derive these:
+#
+#   cargo           Valid (Cargo v1). `directory: "/"` reads the root
+#                   Cargo.toml, which is a VIRTUAL workspace: it holds no
+#                   [package], only [workspace.members] and the
+#                   [workspace.dependencies] table. That table is the one
+#                   that actually needs bumping, so the root is the only
+#                   correct directory. Members are
+#                   apps/desktop/src-tauri, services/relay and
+#                   packages/protocol, and the one authoritative lockfile
+#                   is the root Cargo.lock.
+#
+#   npm             Valid (npm v7-v11). `/apps/desktop` is the only
+#                   directory with a package.json. The lockfile is
+#                   committed, which is what makes `npm ci` reproducible
+#                   in CI, so Dependabot updating it is a feature.
+#
+#   docker          Valid (Docker v1). `/services/relay` because that is
+#                   where the only Dockerfile is, and Dependabot's Docker
+#                   file fetcher lists the contents of the configured
+#                   directory NON-recursively - it does not walk the tree
+#                   looking for Dockerfiles. Configuring `directory: "/"`
+#                   would find nothing at the root and fail with "No
+#                   Dockerfiles nor Kubernetes YAML found in /".
+#                   Not covered: the root docker-compose.yml. There IS a
+#                   `docker-compose` package ecosystem, but that file
+#                   declares no `image:` key at all - it builds from source
+#                   via `build:` - so there is nothing in it for Dependabot
+#                   to update. If an `image:` reference is ever added,
+#                   add an entry here:
+#                     - package-ecosystem: "docker-compose"
+#                       directory: "/"
+#                       schedule: { interval: "weekly" }
+#
+#   github-actions  Valid. `directory: "/"` is correct and required: this
+#                   fetcher only looks for workflows when the configured
+#                   directory is the repository root, and it also picks up
+#                   .github/dependabot.yml itself. The `uses:` tags in
+#                   ci.yml are not SHA-pinned yet; this entry is what will
+#                   move them under review rather than by hand.
+#
+#   rust-toolchain  Valid. Included because rust-toolchain.toml pins the
+#                   toolchain to 1.98 and its own comment explains that the
+#                   pin exists precisely so the baseline cannot drift under
+#                   a fragile build. A Rust bump here is not routine: the
+#                   SQLCipher/OpenSSL link and the musl/glibc baseline both
+#                   move with it, so read that file before merging.
+#
+#   pub             Valid (pub v2), and NOT omitted. Dart/Flutter support
+#                   exists and is listed in GitHub's supported-ecosystems
+#                   table, although it is community-maintained by the Dart
+#                   team rather than by GitHub. apps/mobile/pubspec.yaml is
+#                   the only pub manifest, and pubspec.lock is committed.
+#                   Flutter plugin bumps are frequently breaking, so major
+#                   updates are deliberately left ungrouped and land as
+#                   their own pull request.
+#
+# GROUPING: patch and minor are grouped per ecosystem into a single pull
+# request each, majors are left alone. Contributors on a small project do
+# not benefit from being handed 40 patch bumps a week, and a grouped PR is
+# also a much easier review and a much easier `npm ci` / `cargo build` to
+# run once.
+
+version: 2
+
+updates:
+  # ------------------------------------------------------------------
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 4
+    ignore:
+      # DELIBERATE, and the most important entry in this file.
+      #
+      # The root Cargo.toml documents five crates that are declared
+      # per-crate rather than in [workspace.dependencies], so the lockfile
+      # resolves TWO COPIES of each. The most consequential is tungstenite:
+      # the relay is on 0.24 and the desktop on 0.30, and they implement
+      # the same WebSocket protocol while talking to each other. The others
+      # are rand (relay 0.8 / desktop 0.10), rcgen (0.13 / 0.14), sha2
+      # (protocol 0.10 / desktop 0.11) and thiserror (protocol 1 /
+      # desktop 2).
+      #
+      # A Dependabot bump to one side of that skew would change wire
+      # behaviour or a signature in a crate the other side shares, with
+      # nothing in the pull request making that visible. Converging them
+      # is deliberate, reviewed work: confirm the desktop's version is the
+      # one all three should adopt, move it into [workspace.dependencies],
+      # and check whether the bump needs code changes. Until then these
+      # are held back. Security updates are not affected by `ignore`.
+      - dependency-name: "tungstenite"
+      - dependency-name: "tokio-tungstenite"
+      - dependency-name: "rand"
+      - dependency-name: "rcgen"
+      - dependency-name: "sha2"
+      - dependency-name: "thiserror"
+    groups:
+      cargo-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+          - "minor"
+
+  # ------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/apps/desktop"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 4
+    ignore:
+      # apps/desktop/package.json pins TWO TypeScript compilers through npm
+      # aliases:
+      #   "typescript":        "npm:@typescript/typescript6@^6.0.2"
+      #   "@typescript/native": "npm:typescript@^7.0.2"
+      # Both are preview/next-generation compilers, and both are behind
+      # caret ranges, so a routine Dependabot bump can change type
+      # semantics for the whole frontend - or change which compiler
+      # `npx tsc` resolves to - with no code change in the pull request
+      # and no failing test to explain it.
+      #
+      # Moving either of these is a deliberate decision that needs the
+      # full frontend gate run against it: `npx tsc --noEmit`,
+      # `npx vitest run`, `npm run lint` (which uses typescript-eslint's
+      # type-aware rules against the TS 6 API) and `npx vite build`.
+      # Handle them by hand, not on a Monday.
+      - dependency-name: "typescript"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      - dependency-name: "@typescript/native"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+    groups:
+      npm-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+          - "minor"
+
+  # ------------------------------------------------------------------
+  - package-ecosystem: "pub"
+    directory: "/apps/mobile"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    groups:
+      # Minor only. Flutter plugin packages in particular use the minor
+      # slot for breaking platform API changes, so minors get grouped and
+      # majors get a pull request each with the full test gate run
+      # against it.
+      pub-minor:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+
+  # ------------------------------------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/services/relay"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
+    groups:
+      docker-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+          - "minor"
+
+  # ------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    groups:
+      actions-patch:
+        applies-to: version-updates
+        update-types:
+          - "patch"
+          - "minor"
+
+  # ------------------------------------------------------------------
+  - package-ecosystem: "rust-toolchain"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 1

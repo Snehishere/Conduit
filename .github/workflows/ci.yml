@@ -1,0 +1,718 @@
+name: ci
+
+# ===========================================================================
+# THIS WORKFLOW HAS NEVER BEEN EXECUTED.
+#
+# Conduit had no git remote until the first public release. Every job below
+# was written by reading the tree, not by running it. The first push to a
+# real remote is the first execution of this file, and the following jobs are
+# EXPECTED TO NEED FIXING on that run. This is deliberate disclosure, not an
+# oversight, and it is the reason this banner exists.
+#
+# Expected red or non-green on the very first run:
+#
+#   node      - `npm run lint` exits 1 today: 15 errors across 19 files. The
+#               step is marked continue-on-error for that reason alone.
+#   rust      - the desktop crate (`conduit`) has no verified Linux build
+#               path. Its clippy/test/release steps are all continue-on-error.
+#               See the long comment in that job.
+#   hygiene   - the tauri.conf.json entitlements path-case check is currently
+#               RED for real. It found a live macOS codesign bug. Marked
+#               continue-on-error so the finding is visible without taking the
+#               other three hygiene checks down with it.
+#   flutter   - `dart format --set-exit-if-changed` fails: 63 of 74 Dart files
+#               are unformatted. `flutter analyze --fatal-infos` is
+#               non-blocking for a different reason. Both already were.
+#   docker    - fixed in this file; see the RELAY_TOKEN comment in that job.
+#   codegen   - fixed in this file. The drift gate itself is expected to pass:
+#               `npm run generate` exits 0, is byte-for-byte idempotent, and
+#               both generated clients are a fresh render of schema.json.
+#   icons     - expected to pass. Verified locally: 36 tracked assets,
+#               188 assertions, 0 problems, Pillow 12.3.0.
+#
+# Verified green before the first run, on the crates that build portably:
+#   cargo fmt --all -- --check                                  exit 0
+#   cargo clippy -p conduit-protocol -p relay --all-targets    exit 0
+#   cargo test  -p conduit-protocol -p relay                    266 + 189 passed
+#   cargo build -p conduit-protocol -p relay --release          exit 0
+#
+# Policy applied throughout, so the above list is not a matter of taste:
+#   - A step that fails for a reason fixable inside this file (a wrong path, a
+#     missing non-secret input) is FIXED and left blocking.
+#   - A step that fails because the product tree has a real defect, or because
+#     a prerequisite does not exist yet, is marked continue-on-error, emits a
+#     `::warning` annotation, and carries a comment saying what is wrong and
+#     what would fix it. It is never deleted and never silently omitted.
+#   - A step that is unverified but not known-broken is left blocking, with a
+#     comment naming the specific risk so the first reviewer knows where to
+#     look.
+#
+# No step in this workflow needs a repository secret. `cargo audit` and
+# `cargo deny` fetch public advisory data over the network and need no token.
+# There is deliberately no deploy, publish or release automation here.
+#
+# Required status check name for branch protection: "ci / rust"
+# (or "ci / node" if you prefer the Node job to gate merges).
+#
+# `uses:` version tags are not SHA-pinned yet. That is a tracked decision, not
+# an oversight: .github/dependabot.yml has a `github-actions` entry with a
+# weekly schedule, so the tags move under review rather than being rewritten
+# by hand. Pinning all of them to SHAs is the correct end state and is a
+# separate, larger change.
+# ===========================================================================
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep cargo's target dir inside the workspace so CI caching works and so
+  # a stray global target/ is never used by accident.
+  CARGO_TARGET_DIR: target
+
+# Cancels superseded runs on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Rust: fmt, clippy, test, build.
+  #
+  # `scripts/lint-all.ps1` only ever covered apps/desktop/src-tauri, which
+  # is why a broken relay test suite and a broken protocol test suite both
+  # survived for as long as they did.
+  #
+  # This job is split by crate, and deliberately so. Two of the three
+  # crates are portable and are BLOCKING. The third, the Tauri desktop
+  # crate, has no verified build path on a Linux runner and is
+  # NON-BLOCKING. See the OpenSSL block below before promoting anything.
+  # ------------------------------------------------------------------
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux webview dependencies
+        # Needed by the Tauri desktop crate. This does NOT cover the
+        # vendored-OpenSSL question below - see the note there.
+        # The two portable crates need none of this; it is here only so
+        # the non-blocking desktop steps have a chance of running.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev librsvg2-dev \
+            libayatana-appindicator3-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # FIXED. The previous value was `from rust-toolchain.toml`, which
+          # is not a rustup toolchain specifier. This action's `toolchain`
+          # input is passed to `rustup toolchain install`, so the step would
+          # have failed on the first run with an invalid-toolchain error
+          # before a single line of Rust was compiled. `from
+          # rust-toolchain.toml` is the spelling used by
+          # actions-rust-lang/setup-rust-toolchain, a different action.
+          #
+          # This now duplicates rust-toolchain.toml (channel 1.98,
+          # components rustfmt + clippy) instead of reading it. That
+          # duplication is the price of determinism: relying on the action
+          # to auto-detect the file makes the CI toolchain depend on the
+          # action's default-resolution behaviour. If you change
+          # rust-toolchain.toml, change this too.
+          toolchain: 1.98
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - name: cargo fmt --check
+        # Workspace-wide, not per-crate: rustfmt parses source and never
+        # runs a build script, so this covers all three members including
+        # the one that cannot be compiled here. Verified exit 0.
+        run: cargo fmt --all -- --check
+
+      # ---- portable crates: BLOCKING -------------------------------------
+
+      - name: cargo clippy -p conduit-protocol -p relay
+        # Neither crate's tree depends on a system library that CI would have
+        # to install: no OpenSSL, no webview, no X11, no audio, no SQLite.
+        # ring (via rustls) compiles its own vendored C and asm with `cc`,
+        # which every runner has. Nothing in either tree is gated on a
+        # package that is not already present, so a pass here is a pass on
+        # Linux, not just on this Windows checkout. Verified exit 0.
+        run: cargo clippy -p conduit-protocol -p relay --all-targets --locked -- -D warnings
+
+      - name: cargo test -p conduit-protocol -p relay
+        # 266 protocol + 189 relay. Verified 0 failures.
+        run: cargo test -p conduit-protocol -p relay --locked
+
+      - name: cargo build --release -p conduit-protocol -p relay
+        # Verified exit 0. This is the release artefact that matters for
+        # self-hosted relay operators.
+        run: cargo build -p conduit-protocol -p relay --release --locked
+
+      # ---- desktop crate: NON-BLOCKING, see below -----------------------
+
+      # WHY THE DESKTOP CRATE CANNOT BE TRUSTED ON LINUX CI YET
+      #
+      # apps/desktop/src-tauri (crate `conduit`) depends on rusqlite with
+      # the `bundled-sqlcipher` feature. SQLCipher needs a crypto library
+      # at link time. On Windows the repo supplies one through
+      # .cargo/config.toml:
+      #
+      #   [env]
+      #   OPENSSL_LIB_DIR   = .tools/openssl-win64/lib/static
+      #   OPENSSL_INCLUDE_DIR = .tools/openssl-win64/include
+      #
+      # Three facts make this unresolvable on a Linux runner as written.
+      #
+      #  1. .tools/ is gitignored and is absent from a fresh clone. It is
+      #     ~80 MB of .lib/.h with no fetch script, no version pin and no
+      #     SHA-256 check. scripts/fetch-openssl.ps1 does not exist; it is
+      #     tracked as outstanding work in the project notes.
+      #
+      #  2. The [env] table is UNCONDITIONAL. It is not scoped to
+      #     [target.x86_64-pc-windows-msvc], so cargo exports those two
+      #     variables on Linux too, pointing at a directory that is not
+      #     there. Anything that honours OPENSSL_LIB_DIR will abort on the
+      #     missing directory.
+      #
+      #  3. Cargo.lock contains NO openssl-sys and NO openssl-src. The
+      #     only crypto-adjacent entries are libsqlite3-sys 0.38.2 (deps:
+      #     cc, pkg-config, vcpkg). So the consumer is libsqlite3-sys's own
+      #     build script, not an openssl-sys build script - which means the
+      #     Linux behaviour depends on whether that build script prefers
+      #     pkg-config (finding the system OpenSSL that libssl-dev installs
+      #     above) or honours OPENSSL_LIB_DIR first.
+      #
+      # Point 3 was NOT resolved. It cannot be resolved from a Windows
+      # checkout, and guessing wrong here is how a build ends up green on a
+      # maintainer laptop and red on every runner. So every step below is
+      # continue-on-error and emits a warning instead.
+      #
+      # There is a second, independent risk in the same crate even if the
+      # OpenSSL question resolves favourably: cpal, enigo, xcap and keyring
+      # are native and platform-sensitive. They were only ever exercised on
+      # Windows. keyring in particular is documented to fail closed on a
+      # Linux box with no Secret Service, and a headless runner is exactly
+      # that box.
+      #
+      # TO MAKE THESE BLOCKING, in order:
+      #   a. Add scripts/fetch-openssl.ps1 (or a Linux equivalent) that
+      #      downloads a pinned OpenSSL with a verified SHA-256.
+      #   b. Scope .cargo/config.toml's [env] to the Windows target triple,
+      #      or delete it in favour of the fetch script exporting the
+      #      variables only where they apply.
+      #   c. Run this job once on a Linux runner and confirm the desktop
+      #      crate's tests actually pass, not merely compile.
+      #   d. Delete `continue-on-error: true` from the three steps below.
+      #
+      # Until then these steps are a tripwire, not a gate. They are worth
+      # keeping precisely because they will start reporting the day the
+      # path opens up.
+
+      - name: cargo clippy -p conduit (non-blocking, see comment above)
+        run: |
+          echo "::warning title=Desktop crate unverified on Linux::apps/desktop/src-tauri (crate 'conduit') has no verified Linux build path. Vendored OpenSSL under .tools/ is gitignored with no fetch script, and .cargo/config.toml exports it unconditionally. Non-blocking until that is fixed."
+          cargo clippy -p conduit --all-targets --locked -- -D warnings
+        continue-on-error: true
+
+      - name: cargo test -p conduit (non-blocking, see comment above)
+        run: |
+          echo "::warning title=Desktop crate unverified on Linux::The 696 desktop Rust tests have only ever run on Windows. Treated as advisory here."
+          cargo test -p conduit --locked
+        continue-on-error: true
+
+      - name: cargo build --release -p conduit (non-blocking, see comment above)
+        run: |
+          echo "::warning title=Desktop crate unverified on Linux::No release binary is produced for the desktop app on CI. Packaging is unverified end to end."
+          cargo build -p conduit --release --locked
+        continue-on-error: true
+
+      # NOTE ON A CORRECTION: an earlier version of this file claimed that
+      # `cargo test -p conduit` "does compile and run on this job" and that
+      # only the release LINK was uncovered. That is not supportable. Because
+      # .cargo/config.toml exports OPENSSL_LIB_DIR unconditionally, whether
+      # the crate compiles at all on Linux is the open question, not just
+      # whether it links. clippy and test both have to compile it. The claim
+      # has been removed rather than softened.
+
+      # ---- supply chain, both NON-BLOCKING -------------------------------
+
+      - name: cargo audit
+        # Non-blocking because cargo-audit is compiled from source on the
+        # runner (several minutes) and then fetches the advisory database
+        # over the network. Both are slow and occasionally flaky, and a
+        # timeout there reports as a build failure unrelated to the change
+        # under test. Neither needs a secret.
+        # Promote to blocking once the tool is cached or moved to a
+        # dedicated scheduled workflow.
+        run: cargo install cargo-audit --locked && cargo audit
+        continue-on-error: true
+
+      - name: cargo deny check advisories
+        # Non-blocking, same reason as cargo audit above.
+        #
+        # Two things were corrected here. The previous form was
+        #   cargo deny check ... 2>&1 | tee deny.log ; test ! -s deny.log
+        # which could never pass: `tee` captures cargo-deny's ordinary
+        # progress and summary output as well as any finding, so deny.log is
+        # non-empty on a run with zero advisories and the step failed
+        # unconditionally. The log file is gone and cargo-deny's own exit
+        # status is what is checked.
+        #
+        # It also ran `licenses bans`. There is no deny.toml anywhere in the
+        # repo, so those two checks were running against cargo-deny's
+        # built-in defaults and could not be meaningful. They stay off
+        # until a policy file exists; adding one is the prerequisite for
+        # ever promoting this step to blocking.
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check advisories
+        continue-on-error: true
+
+  # ------------------------------------------------------------------
+  # TypeScript: typecheck, lint, unit tests, production build, e2e.
+  # ------------------------------------------------------------------
+  node:
+    name: node
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - run: npm ci
+        # apps/desktop/.npmrc sets legacy-peer-deps=true and the repo pins
+        # two TypeScript compilers through npm aliases:
+        #   "typescript":          "npm:@typescript/typescript6@^6.0.2"
+        #   "@typescript/native":   "npm:typescript@^7.0.2"
+        # package-lock.json is committed and resolves both aliases, so
+        # `npm ci` is reproducible here. Do not "simplify" it to `npm
+        # install`: that would let the lockfile drift under the aliases.
+
+      # `npm run build` is `tsc && vite build`; running tsc separately first
+      # turns a typecheck failure into its own readable step.
+      - name: tsc --noEmit
+        run: npx tsc --noEmit
+
+      - name: eslint (non-blocking, 15 pre-existing errors)
+        # KNOWN FAILURE, verified by running it: exit 1, 15 errors across
+        # 19 files, plus 267 warnings.
+        #
+        # eslint.config.js deliberately mixes severities. Everything set to
+        # "warn" is feedback only and does not affect the exit code; the 15
+        # failures are all rules set to "error". They break down as:
+        #   - 11x @typescript-eslint/ban-ts-comment on `// @ts-nocheck` in
+        #     src/hooks/useWebSocket.tsx, useAutomation.ts, useCalls.ts,
+        #     useFiles.ts, useMessageHandlers.ts, useSms.ts and others
+        #   - 1x @typescript-eslint/no-invalid-void-type in src/lib/tauri.ts
+        #   - 3x type-safety errors in useAutomation.ts
+        #     (no-redundant-type-constituents, restrict-plus-operands x2)
+        #
+        # These are real findings in hand-written source, not CI
+        # environment problems, and they cannot be fixed from this file.
+        #
+        # Note the specific trap: `// @ts-nocheck` is what lets `tsc` pass
+        # over some of these files at all. Removing the suppression is a
+        # prerequisite for fixing the errors it is hiding, and that is real
+        # work, not a config tweak.
+        #
+        # To promote this to blocking: fix the 15 errors and delete the
+        # `continue-on-error: true` on this step. The 267 warnings can stay
+        # as warnings; they do not fail the run.
+        run: |
+          echo "::warning title=eslint has 15 pre-existing errors::Non-blocking. The warnings do not fail the run; the 15 'error'-severity findings do."
+          npm run lint
+        continue-on-error: true
+
+      - name: vitest
+        run: npm test
+
+      - name: vite build
+        # `npx vite build`, not `npm run build`, and the difference matters.
+        # package.json defines a prebuild hook (`npm run icons:verify`),
+        # which shells out to Python and needs Pillow. This job installs
+        # neither, so `npm run build` would fail here on a missing
+        # interpreter rather than on anything TypeScript-related. The brand
+        # assets that prebuild guards are covered properly by the `icons`
+        # job, which installs Pillow and runs the real verifier.
+        run: npx vite build
+
+      - name: playwright (e2e)
+        # NOTE: this suite runs the React shell in a plain browser. Tauri
+        # IPC is unavailable, so it explicitly cannot exercise the backend
+        # or the webview<->local-server handshake. It is a regression net
+        # for the UI, not an integration test. See docs/TESTING.md.
+        # playwright.config.ts starts `npm run dev` on port 5173 itself.
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e
+
+      - name: Upload playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: apps/desktop/playwright-report
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Codegen drift gate. KEEP THIS JOB BLOCKING. It is the highest-value
+  # check in this file.
+  #
+  # WHY IT EXISTS, in terms a reviewer can act on:
+  #
+  #   types.rs -> schema.json -> generate_types.js / generate_dart.js ->
+  #   apps/desktop/src/types/websocket.ts +
+  #   apps/mobile/lib/models/protocol.dart
+  #
+  #   websocket.ts once declared `ClipboardRequestMessage` TWICE.
+  #   TypeScript MERGES interface declarations instead of erroring on them.
+  #   So `tsc` exited 0, the `node` job went green, and the effective type
+  #   carried three fields that do not exist in Rust. No type checker, in
+  #   any language, can see that. A regenerate-and-diff can, in one step.
+  #
+  #   If you touch packages/protocol/src/types.rs, this job is the thing
+  #   that tells you schema.json and both generated clients are stale. The
+  #   fix is `npm run generate` in apps/desktop, committed. Never hand-edit
+  #   a generated file: the next regeneration silently discards it and the
+  #   drift gate fails on someone else's pull request.
+  #   See docs/decisions/0010-schema-json-is-hand-maintained-and-test-enforced.md
+  # ------------------------------------------------------------------
+  codegen:
+    name: codegen drift
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # FIXED. Was `../../.nvmrc`. setup-node resolves `node-version-file`
+          # against GITHUB_WORKSPACE, not against the step's
+          # working-directory, so `../../.nvmrc` pointed outside the
+          # checkout and the action would have aborted on its first run with
+          # "the specified node version file ... does not exist" - taking the
+          # drift gate down without ever running a single check. The `node`
+          # job's own use of `.nvmrc` is the correct spelling, and the
+          # sibling key `cache-dependency-path` here is already
+          # workspace-relative, which is what made the mismatch visible.
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - run: npm ci
+
+      - name: Regenerate client models
+        run: npm run generate
+
+      - name: Fail if regeneration changed anything
+        # Verified before the first run: `npm run generate` exits 0, is
+        # byte-for-byte idempotent, and both generated clients are a fresh
+        # render of packages/protocol/schema.json. `ClipboardRequestMessage`
+        # is declared once, not twice. This step is expected to pass.
+        run: |
+          if ! git diff --exit-code -- \
+            src/types/websocket.ts \
+            ../mobile/lib/models/protocol.dart \
+            ../../packages/protocol/schema.json ; then
+            echo "::error title=Generated models are stale::The files above are generated from packages/protocol/schema.json. Run 'npm run generate' in apps/desktop and commit the result. Do not hand-edit them."
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------
+  # Brand asset drift gate.
+  # assets/brand/conduit.mark.json -> scripts/icons/build_icons.py ->
+  # 36 generated files: 31 PNGs, icon.ico, icon.icns, logo.svg,
+  # ConduitLogo.tsx and conduit_logo.dart (assets/brand/icon-manifest.json
+  # is the authoritative list).
+  #
+  # Conduit used to have FOUR independent definitions of its own logo -
+  # logo.svg, ConduitLogo.tsx, conduit_logo.dart and generate_icons.py - which
+  # had drifted apart into ~29 image files with ~29 distinct hashes, including
+  # a favicon in a completely different colour palette, an icon.ico that
+  # silently held one 16px frame while its generator reported six, and
+  # rasters with no antialiasing at all (alpha levels {0, 255} only).
+  #
+  # None of that is visible to tsc, eslint, vitest, cargo or flutter analyze.
+  # A regenerate-and-diff catches all of it, and the verifier additionally
+  # asserts the container formats, the alpha contract, and that no guarded
+  # image on disk is missing from the spec.
+  #
+  # Needs no Rust, no Flutter and no Node: the rasteriser is Pillow. That
+  # matters here because the vendored-OpenSSL trap already makes the desktop
+  # crate unbuildable on Linux (see the rust job).
+  # ------------------------------------------------------------------
+  icons:
+    name: icon drift
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - run: pip install 'Pillow==12.3.0'
+        # The pin is a real published version; it was verified against a
+        # local 12.3.0 install, and it matters because the alpha and
+        # antialiasing assertions in verify_icons.py are sensitive to
+        # Pillow's rasteriser. Bumping it is a deliberate act, not a
+        # side effect of a Dependabot run.
+
+      - name: Regenerate and verify every brand asset
+        # Verified locally before the first run: 36 tracked files,
+        # 188 assertions, "0 problems - every asset is a fresh render of
+        # the spec", exit 0.
+        #
+        # Note that --check is not read-only. build_icons.py renders every
+        # asset in place and only then compares, which is why the `git
+        # diff` step below is the part that actually fails the build. The
+        # practical consequence for contributors: running `npm run icons`
+        # or this command locally rewrites all 36 files even when nothing
+        # has changed, so expect a dirty working tree afterwards.
+        run: python ../../scripts/icons/build_icons.py --check
+
+      - name: Fail if regeneration changed anything
+        run: |
+          if ! git diff --exit-code -- \
+            ../../assets/brand \
+            src-tauri/icons \
+            public \
+            src/components/icons/ConduitLogo.tsx \
+            ../mobile/assets \
+            ../mobile/lib/widgets/conduit_logo.dart \
+            ../mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset \
+            ../mobile/android/app/src/main/res ; then
+            echo "::error title=Brand assets are stale::Every Conduit logo, icon and favicon is generated from assets/brand/conduit.mark.json. Run 'npm run icons' in apps/desktop and commit the result. Do not hand-edit a generated file."
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------
+  # Flutter: format, analyze, unit tests.
+  # ------------------------------------------------------------------
+  flutter:
+    name: flutter
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # pubspec.yaml declares `sdk: '>=3.12.0 <4.0.0'` and pins no
+          # Flutter constraint, so compileSdk/targetSdk/minSdk all float
+          # with the SDK. Pinning them means adding an `environment:`
+          # `flutter:` key to apps/mobile/pubspec.yaml, which is
+          # outstanding work. The pairing of that Dart SDK floor with this
+          # Flutter version is asserted by `flutter pub get` below: if the
+          # Dart shipping with 3.47 is below 3.12, pub get fails
+          # immediately and legibly, which is the right way to find out.
+          flutter-version: '3.47'
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+
+      - name: dart format --set-exit-if-changed (non-blocking)
+        # Currently FAILS: 63 of the 74 .dart files under apps/mobile are
+        # unformatted, because `dart format` has never been run across the
+        # tree in one pass. (The 74 total was re-counted when this comment
+        # was written; the 63 figure is from a local run, not from CI, which
+        # has never executed this step.)
+        #
+        # Non-blocking so the real gate stays visible; flip to blocking once
+        # the tree is formatted. The fix is one command, run from
+        # apps/mobile:  dart format .
+        run: dart format --output=none --set-exit-if-changed .
+        continue-on-error: true
+
+      - name: flutter analyze --fatal-infos (non-blocking)
+        # Kept non-blocking for a different reason than the step above.
+        # `dart analyze --fatal-infos` on the hand-written Dart is clean
+        # (0 errors, 0 warnings), but `flutter analyze` also walks
+        # plugin-generated and platform directories, where an info-level
+        # finding becomes a hard failure under --fatal-infos. Until the
+        # analysis scope is pinned to lib/ and test/ this step cannot
+        # distinguish a real regression from generated noise.
+        run: flutter analyze --fatal-infos
+        continue-on-error: true
+
+      - name: flutter test
+        # 43 tests, verified passing. Runs on the Dart VM, so no device
+        # or emulator is needed and no platform channels are live.
+        run: flutter test
+
+  # ------------------------------------------------------------------
+  # Docker / compose validity, and the relay image build.
+  # ------------------------------------------------------------------
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    # No `defaults.run.working-directory` on purpose: both steps below
+    # need the repository root, and the build context must be the root.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate compose file
+        # FIXED. docker-compose.yml line 34 reads
+        #   RELAY_TOKEN=${RELAY_TOKEN:?RELAY_TOKEN is required}
+        # which is a deliberate fail-closed guard. `docker compose config`
+        # interpolates before it validates, so with no RELAY_TOKEN in the
+        # environment - and there is no .env in the repository, it is
+        # gitignored by design - the step aborted with exactly the error
+        # the guard exists to produce. The guard is correct; the CI step was
+        # calling it without its input.
+        #
+        # A placeholder is the right input here. `config` renders and
+        # validates the file; it does not start a container, does not read
+        # the token, and does not write it anywhere. No secret is involved.
+        # Leaving this blocking, because compose validity is cheap to check
+        # and the failure mode it catches (a typo'd volume, a missing
+        # build context) is exactly the kind that only shows up in
+        # production.
+        env:
+          RELAY_TOKEN: ci-placeholder-not-a-real-token
+        run: docker compose config -q
+
+      # Build context MUST be the repo root - the Dockerfile copies
+      # packages/protocol and Cargo.lock in, and needs
+      # apps/desktop/src-tauri/Cargo.toml present so the virtual workspace
+      # resolves even though the desktop app is never compiled here.
+      # Passing apps/ or services/relay as the context is the most common
+      # way to break this, so the `.` is explicit here rather than relying
+      # on the default.
+      #
+      # Never executed before. The two things that could go wrong are the
+      # `rust:1.98-alpine` and `alpine:3.20` tags not existing under those
+      # names, and `cargo build --locked` rejecting a lockfile that has
+      # drifted. Both surface as a normal build failure on the first run.
+      - name: Build relay image
+        run: docker build -f services/relay/Dockerfile -t conduit-relay:test .
+
+  # ------------------------------------------------------------------
+  # Guard rails on repository hygiene. Four cheap invariants that a
+  # reviewer can act on directly:
+  #
+  #   1. Exactly one Cargo.lock, at the workspace root. Nested lockfiles
+  #      inside members are invisible to Cargo - it ignores them - while
+  #      being actively misleading to anyone reading the tree. One of them
+  #      did not even contain its own mandatory conduit-protocol path
+  #      dependency. .gitignore enforces `**/Cargo.lock` with
+  #      `!/Cargo.lock`; this step is what stops `--force` from undoing it.
+  #      See docs/decisions/0001-single-cargo-lockfile-and-workspace-dependencies.md
+  #
+  #   2. No committed build output, vendored binaries or tool caches. These
+  #      are the artefacts that are cheap to check for and expensive to
+  #      discover after a release: a multi-hundred-megabyte stray video, a
+  #      committed node_modules tree, the 80 MB vendored OpenSSL under
+  #      .tools/. All four are already in .gitignore, which is exactly why
+  #      this step is worth having - .gitignore is the thing that gets
+  #      undone with --force.
+  #
+  #   3. No committed secrets. Narrow on purpose - .env.example is allowed,
+  #      a real .env is not. Full secret scanning is not wired up yet; the
+  #      step's own comment is explicit about what it does not catch.
+  #
+  #   4. tauri.conf.json's entitlements path case matches what is on disk.
+  #      See that step: it is currently red, and it is red for a real
+  #      reason.
+  # ------------------------------------------------------------------
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exactly one Cargo.lock, at the root
+        run: |
+          found=$(git ls-files '*Cargo.lock')
+          if [ "$found" != "Cargo.lock" ]; then
+            echo "::error title=Stray Cargo.lock::Expected only 'Cargo.lock' at the workspace root, found: $found"
+            exit 1
+          fi
+
+      - name: No committed build output or vendored binaries
+        # Note: this inspects TRACKED files only. A developer's working
+        # copy is expected to contain apps/desktop/dist/, node_modules/
+        # and target/ after a local build; .gitignore excludes all three,
+        # which is exactly why this step is worth having.
+        run: |
+          bad=$(git ls-files | grep -E \
+            '^(target/|node_modules/|apps/desktop/dist/|apps/mobile/build/|\.tools/)|\.tsbuildinfo$|\.dart_tool/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=Committed build output::$bad"
+            exit 1
+          fi
+
+      - name: No secrets committed
+        # Narrow on purpose. .env.example is explicitly allowed; a real .env
+        # is not. This is a FILENAME heuristic: it does not read file
+        # contents, so it will not catch a credential pasted into a Rust
+        # source file or a Dart constant. Real scanning is outstanding work
+        # and belongs in push protection plus a content-based scanner; this
+        # step is the cheap floor, not the ceiling.
+        run: |
+          bad=$(git ls-files | grep -E '(^|/)\.env$|\.pem$|\.key$|\.p12$|\.jks$|(^|/)secrets/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error title=Possible secret committed::$bad"
+            exit 1
+          fi
+
+      - name: tauri.conf.json entitlements path case matches disk (non-blocking)
+        # CURRENTLY RED, and it is red because it found a real bug.
+        #
+        #   apps/desktop/src-tauri/tauri.conf.json line 50:
+        #     "entitlements": "./Entitlements.plist"
+        #   what is on disk:
+        #     apps/desktop/src-tauri/entitlements.plist   (lowercase e)
+        #
+        # On a case-sensitive filesystem `apps/desktop/src-tauri/
+        # Entitlements.plist` does not exist, which is precisely what this
+        # step tests. macOS's case-insensitive default HFS+ and APFS
+        # volumes hide it during local development; codesign on a
+        # case-sensitive volume, and any Linux or CI build that reads the
+        # config, fails.
+        #
+        # Marked non-blocking for exactly one reason: the fix is a rename
+        # or a one-line config edit, and neither file is this workflow's to
+        # change. The check itself is correct and must not be deleted or
+        # relaxed - it is the only thing in the repository that notices.
+        #
+        # The fix is one of:
+        #   (a) rename the file to Entitlements.plist, or
+        #   (b) change tauri.conf.json to "./entitlements.plist"
+        # Whichever is chosen, do the same in any macOS packaging script,
+        # then delete the `continue-on-error: true` below.
+        run: |
+          echo "::warning title=entitlements.plist path case mismatch::tauri.conf.json references './Entitlements.plist' but the file on disk is 'entitlements.plist'. Real macOS codesign bug on a case-sensitive volume. Non-blocking until fixed."
+          ref=$(grep -o '"\./[Ee]ntitlements\.plist"' apps/desktop/src-tauri/tauri.conf.json | tr -d '"')
+          if [ -n "$ref" ]; then
+            if [ ! -f "apps/desktop/src-tauri/${ref#./}" ]; then
+              echo "::error title=entitlements.plist path case mismatch::tauri.conf.json references '$ref' but that exact path does not exist on disk"
+              exit 1
+            fi
+          fi
+        continue-on-error: true

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/desktop/src-tauri",
+    "services/relay",
+    "packages/protocol",
+]
+
+# --- IMPORTANT ---
+# There is exactly ONE Cargo.lock, at this workspace root. Nested lockfiles
+# inside members were deleted as bugs: Cargo ignores them, so they were
+# invisible to the toolchain while actively misleading anyone reading the
+# tree. services/relay/Cargo.lock did not even contain its own mandatory
+# conduit-protocol path dependency.
+# .gitignore enforces this: `**/Cargo.lock` with `!/Cargo.lock`.
+# See docs/decisions/0001-single-cargo-lockfile-and-workspace-dependencies.md
+
+[workspace.dependencies]
+# Shared across all three crates
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Shared across desktop + relay
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "fs", "macros", "signal"] }
+log = "0.4"
+env_logger = "0.11"
+hex = "0.4"
+futures-util = "0.3"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2.2"
+tokio-rustls = "0.26"
+
+# --- Version skew: these resolve to two copies each; converge them ---
+# These five were declared per-crate instead of here, so the lockfile
+# resolved TWO COPIES of each. The most consequential is tungstenite:
+# the relay (0.24) and the desktop (0.30) implement the same WebSocket
+# protocol with different library majors, while speaking to each other.
+# Before moving a crate here, confirm the desktop's version is the one all
+# three should converge on, and check whether the bump needs code changes.
+#   tungstenite / tokio-tungstenite : relay 0.24  vs desktop 0.30
+#   rand                            : relay 0.8   vs desktop 0.10
+#   rcgen                           : relay 0.13  vs desktop 0.14
+#   sha2                            : proto 0.10  vs desktop 0.11
+#   thiserror                       : proto 1     vs desktop 2

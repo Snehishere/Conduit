@@ -1,0 +1,68 @@
+[package]
+name = "conduit"
+version = "0.1.0"
+edition = "2024"
+description = "Your devices, one web."
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+# Settings → Import reads the chosen JSON file with `readTextFile`. The crate
+# was only present transitively through `tauri-plugin-dialog`, which meant the
+# JS import had no matching Rust plugin and no `fs:*` capability.
+tauri-plugin-fs = "2"
+tauri-plugin-process = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+conduit-protocol = { path = "../../../packages/protocol" }
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+tungstenite = "0.30"
+mdns-sd = "0.21"
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
+uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
+chacha20poly1305 = "0.11"
+rand = "0.10"
+base64 = "0.23"
+chrono = { version = "0.4", features = ["serde"] }
+log = { workspace = true }
+env_logger = { workspace = true }
+gethostname = "1.1"
+hex = { workspace = true }
+dirs = "7"
+futures-util = { workspace = true }
+sysinfo = "0.39"
+mime_guess = "2"
+qrcode = "0.14"
+cpal = "0.18"
+thiserror = "2"
+sha2 = "0.11"
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = "0.14"
+keyring = "4.2"
+rusqlite_migration = "2"
+local-ip-address = "0.6"
+get_if_addrs = "0.5.3"
+enigo = "0.6"
+tauri-plugin-single-instance = "2"
+xcap = "0.2"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[dev-dependencies]
+# `test` exposes tauri::test::{mock_app, mock_builder, ...} for command unit tests.
+# Feature is only unified into tauri during `cargo test` builds (resolver v2).
+tauri = { version = "2", features = ["test"] }
+# Used by file-transfer command tests for real temp files/directories.
+tempfile = "3"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

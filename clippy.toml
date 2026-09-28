@@ -1,0 +1,16 @@
+# Conduit clippy configuration.
+#
+# `cargo clippy --workspace --all-targets -- -D warnings` is enforced in CI
+# (.github/workflows/ci.yml) and by scripts/lint-all.ps1 across all three
+# crates. scripts/lint-all.ps1 previously covered only apps/desktop/src-tauri,
+# which is why a broken relay test suite and a broken protocol test suite both
+# survived unnoticed.
+#
+# Note: a `LintConfig` schema change can land in a given Clippy release, so
+# this file is intentionally minimal. Adding an empty `[lint]` table here
+# breaks every cargo invocation, because Clippy validates the whole file
+# rather than ignoring unknown tables it never reads.
+
+# Raise the MSRV floor to match rust-toolchain.toml so a lint suggestion
+# never assumes a newer language feature than the pinned toolchain provides.
+msrv = "1.98"

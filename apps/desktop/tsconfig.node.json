@@ -1,0 +1,13 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    // Emit into the cache dir: a root-level `vite.config.js` would shadow
+    // `vite.config.ts` (Vite resolves .js before .ts).
+    "outDir": "./node_modules/.cache/tsconfig-node",
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["vite.config.ts"]
+}

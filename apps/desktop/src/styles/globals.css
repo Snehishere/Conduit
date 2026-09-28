@@ -1,0 +1,929 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=Inter:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+/* ═══ Tailwind v4 Theme Tokens (maps CSS variables → utility classes) ═══ */
+@theme {
+  --color-bg-0: var(--bg-0);
+  --color-bg-1: var(--bg-1);
+  --color-bg-2: var(--bg-2);
+  --color-bg-3: var(--bg-3);
+  --color-text-1: var(--text-1);
+  --color-text-2: var(--text-2);
+  --color-text-3: var(--text-3);
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-danger: var(--danger);
+  --color-danger-dim: var(--danger-dim);
+  --color-success: var(--success);
+  --color-success-dim: var(--success-dim);
+  --color-warning: var(--warning);
+  --color-warning-dim: var(--warning-dim);
+  --color-info: var(--info);
+  --color-info-dim: var(--info-dim);
+  --color-card-bg: var(--card-bg);
+  --color-card-border: var(--card-border);
+  --color-toggle-bg: var(--toggle-bg);
+  --color-toggle-active: var(--toggle-active);
+  --color-glass-bg: var(--glass-bg);
+  --color-glass-bg-heavy: var(--glass-bg-heavy);
+  --color-glass-border: var(--glass-border);
+  --color-glass-border-strong: var(--glass-border-strong);
+
+  /* ── Ink tokens (text on white frosted surfaces) — spec §B4/B6 ── */
+  --color-ink-1: var(--ink-1);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-ink-line: var(--ink-line);
+
+  /* ── On-white-glass chrome (dock / frost iconography) ── */
+  --color-on-glass: var(--on-glass);
+  --color-on-glass-muted: var(--on-glass-muted);
+
+  /* ── Accent variants (cyan on dark, ink on white glass) ── */
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-dim-ink: var(--accent-dim-ink);
+
+  /* ── Semantic — ink-safe pairs (on frost) ── */
+  --color-danger-ink: var(--danger-ink);
+  --color-success-ink: var(--success-ink);
+  --color-warning-ink: var(--warning-ink);
+  --color-info-ink: var(--info-ink);
+
+  /* ── Surface fills & hairlines — theme-aware replacements for the
+       rgba(11,18,32,*) / rgba(255,255,255,*) hardcodes across components.
+       dark → white-alpha on smoked glass · light → ink-alpha on white frost ── */
+  --color-fill-1: var(--fill-1);
+  --color-fill-2: var(--fill-2);
+  --color-line-1: var(--line-1);
+  --color-line-2: var(--line-2);
+  --color-frost-1: var(--frost-1);
+  --color-frost-border: var(--frost-border);
+  --color-tip-bg: var(--tip-bg);
+  --color-on-accent: var(--on-accent);
+
+  /* ── Dead-class fixes: utility names already used across components ── */
+  --color-text-primary: var(--text-1);
+  --color-text-secondary: var(--text-2);
+  --color-text-muted: var(--text-3);
+  --color-bg-primary: var(--bg-0);
+  --color-bg-secondary: var(--bg-2);
+
+  /* ── Elevation ── */
+  --shadow-card: var(--sh-2);
+}
+
+/* ═══ Theme System ═══ */
+/* Dark theme (default) */
+:root {
+  /* Backgrounds — pitch black for cosmic depth */
+  --bg-0: #000000;
+  --bg-1: #05070B;
+  --bg-2: rgba(255, 255, 255, 0.06);
+  --bg-3: rgba(255, 255, 255, 0.11);
+
+  /* Text — dark surfaces ONLY (never inside .surf-frost).
+     Softened off pure #FFFFFF: spec §B6 wants low-glare contrast, not a
+     white-on-black laser show. */
+  --text-1: #EAEFF6;
+  --text-2: #9DAABD;
+  --text-3: #66738A;
+
+  /* Ink — text/chrome INSIDE frosted surfaces. Dark theme panels are dark
+     smoked glass (user requirement), so ink flips to LIGHT values here and
+     back to near-black in the light-theme blocks below. */
+  --ink-1: #E9EEF6;
+  --ink-2: #A9B4C5;
+  --ink-3: #8B96A8;
+  --ink-line: rgba(255, 255, 255, 0.10);
+
+  /* Accent — cyan is a light source on dark. --accent-ink is normally the
+     ≥4.5:1-on-white counterpart, but in the dark theme every surface is dark
+     (smoked glass / starfield), so the ink accent collapses onto the bright
+     one. theme.tsx mirrors this at runtime when it writes the inline vars. */
+  --accent: #00F0FF;
+  --accent-dim: rgba(0, 240, 255, 0.14);
+  --accent-glow: rgba(0, 240, 255, 0.3);
+  --accent-ink: var(--accent);
+  --accent-dim-ink: rgba(0, 240, 255, 0.16);
+
+  /* On-glass chrome (dock icons, tooltips, badges) — light on smoked glass */
+  --on-glass: #F2F6FC;
+  --on-glass-muted: #93A0B2;
+
+  /* Semantic colors */
+  --border: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.11);
+  --danger: #ef4444;
+  --danger-dim: rgba(239, 68, 68, 0.12);
+  --info: #3b82f6;
+  --info-dim: rgba(59, 130, 246, 0.12);
+  --warning: #FFB300;
+  --warning-dim: rgba(255, 179, 0, 0.12);
+  --success: #22c55e;
+  --success-dim: rgba(34, 197, 94, 0.12);
+
+  /* Semantic — ink-safe variants for frosted panels. Dark theme panels are
+     smoked glass, so these read as the bright set; light theme restores the
+     ≥4.5:1-on-white set. */
+  --danger-ink: #FF8A8A;
+  --success-ink: #5FD98B;
+  --warning-ink: #FBBF24;
+  --info-ink: #7DB3FF;
+
+  /* Typography */
+  --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-display: 'Outfit', 'Inter', -apple-system, sans-serif;
+
+  /* Cards — light-alpha fill so the dot grid reads through (was an ink-alpha
+     fill, which on a black page was simply invisible) */
+  --card-bg: rgba(255, 255, 255, 0.05);
+  --card-border: rgba(255, 255, 255, 0.09);
+
+  /* Toggle */
+  --toggle-bg: #2e3148;
+  --toggle-active: #00F0FF;
+
+  /* Glassmorphism */
+  --glass-bg: rgba(255, 255, 255, 0.08);
+  --glass-bg-heavy: rgba(255, 255, 255, 0.13);
+  --glass-border: rgba(255, 255, 255, 0.16);
+  --glass-border-strong: rgba(255, 255, 255, 0.3);
+
+  /* ── Smoked-glass surface system (requirement: dark mode = dark panels,
+       textured frosted glass you cannot see through, only sense) ── */
+  --fill-1: rgba(255, 255, 255, 0.05);   /* row / chip fill on a panel */
+  --fill-2: rgba(255, 255, 255, 0.09);   /* hover / raised fill */
+  --line-1: rgba(255, 255, 255, 0.10);   /* hairline on a panel */
+  --line-2: rgba(255, 255, 255, 0.17);   /* emphasised hairline */
+  --frost-1: rgba(21, 26, 36, 0.90);     /* panel gradient top */
+  --frost-2: rgba(13, 17, 24, 0.82);     /* panel gradient bottom */
+  --frost-border: rgba(255, 255, 255, 0.13);
+  --frost-highlight: rgba(255, 255, 255, 0.12); /* inset top light catch */
+  --dock-1: rgba(24, 29, 40, 0.92);
+  --dock-2: rgba(14, 18, 26, 0.84);
+  --tip-bg: rgba(27, 33, 45, 0.96);
+  --glass-panel-bg: rgba(6, 8, 12, 0.74); /* .surf-glass scrim/chrome */
+  --dot-ring: rgba(4, 8, 14, 0.85);       /* ring around the dock active dot */
+  --ball-ring: rgba(255, 255, 255, 0.08); /* glass-ball edge ring */
+  --ball-ring-hover: rgba(255, 255, 255, 0.11);
+  --focus-ring: var(--accent);
+  --on-accent: #06202B;      /* text on a filled --accent-ink chip */
+  --on-solid: #0F1722;       /* label on a .btn-solid pill (light pill, dark label) */
+
+  /* Fine frosted-glass grain — ONE seamless tile, uniform matte speckle only.
+     (The old tile had a second low-frequency "pebble" turbulence layer that
+     read as a bathroom floor; frosted glass is high-frequency and flat.) */
+  --frost-noise: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='1' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23g)' opacity='0.05'/%3E%3C/svg%3E");
+
+  /* Background dot grid — uniform, tiny, just enough to keep the screen from
+     feeling empty (replaces the starfield) */
+  --dot-grid: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='26' height='26'%3E%3Ccircle cx='1.5' cy='1.5' r='1.1' fill='%23FFFFFF' fill-opacity='0.22'/%3E%3C/svg%3E");
+  --dot-grid-size: 26px 26px;
+
+  /* Radius scale — 6 / 10 / 14 / 20 / 24 / pill */
+  --r-1: 6px;
+  --r-2: 10px;
+  --r-3: 14px;
+  --r-4: 20px;
+  --r-5: 24px;
+  --r-pill: 999px;
+
+  /* Elevation scale — depth comes from 3 steps, not extra blur */
+  --sh-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --sh-2: 0 8px 24px -6px rgba(0, 0, 0, 0.55);
+  --sh-3: 0 20px 48px -12px rgba(0, 0, 0, 0.75);
+  --sh-frost: inset 0 1px 0 rgba(255, 255, 255, 1),
+    0 0 0 0.5px rgba(0, 0, 0, 0.16),
+    0 24px 56px -20px rgba(0, 0, 0, 0.80);
+
+  /* Brand gradient */
+  --gradient-brand: linear-gradient(135deg, #FFFFFF 0%, #00F0FF 100%);
+  --gradient-brand-subtle: linear-gradient(135deg, rgba(255,255,255,0.08) 0%, rgba(0,240,255,0.15) 100%);
+
+  /* Glow */
+  --glow-accent: 0 0 20px rgba(0, 240, 255, 0.25), 0 0 60px rgba(0, 240, 255, 0.08);
+  --glow-teal: 0 0 16px rgba(0, 240, 255, 0.35);
+}
+
+/* Light theme — system preference */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg-0: #E8EBF1;
+    --bg-1: #ffffff;
+    --bg-2: #e7eaf1;
+    --bg-3: #d5d9e3;
+    --text-1: #171A20;
+    --text-2: #4A5060;
+    --text-3: #767C8A;
+    /* Ink returns to the near-black set — panels are white frost here */
+    --ink-1: #10161F;
+    --ink-2: #454E5D;
+    --ink-3: #5B6472;
+    --ink-line: rgba(11, 18, 32, 0.10);
+    --accent: #00F0FF;
+    --accent-dim: rgba(0, 240, 255, 0.08);
+    --accent-glow: rgba(0, 240, 255, 0.2);
+    --accent-ink: #155E75;
+    --accent-dim-ink: rgba(21, 94, 117, 0.12);
+    --on-glass: #111827;
+    --on-glass-muted: #5A6472;
+    --border: rgba(11, 18, 32, 0.10);
+    --border-strong: rgba(11, 18, 32, 0.18);
+    --danger: #dc2626;
+    --danger-dim: rgba(220, 38, 38, 0.08);
+    --info: #3b82f6;
+    --info-dim: rgba(59, 130, 246, 0.08);
+    --warning: #FFB300;
+    --warning-dim: rgba(255, 179, 0, 0.08);
+    --success: #16a34a;
+    --success-dim: rgba(22, 163, 74, 0.08);
+    --danger-ink: #B91C1C;
+    --success-ink: #127033;
+    --warning-ink: #B45309;
+    --info-ink: #1D4ED8;
+    --card-bg: #ffffff;
+    --card-border: rgba(11, 18, 32, 0.10);
+    --toggle-bg: #cbd2dc;
+    --toggle-active: #0E7490;
+    --glass-bg: rgba(255, 255, 255, 0.7);
+    --glass-bg-heavy: rgba(255, 255, 255, 0.9);
+    --glass-border: rgba(11, 18, 32, 0.10);
+    --glass-border-strong: rgba(11, 18, 32, 0.16);
+    --glow-accent: 0 0 20px rgba(99, 102, 241, 0.15);
+    /* Smoked-glass surface system, light edition (ink-alpha on white frost) */
+    --fill-1: rgba(11, 18, 32, 0.05);
+    --fill-2: rgba(11, 18, 32, 0.09);
+    --line-1: rgba(11, 18, 32, 0.13);
+    --line-2: rgba(11, 18, 32, 0.18);
+    --frost-1: rgba(255, 255, 255, 0.97);
+    --frost-2: rgba(246, 247, 250, 0.86);
+    --frost-border: rgba(11, 18, 32, 0.15);
+    --frost-highlight: rgba(255, 255, 255, 1);
+    --dock-1: rgba(255, 255, 255, 0.96);
+    --dock-2: rgba(245, 246, 250, 0.88);
+    --tip-bg: rgba(255, 255, 255, 0.97);
+    --glass-panel-bg: rgba(255, 255, 255, 0.88);
+    --dot-ring: rgba(255, 255, 255, 0.95);
+    --ball-ring: rgba(11, 18, 32, 0.14);
+    --ball-ring-hover: rgba(11, 18, 32, 0.22);
+    --focus-ring: var(--accent-ink);
+  --on-accent: #FFFFFF;
+  --on-solid: #FFFFFF;
+    --dot-grid: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='26' height='26'%3E%3Ccircle cx='1.5' cy='1.5' r='1.1' fill='%231B2233' fill-opacity='0.28'/%3E%3C/svg%3E");
+    --dot-grid-size: 26px 26px;
+    --gradient-brand: linear-gradient(135deg, #10161F 0%, #0E7490 100%);
+  }
+
+  /* Dot grid is theme-aware — light theme swaps in ink dots, no vignette */
+  :root:not([data-theme="dark"]) body,
+  :root:not([data-theme="dark"]) .starfield {
+    background-image: var(--dot-grid);
+    background-color: var(--bg-0);
+    background-size: var(--dot-grid-size);
+    background-repeat: repeat;
+    background-position: 0 0;
+    background-attachment: fixed;
+  }
+}
+
+/* Light theme — explicit toggle */
+:root[data-theme="light"] {
+  --bg-0: #E8EBF1;
+  --bg-1: #ffffff;
+  --bg-2: #e7eaf1;
+  --bg-3: #d5d9e3;
+  --text-1: #171A20;
+  --text-2: #4A5060;
+  --text-3: #767C8A;
+  /* Ink returns to the near-black set — panels are white frost here */
+  --ink-1: #10161F;
+  --ink-2: #454E5D;
+  --ink-3: #5B6472;
+  --ink-line: rgba(11, 18, 32, 0.10);
+  --accent: #00F0FF;
+  --accent-dim: rgba(0, 240, 255, 0.08);
+  --accent-glow: rgba(0, 240, 255, 0.2);
+  --accent-ink: #155E75;
+  --accent-dim-ink: rgba(21, 94, 117, 0.12);
+  --on-glass: #111827;
+  --on-glass-muted: #5A6472;
+  --border: rgba(11, 18, 32, 0.10);
+  --border-strong: rgba(11, 18, 32, 0.18);
+  --danger: #dc2626;
+  --danger-dim: rgba(220, 38, 38, 0.08);
+  --info: #3b82f6;
+  --info-dim: rgba(59, 130, 246, 0.08);
+  --warning: #FFB300;
+  --warning-dim: rgba(255, 179, 0, 0.08);
+  --success: #16a34a;
+  --success-dim: rgba(22, 163, 74, 0.08);
+  --danger-ink: #B91C1C;
+  --success-ink: #127033;
+  --warning-ink: #B45309;
+  --info-ink: #1D4ED8;
+  --card-bg: #ffffff;
+  --card-border: rgba(11, 18, 32, 0.10);
+  --toggle-bg: #cbd2dc;
+  --toggle-active: #0E7490;
+  --glass-bg: rgba(255, 255, 255, 0.7);
+  --glass-bg-heavy: rgba(255, 255, 255, 0.9);
+  --glass-border: rgba(11, 18, 32, 0.10);
+  --glass-border-strong: rgba(11, 18, 32, 0.16);
+  --glow-accent: 0 0 20px rgba(99, 102, 241, 0.15);
+  /* Smoked-glass surface system, light edition (ink-alpha on white frost) */
+  --fill-1: rgba(11, 18, 32, 0.05);
+  --fill-2: rgba(11, 18, 32, 0.09);
+  --line-1: rgba(11, 18, 32, 0.13);
+  --line-2: rgba(11, 18, 32, 0.18);
+  --frost-1: rgba(255, 255, 255, 0.97);
+  --frost-2: rgba(246, 247, 250, 0.86);
+  --frost-border: rgba(11, 18, 32, 0.15);
+  --frost-highlight: rgba(255, 255, 255, 1);
+  --dock-1: rgba(255, 255, 255, 0.96);
+  --dock-2: rgba(245, 246, 250, 0.88);
+  --tip-bg: rgba(255, 255, 255, 0.97);
+  --glass-panel-bg: rgba(255, 255, 255, 0.88);
+  --dot-ring: rgba(255, 255, 255, 0.95);
+  --ball-ring: rgba(11, 18, 32, 0.14);
+  --ball-ring-hover: rgba(11, 18, 32, 0.22);
+  --focus-ring: var(--accent-ink);
+  --on-accent: #FFFFFF;
+  --on-solid: #FFFFFF;
+  --dot-grid: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='26' height='26'%3E%3Ccircle cx='1.5' cy='1.5' r='1.1' fill='%231B2233' fill-opacity='0.28'/%3E%3C/svg%3E");
+  --dot-grid-size: 26px 26px;
+  --gradient-brand: linear-gradient(135deg, #10161F 0%, #0E7490 100%);
+}
+
+/* Dot grid is theme-aware — light theme swaps in ink dots, no vignette */
+:root[data-theme="light"] body,
+:root[data-theme="light"] .starfield {
+  background-image: var(--dot-grid);
+  background-color: var(--bg-0);
+  background-size: var(--dot-grid-size);
+  background-repeat: repeat;
+  background-position: 0 0;
+  background-attachment: fixed;
+}
+
+/* ═══ Base Reset ═══
+   MUST live in @layer base: Tailwind v4 utilities sit in @layer utilities,
+   and unlayered rules outrank EVERY layer — an unlayered `*{padding:0}`
+   silently killed every p-*, m-*, and space-y-* utility in the app (and the
+   unlayered `button{background:none}` killed every bg-* on buttons). */
+@layer base {
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body, #root { width: 100%; height: 100%; overflow: hidden; }
+  body {
+    font-family: var(--font-family);
+    font-feature-settings: 'ss01';
+    color: var(--text-1);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-size: 14px;
+    line-height: 1.5;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+}
+
+/* ═══ Background — uniform dot grid (requirement: the starfield read as
+   decorative noise; the screen just needs to not feel empty) ═══
+   Layer stack (top → bottom):
+     1. vignette  — soft radial edge falloff so panels float
+     2. dot tile   — seamless 26×26 SVG, 1.5px dots at 26px pitch, one tier,
+                     alpha tuned per theme via --dot-grid (dark: white @0.075,
+                     light: ink @0.16)
+   Zero runtime randomness, background-attachment: fixed, applied to `body`
+   so every screen inherits it (light theme swaps the tile below). */
+.starfield,
+body {
+  background-color: var(--bg-0);
+  background-image:
+    radial-gradient(135% 100% at 50% 40%, transparent 55%, rgba(0, 0, 0, 0.40)),
+    var(--dot-grid);
+  background-size: auto, var(--dot-grid-size);
+  background-repeat: no-repeat, repeat;
+  background-position: 0 0, 0 0;
+  background-attachment: fixed;
+}
+
+@layer base {
+  /* Display font for headings */
+  h1, h2, h3, h4, h5, h6,
+  .font-display { font-family: var(--font-display); }
+
+  button {
+    font-family: var(--font-family);
+    cursor: pointer;
+    border: none;
+    background: none;
+  }
+  input, textarea {
+    font-family: var(--font-family);
+  }
+}
+
+/* ═══ Focus-visible for keyboard navigation ═══ */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* On white frosted surfaces the focus ring must switch to the ink accent
+   (bright cyan is 1.3:1 on white) — spec §B7. */
+.surf-frost:focus-visible,
+.surf-frost :focus-visible,
+.dock:focus-visible,
+.dock :focus-visible,
+.dock-tip:focus-visible {
+  outline-color: var(--accent-ink);
+}
+
+/* ═══ Scrollbar ═══ */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+/* Thumb on frosted panels — theme-aware (ink-alpha on white frost, light-alpha
+   on smoked glass); unlayered rules beat utilities, so scope it here. */
+.surf-frost ::-webkit-scrollbar-thumb,
+.surf-frost::-webkit-scrollbar-thumb,
+.dock ::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+}
+.surf-frost ::-webkit-scrollbar-thumb:hover,
+.surf-frost::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-3);
+}
+
+/* ═══ Range Input ═══ */
+input[type="range"] {
+  -webkit-appearance: none;
+  height: 3px;
+  background: var(--border-strong);
+  border-radius: 2px;
+  outline: none;
+}
+input[type="range"]:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 4px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  /* --accent-ink is theme-collapsed: bright accent on dark, ink on white */
+  background: var(--accent-ink);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid var(--frost-1);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
+/* Track on frosted panels reads stronger than the page-level hairline. */
+.surf-frost input[type="range"] {
+  background: var(--fill-2);
+}
+.surf-frost input[type="range"]:focus-visible {
+  outline-color: var(--accent-ink);
+}
+
+/* ═══ Global surface system (spec §B4, revision 2) ═══
+   3 levels replacing scattered inline styles.
+   Law: never text tokens inside .surf-frost · never ink tokens on starfield.
+   Revision 2: panels are TEXTURED frosted glass — you cannot see through
+   them, you only sense what is behind. --frost-* / --dock-* tokens flip with
+   the theme: dark → smoked glass + light ink, light → white frost + dark ink. */
+
+/* .surf-frost — DEFAULT for content surfaces (settings, lists, cards, drawers,
+   dialogs, search, empty states). Ink text tokens inside.
+   NOTE: surface chrome lives in @layer components so that layered utilities
+   (bg-*, border-*, text-*, hover:*) can override it — Tailwind v4 orders
+   components BEFORE utilities, and an unlayered rule would beat every
+   utility no matter the specificity. */
+@layer components {
+.surf-frost {
+  background-color: var(--frost-1);
+  background-image: var(--frost-noise),
+    linear-gradient(180deg, var(--frost-1), var(--frost-2));
+  background-size: 160px 160px, auto;
+  backdrop-filter: blur(34px) saturate(155%);
+  -webkit-backdrop-filter: blur(34px) saturate(155%);
+  border: 1px solid var(--frost-border);
+  box-shadow:
+    inset 0 1px 0 var(--frost-highlight),
+    0 0 0 0.5px rgba(0, 0, 0, 0.18),
+    0 24px 56px -20px rgba(0, 0, 0, 0.70);
+  color: var(--ink-1);
+}
+
+/* .surf-glass — obsidian scrim / receding chrome → TEXT tokens (theme-aware:
+   light theme gets a white panel, so text-1 stays legible in both) */
+.surf-glass {
+  background: var(--glass-panel-bg);
+  backdrop-filter: blur(30px) saturate(150%);
+  -webkit-backdrop-filter: blur(30px) saturate(150%);
+  border: 1px solid var(--line-1);
+  color: var(--text-1);
+}
+
+/* .surf-clear / .surf-clear-on-dark — NO blur (cheap) for rows, chips, hovers */
+.surf-clear {
+  background: var(--fill-1);
+}
+.surf-clear-on-dark {
+  background: var(--fill-1);
+}
+
+/* .scrim — modal / drawer backdrop */
+.scrim {
+  background: rgba(0, 0, 0, 0.50);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+/* .btn-solid — the primary CTA pill. Filled with the ink token so it flips
+   with the theme: light pill + dark label on smoked glass, near-black pill +
+   white label on white frost. Hover = the next ink step (same flip). */
+.btn-solid {
+  background: var(--ink-1);
+  color: var(--on-solid);
+}
+.btn-solid:hover {
+  background: var(--ink-2);
+}
+}
+
+/* ═══ Device bubbles (revision 3) ═══
+   DOM layers (bottom → top): .glass-ball → __lift → __body → __ao → __device
+   → __label. The baked-in shine (sheen / spec / spec2 / caustic / fresnel),
+   the 1px edge ring, and the cyan caustic blob are GONE — the sphere is a
+   plain frosted orb that reads against the page via a soft internal gradient
+   only. Perf: blur 14px (not 24) · never animate filter/backdrop-filter/
+   box-shadow — transform + opacity only. */
+
+/* Physics wrapper — transform owned by useBubblePhysics. border-radius 50%
+   keeps the drop shadows circular (children stay unclipped). */
+.glass-ball {
+  contain: layout style;
+  border-radius: 50%;
+  will-change: transform;
+  box-shadow:
+    0 20px 34px -14px rgba(0, 0, 0, 0.85),
+    0 6px 14px -4px rgba(0, 0, 0, 0.55);
+}
+
+/* Hover / selected / dragging scale lives HERE, never on the physics wrapper */
+.glass-ball__lift {
+  width: 100%;
+  height: 100%;
+  transform-origin: 50% 50%;
+  transition: transform 220ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+.glass-ball:hover .glass-ball__lift {
+  transform: scale(1.045);
+}
+.glass-ball[data-selected] .glass-ball__lift,
+.glass-ball__lift[data-selected] {
+  transform: scale(1.06);
+}
+.glass-ball[data-dragging] .glass-ball__lift,
+.glass-ball__lift[data-dragging] {
+  transform: scale(0.97);
+}
+
+/* Deeper shadow on hover / selected, tighter while dragging (not transitioned) */
+.glass-ball:hover {
+  box-shadow:
+    0 26px 44px -14px rgba(0, 0, 0, 0.9),
+    0 8px 18px -4px rgba(0, 0, 0, 0.6);
+}
+.glass-ball[data-selected] {
+  box-shadow:
+    0 20px 34px -14px rgba(0, 0, 0, 0.85),
+    0 6px 14px -4px rgba(0, 0, 0, 0.55),
+    0 0 34px -6px var(--accent-glow);
+}
+.glass-ball[data-dragging] {
+  box-shadow:
+    0 12px 22px -12px rgba(0, 0, 0, 0.8),
+    0 4px 10px -4px rgba(0, 0, 0, 0.5);
+}
+
+/* Frosted orb body — one soft highlight, one soft edge falloff, no caustics */
+.glass-ball__body {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 30% 22%, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 30%, rgba(255, 255, 255, 0) 55%),
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 62%, rgba(0, 0, 0, 0.35) 100%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0.02) 45%, rgba(0, 0, 0, 0.35) 100%);
+  backdrop-filter: blur(14px) saturate(150%) brightness(112%) contrast(106%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%) brightness(112%) contrast(106%);
+}
+
+/* Light theme: the orb flips to a white sphere with a hairline ink edge so
+   it still reads as an object on the pale dot-grid page (no cyan caustic). */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .glass-ball__body {
+    background:
+      radial-gradient(circle at 32% 24%, rgba(255, 255, 255, 0.98) 0%, rgba(255, 255, 255, 0.68) 34%, rgba(255, 255, 255, 0) 62%),
+      radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.88) 0%, rgba(255, 255, 255, 0.52) 66%, rgba(11, 18, 32, 0.10) 100%);
+    box-shadow: inset 0 0 0 1px rgba(11, 18, 32, 0.07);
+    backdrop-filter: blur(14px) saturate(110%);
+    -webkit-backdrop-filter: blur(14px) saturate(110%);
+  }
+}
+:root[data-theme="light"] .glass-ball__body {
+  background:
+    radial-gradient(circle at 32% 24%, rgba(255, 255, 255, 0.98) 0%, rgba(255, 255, 255, 0.68) 34%, rgba(255, 255, 255, 0) 62%),
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.88) 0%, rgba(255, 255, 255, 0.52) 66%, rgba(11, 18, 32, 0.10) 100%);
+  box-shadow: inset 0 0 0 1px rgba(11, 18, 32, 0.07);
+  backdrop-filter: blur(14px) saturate(110%);
+  -webkit-backdrop-filter: blur(14px) saturate(110%);
+}
+
+/* Ambient-occlusion contact pool — dark pool BEHIND the device */
+.glass-ball__ao {
+  position: absolute;
+  inset: 16% 28% 16% 22%;
+  border-radius: 50%;
+  background: radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0) 72%);
+  filter: blur(6px);
+  pointer-events: none;
+}
+
+/* Suspended 3D device model (optical center lifted 3%) */
+.glass-ball__device {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-3%);
+  filter:
+    drop-shadow(0 6px 8px rgba(0, 0, 0, 0.55))
+    drop-shadow(0 1px 1px rgba(255, 255, 255, 0.10));
+}
+.glass-ball[data-selected] .glass-ball__device,
+.glass-ball__lift[data-selected] .glass-ball__device {
+  filter:
+    drop-shadow(0 6px 8px rgba(0, 0, 0, 0.55))
+    drop-shadow(0 1px 1px rgba(255, 255, 255, 0.10))
+    brightness(1.08);
+}
+
+/* Device label — bottom 14%, truncate at 68% width.
+   Font = max(10, radius × 0.12); radius exposed as --ball-radius by the component. */
+.glass-ball__label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 14%;
+  margin-inline: auto;
+  max-width: 68%;
+  font-size: max(10px, calc(var(--ball-radius, 70px) * 0.12));
+  font-weight: 600;
+  line-height: 1.2;
+  text-align: center;
+  color: var(--text-1);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.85);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+/* Light theme: the label sits on a near-white sphere over a light page, so
+   the halo inverts (dark drop shadow on a light sphere reads as dirt). */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) .glass-ball__label {
+    text-shadow: 0 1px 6px rgba(255, 255, 255, 0.9);
+  }
+}
+:root[data-theme="light"] .glass-ball__label {
+  text-shadow: 0 1px 6px rgba(255, 255, 255, 0.9);
+}
+
+
+
+
+
+
+/* Backdrop-filter budget escape hatch: drop the blur, raise the tint alphas */
+.glass-ball--noblur .glass-ball__body {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background:
+    radial-gradient(circle at 30% 22%, rgba(255, 255, 255, 0.30) 0%, rgba(255, 255, 255, 0.10) 30%, rgba(255, 255, 255, 0) 55%),
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.08) 0%, rgba(255, 255, 255, 0) 62%, rgba(0, 0, 0, 0.35) 100%),
+    linear-gradient(155deg, rgba(255, 255, 255, 0.16) 0%, rgba(255, 255, 255, 0.05) 45%, rgba(0, 0, 0, 0.40) 100%),
+    rgba(11, 18, 32, 0.45);
+}
+
+/* ═══ Frosted glass dock (spec §B3, revision 2) ═══
+   Theme tokens: dark → smoked glass with light icons, light → white frost
+   with ink icons. --on-glass (hover), --on-glass-muted (default icon),
+   --accent-ink (active dot / badges / focus) all flip with the theme, so
+   components only ever reference the tokens.
+    A single fixed dock — no tray/flyout expansion.
+   In @layer components so utilities (bg-*, hover:*, sizing) can override. */
+@layer components {
+.dock {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 48px;
+  z-index: 100;
+  height: 56px;
+  padding: 8px 10px;
+  border-radius: 18px;
+  gap: 4px;
+  background-color: var(--dock-1);
+  background-image: var(--frost-noise),
+    linear-gradient(180deg, var(--dock-1), var(--dock-2));
+  background-size: 160px 160px, auto;
+  backdrop-filter: blur(28px) saturate(170%);
+  -webkit-backdrop-filter: blur(28px) saturate(170%);
+  border: 1px solid var(--frost-border);
+  box-shadow:
+    inset 0 1px 0 var(--frost-highlight),
+    inset 0 -1px 0 var(--frost-highlight),
+    0 0 0 0.5px rgba(0, 0, 0, 0.20),
+    0 14px 34px -8px rgba(0, 0, 0, 0.60),
+    0 4px 10px rgba(0, 0, 0, 0.35);
+}
+
+/* Dock tooltip — frosted, ink/on-glass text, 11px/600 */
+.dock-tip {
+  background: var(--tip-bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  color: var(--on-glass);
+  border: 1px solid var(--frost-border);
+  border-radius: 10px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.35),
+    0 0 0 0.5px rgba(0, 0, 0, 0.18);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 6px 10px;
+}
+}
+
+/* Subtle tactile treatments: matte note stock and brushed file metadata cards. */
+.texture-ink {
+  background-image: radial-gradient(rgba(255,255,255,.018) .65px, transparent .65px),
+    linear-gradient(145deg, rgba(255,255,255,.025), transparent 58%);
+  background-size: 5px 5px, 100% 100%;
+}
+.texture-metal {
+  background-image: repeating-linear-gradient(112deg, rgba(255,255,255,.025) 0 1px, transparent 1px 4px),
+    linear-gradient(145deg, rgba(255,255,255,.045), transparent 42%, rgba(0,240,255,.025));
+  box-shadow: inset 0 1px rgba(255,255,255,.08), 0 12px 28px rgba(0,0,0,.24);
+}
+
+/* ═══ Gradient text ═══ */
+.gradient-text {
+  background: var(--gradient-brand);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ═══ Animations & Keyframes ═══ */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+}
+
+@keyframes success-pop {
+  0% { transform: scale(0); opacity: 0; }
+  50% { transform: scale(1.15); }
+  100% { transform: scale(1); opacity: 1; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-scale-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes slide-down {
+  from { opacity: 0; transform: translateY(-10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.85); }
+}
+
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: var(--glow-accent); }
+  50% { box-shadow: 0 0 30px rgba(99, 102, 241, 0.4), 0 0 80px rgba(99, 102, 241, 0.12); }
+}
+
+@keyframes logo-entrance {
+  0%   { opacity: 0; transform: scale(0.7) rotate(-8deg); filter: blur(8px); }
+  60%  { opacity: 1; transform: scale(1.05) rotate(1deg); filter: blur(0px); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); filter: blur(0px); }
+}
+
+/* ═══ Animation Classes ═══ */
+.animate-shimmer {
+  background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 50%, var(--bg-2) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+}
+.animate-shake { animation: shake 0.4s ease-in-out; }
+.animate-success-pop { animation: success-pop 0.3s ease-out; }
+.animate-fade-in { animation: fade-in 0.25s ease-out; }
+.animate-fade-scale-in { animation: fade-scale-in 0.2s ease-out; }
+.animate-spin { animation: spin 1s linear infinite; }
+.animate-slide-in-right { animation: slideInRight 0.25s ease-out; }
+.animate-slide-down { animation: slide-down 0.2s ease-out; }
+.animate-slide-up { animation: slide-up 0.2s ease-out; }
+.animate-pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+.animate-glow-pulse { animation: glow-pulse 3s ease-in-out infinite; }
+.animate-logo-entrance { animation: logo-entrance 0.7s cubic-bezier(0.34, 1.56, 0.64, 1) forwards; }
+
+/* Button press effect */
+.btn-press {
+  transition: transform 0.1s ease;
+}
+.btn-press:active {
+  transform: scale(0.95);
+}
+
+/* ═══ Scroll Performance ═══ */
+.overflow-y-auto,
+.overflow-x-auto {
+  will-change: transform;
+  overscroll-behavior: contain;
+}
+
+.list-item-contain {
+  contain: layout style paint;
+}
+
+/* ═══ Reduced motion ═══ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  /* Glass ball: no lift transition, no hover scale (spec §B7) */
+  .glass-ball__lift {
+    transition: none !important;
+  }
+  .glass-ball:hover .glass-ball__lift {
+    transform: none;
+  }
+
+  /* Starfield: no twinkle by default — pin it so it can never animate */
+  .starfield,
+  body {
+    animation: none !important;
+  }
+}

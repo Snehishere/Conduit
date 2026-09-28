@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Conduit</string>
+    <string name="accessibility_service_description">Lets Conduit send taps, gestures and key presses to this device when your desktop sends remote input, or when you tap a mirrored screen.</string>
+</resources>

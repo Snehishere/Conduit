@@ -1,0 +1,88 @@
+# ---- Rust / Cargo ----
+/target
+**/target
+# only the workspace-root lockfile is authoritative
+**/Cargo.lock
+!/Cargo.lock
+
+# ---- Node / Vite / TS ----
+node_modules
+/dist
+**/dist
+*.tsbuildinfo
+.vite
+.eslintcache
+coverage
+/test-results
+/playwright-report
+/blob-report
+/playwright/.cache
+
+# ---- Flutter / Dart ----
+.dart_tool
+.flutter-plugins
+.flutter-plugins-dependencies
+**/.dart_tool
+**/build/
+.pub-cache
+.pub
+pubspec_overrides.yaml
+
+# ---- Android ----
+**/android/.gradle
+**/android/.kotlin
+**/android/local.properties
+**/android/app/debug
+**/android/app/profile
+**/android/app/release
+*.iml
+
+# ---- iOS ----
+**/ios/Flutter/ephemeral
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Pods
+**/ios/.symlinks
+**/ios/Flutter/ephemeral/.plugin_symlinks
+
+# ---- Rust vendored OpenSSL (~80MB) ----
+# Intended to be fetched by a script, but no fetch script exists yet
+# (scripts/fetch-openssl.ps1 is tracked as W5.1 in docs/REMAINING_WORK.md).
+/.tools/
+
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+/secrets/
+
+# ---- Relay runtime state ----
+/services/relay/secrets/
+/services/relay/data/
+/services/relay/certs/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- Logs / artifacts ----
+*.log
+*.mp4
+clippy_out.txt
+scratch_*.ts
+
+# ---- opencode ----
+/.opencode/node_modules

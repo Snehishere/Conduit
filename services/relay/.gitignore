@@ -1,0 +1,6 @@
+/target
+
+# Runtime secrets and state — never commit
+/secrets/
+/data/
+

@@ -1,0 +1,10 @@
+# Use prebuilt OpenSSL for SQLCipher builds on Windows.
+# The bundled-sqlcipher feature compiles SQLCipher from source but still needs
+# a system crypto library (OpenSSL/LibreSSL) to link against.
+#
+# Prebuilt OpenSSL is at <workspace>/.tools/openssl-win64/ (downloaded from
+# https://github.com/TaurusTLS-Developers/OpenSSL-Distribution/releases).
+#
+[env]
+OPENSSL_LIB_DIR = { value = ".tools/openssl-win64/lib/static", relative = true }
+OPENSSL_INCLUDE_DIR = { value = ".tools/openssl-win64/include", relative = true }

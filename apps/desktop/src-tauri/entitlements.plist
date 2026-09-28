@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Conduit macOS Entitlements
+  These entitlements are required for macOS App Store distribution and notarization.
+  Only request what is strictly necessary — Apple reviews each entitlement.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Allow unsigned executable memory (required by Tauri/WRY webview) -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- Allow outgoing network connections (WebSocket server, mDNS) -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
+    <!-- Allow incoming network connections (WebSocket server binds to 0.0.0.0) -->
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- Required for microphone access (audio streaming feature) -->
+    <key>com.apple.security.device.microphone</key>
+    <true/>
+
+    <!-- Required for screen recording / screen mirror feature -->
+    <key>com.apple.security.screen-capture</key>
+    <true/>
+
+    <!-- Required for screen capture (macOS 13+ alternative key) -->
+    <key>com.apple.security.device.screen-capture-recording</key>
+    <true/>
+
+    <!-- App Sandbox — required for App Store distribution -->
+    <!-- Set to false for direct distribution / notarization outside App Store -->
+    <key>com.apple.security.app-sandbox</key>
+    <false/>
+
+    <!-- Allow read/write access to Downloads folder for received files -->
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+
+    <!-- Allow reading user-selected files (file picker) -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>
