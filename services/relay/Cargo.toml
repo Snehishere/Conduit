@@ -5,7 +5,7 @@ edition = "2024"
 
 [dev-dependencies]
 tokio-test = "0.4"
-serial_test = "3"
+serial_test = "4"
 
 [dependencies]
 env_logger = { workspace = true }
