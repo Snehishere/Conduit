@@ -41,6 +41,6 @@
     "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-76.png": "a281c1872279591b84b844f4c68231464a3c7cbe848544e510aa97eeb4f65cc3",
     "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-76@2x.png": "65ecc356f6afd991a2f7d7494019fca31119051774742e4cdfb72ec893f1afd2",
     "apps/mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset/Icon-83.5@2x.png": "5bee17d146de2da53adf96ee2c12c297716a4f64b2b64a17588e0c3c5fd04677",
-    "apps/mobile/lib/widgets/conduit_logo.dart": "4e69589079c3542883b1f23d305550a15f573a9098eac5874349ad1d8b0878bf"
+    "apps/mobile/lib/widgets/conduit_logo.dart": "ec1ff40c54fa3377391cfe86d647e0d9ed7857778e8f4b8f7353981a578a5926"
   }
 }

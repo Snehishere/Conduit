@@ -1,0 +1,14 @@
+# Dependencies for the brand-asset generator in this directory.
+#
+# Used by:
+#   scripts/icons/build_icons.py   (npm run icons, from apps/desktop)
+#   scripts/icons/verify_icons.py  (npm run icons:verify)
+#   .github/workflows/ci.yml       (the "icon drift" job)
+#
+# The pin is deliberate, not a floor. verify_icons.py asserts on the alpha and
+# antialiasing of the rendered output, and Pillow's rasteriser differs between
+# releases - an unpinned or floating install makes the icon-drift check fail
+# for reasons that have nothing to do with the mark. Bump this by hand and
+# re-run the generator, so the version change and the regenerated assets land
+# in the same commit.
+Pillow==12.3.0

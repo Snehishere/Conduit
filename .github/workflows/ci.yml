@@ -481,19 +481,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          # `cache: pip` (the v5 default) makes this action hash a dependency
-          # file to build its cache key, and fails the step outright when it
-          # cannot find one. The icon scripts are stdlib-only apart from the
-          # single pinned Pillow install below, so there is no requirements.txt
-          # or pyproject.toml to hash and nothing worth caching.
-          cache: 'false'
+          # setup-python v5 enables pip caching by default, and its cache key
+          # is a hash of a dependency file. With no requirements.txt it fails
+          # the step outright ("No file ... matched to [**/requirements.txt or
+          # **/pyproject.toml]"), which is what this job hit on the first run.
+          # The fix is to declare the dependency rather than to switch caching
+          # off: the icon scripts do need Pillow, and having it pinned in one
+          # place beats pinning it in a CI command and a doc comment.
+          #
+          # Note `cache: 'false'` is NOT how you disable it - the input is
+          # parsed as a backend name and fails with "Caching for 'false' is
+          # not supported". Use an empty value if it ever needs turning off.
+          cache: pip
+          cache-dependency-path: scripts/icons/requirements.txt
 
-      - run: pip install 'Pillow==12.3.0'
-        # The pin is a real published version; it was verified against a
-        # local 12.3.0 install, and it matters because the alpha and
-        # antialiasing assertions in verify_icons.py are sensitive to
-        # Pillow's rasteriser. Bumping it is a deliberate act, not a
-        # side effect of a Dependabot run.
+      - name: Install icon-generator dependencies
+        # The pinned version comes from the requirements file so the script, CI
+        # and the documentation cannot disagree about it.
+        working-directory: scripts/icons
+        run: pip install -r requirements.txt
 
       - name: Regenerate and verify every brand asset
         # Verified locally before the first run: 36 tracked files,

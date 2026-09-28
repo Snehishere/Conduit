@@ -19,7 +19,8 @@ Design rules that fall out of having one generator:
     larger than the base image, which is why the committed icon.ico contained a
     single 16x16 frame while the generator reported six.
 
-Requires: Pillow  (pip install Pillow)
+Requires: Pillow, pinned. See requirements.txt in this directory for the
+             version and why the pin matters.
 
 Usage:
     python scripts/icons/build_icons.py            # write assets + manifest
@@ -42,7 +43,7 @@ import tempfile
 try:
     from PIL import Image, ImageDraw
 except ImportError:  # pragma: no cover
-    sys.exit("Pillow is required: pip install Pillow")
+    sys.exit("Pillow is required: pip install -r scripts/icons/requirements.txt")
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 SPEC_PATH = os.path.join(REPO, "assets", "brand", "conduit.mark.json")
