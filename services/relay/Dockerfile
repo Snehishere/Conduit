@@ -27,7 +27,7 @@ COPY services/relay/src services/relay/src
 COPY packages/protocol/src packages/protocol/src
 RUN cargo build --release --locked -p relay
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache libgcc ca-certificates
 RUN adduser -D -u 1001 relay
 # Workspace builds place the binary in the ROOT target/, not services/relay/target.
