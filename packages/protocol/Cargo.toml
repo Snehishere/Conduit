@@ -16,4 +16,4 @@ subtle = "2"
 log = { workspace = true }
 
 [dev-dependencies]
-jsonschema = "0.57.0"
+jsonschema = "0.58.0"
