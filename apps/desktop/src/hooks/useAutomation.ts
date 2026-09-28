@@ -2,12 +2,30 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useSharedWebSocket } from './useWebSocket';
 import type {
-  any as AutomationRule,
+  AutomationActionPayload,
   AutomationTrigger,
-  any,
 } from '../types/websocket';
 
-export type { AutomationRule, AutomationTrigger, any };
+/**
+ * The rule shape this hook holds in client state.
+ *
+ * Deliberately NOT an alias of the wire type: `AutomationRuleMessage` carries
+ * a `type`/`action` discriminant and names the payload `rule_action`, whereas
+ * the local shape drops the discriminants and adds two counters the UI
+ * maintains. The trigger and action payloads are borrowed from the generated
+ * protocol types so the two cannot drift on the fields that matter.
+ */
+export type AutomationRule = {
+  id: string;
+  name: string;
+  trigger: AutomationTrigger;
+  action: AutomationActionPayload;
+  enabled: boolean;
+  triggerCount: number;
+  lastTriggered?: number;
+};
+
+export type { AutomationTrigger };
 
 /**
  * Loosely-typed inbound automation payload.

@@ -14,11 +14,15 @@ import {
   AppWindow,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import type { any, any } from '../../types/websocket';
+import type { AutomationActionPayload, AutomationTrigger } from '../../types/websocket';
 
 // Sentence case, matching every other label in the app. These were Title Case
 // ("Device Connects", "Send Notification"), which read as a different product.
-export const TRIGGER_TYPES: { id: any; label: string }[] = [
+//
+// The `id` types are indexed off the generated protocol types rather than left
+// loose, so adding a trigger or action to `packages/protocol` makes this list a
+// compile error until the label is added too.
+export const TRIGGER_TYPES: { id: AutomationTrigger['type']; label: string }[] = [
   { id: 'device_connect', label: 'Device connects' },
   { id: 'device_disconnect', label: 'Device disconnects' },
   { id: 'time', label: 'Time of day' },
@@ -28,7 +32,7 @@ export const TRIGGER_TYPES: { id: any; label: string }[] = [
   { id: 'audio_device_connect', label: 'Audio device connects' },
 ];
 
-export const ACTION_TYPES: { id: any; label: string }[] = [
+export const ACTION_TYPES: { id: AutomationActionPayload['type']; label: string }[] = [
   { id: 'send_notification', label: 'Send notification' },
   { id: 'set_phone_profile', label: 'Set phone profile' },
   { id: 'route_audio', label: 'Route audio' },

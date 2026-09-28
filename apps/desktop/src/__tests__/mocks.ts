@@ -4,7 +4,9 @@
  */
 
 import { vi } from 'vitest';
-import type { any } from '../types/websocket';
+import type { AutomationRule } from '../../hooks/useAutomation';
+
+export type { AutomationRule };
 
 // ─── Types (mirror src types for fixture safety) ──────────────────────────────
 
@@ -30,7 +32,7 @@ export interface Notification {
   dismissed: boolean;
 }
 
-export type { any as AutomationRule };
+export type { AutomationRule };
 
 // ─── Fixture factories ────────────────────────────────────────────────────────
 
@@ -61,7 +63,7 @@ export function makeNotification(overrides: Partial<Notification> = {}): Notific
   };
 }
 
-export function makeAutomationRule(overrides: Partial<any> = {}): any {
+export function makeAutomationRule(overrides: Partial<AutomationRule> = {}): AutomationRule {
   return {
     id: 'rule-1',
     name: 'Auto silence on connect',
