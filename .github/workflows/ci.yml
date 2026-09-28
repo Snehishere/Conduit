@@ -515,19 +515,19 @@ jobs:
         run: python ../../scripts/icons/build_icons.py --check
 
       - name: Fail if regeneration changed anything
-        run: |
-          if ! git diff --exit-code -- \
-            ../../assets/brand \
-            src-tauri/icons \
-            public \
-            src/components/icons/ConduitLogo.tsx \
-            ../mobile/assets \
-            ../mobile/lib/widgets/conduit_logo.dart \
-            ../mobile/ios/Runner/Assets.xcassets/AppIcon.appiconset \
-            ../mobile/android/app/src/main/res ; then
-            echo "::error title=Brand assets are stale::Every Conduit logo, icon and favicon is generated from assets/brand/conduit.mark.json. Run 'npm run icons' in apps/desktop and commit the result. Do not hand-edit a generated file."
-            exit 1
-          fi
+        # Deliberately NOT `git diff --exit-code`.
+        #
+        # PNG's IDAT chunk is a zlib deflate stream, and Pillow's Windows and
+        # manylinux wheels statically link different zlib builds. The same
+        # artwork therefore renders to different bytes on different machines,
+        # so a byte-level diff reported drift on all 36 assets on the first
+        # run while verify_icons.py, sat next to it, reported none - the
+        # pixels were identical and only the encoding differed.
+        #
+        # compare_generated.py compares what an asset *is*: decoded pixel
+        # buffers for images, bytes for the text outputs. That makes the check
+        # both correct and platform-independent.
+        run: python ../../scripts/icons/compare_generated.py
 
   # ------------------------------------------------------------------
   # Flutter: format, analyze, unit tests.

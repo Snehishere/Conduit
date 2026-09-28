@@ -21,7 +21,6 @@ const List<Offset> kCenterline = <Offset>[
   Offset(38, 48),
   Offset(62, 48),
 ];
-
 class _ConduitSegment {
   final Offset a;
   final Offset b;
@@ -69,7 +68,6 @@ class ConduitLogo extends StatelessWidget {
     child: CustomPaint(painter: _ConduitLogoPainter(color: color)),
   );
 }
-
 class _ConduitLogoPainter extends CustomPainter {
   final Color? color;
 

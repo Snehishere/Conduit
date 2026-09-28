@@ -34,11 +34,8 @@ import io
 import json
 import math
 import os
-import shutil
 import struct
-import subprocess
 import sys
-import tempfile
 
 try:
     from PIL import Image, ImageDraw
@@ -224,29 +221,6 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _dart_format(source: str) -> str:
-    """Run `dart format` over a generated Dart file's contents.
-
-    Returns the source unchanged if Dart is unavailable, so the generator still
-    works on a machine with only Python. CI has Dart and enforces the format
-    gate, and `icon drift` compares hashes, so a stale local format is caught
-    rather than shipped.
-    """
-    exe = shutil.which("dart") or shutil.which("flutter")
-    if exe is None:
-        return source
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "out.dart")
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(source)
-        try:
-            subprocess.run([exe, "format", "--output=write", path],
-                           check=True, capture_output=True, timeout=120)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return source
-        with open(path, "r", encoding="utf-8", newline="") as fh:
-            return fh.read()
-
 
 def build() -> dict[str, str]:
     spec = load_spec()
@@ -295,8 +269,21 @@ def build() -> dict[str, str]:
     # output from a template is whitespace-fragile, so normalise with the real
     # formatter when it is on PATH. Deterministic for a given Dart version, and
     # the manifest hash still catches any drift.
+    # The emitted Dart is written exactly as the template renders it.
+    #
+    # An earlier version ran `dart format` over the output when a Dart SDK
+    # happened to be on PATH, and emitted the unformatted source otherwise.
+    # That made the generator's output depend on the machine: the same commit
+    # rendered differently on a contributor with Flutter installed and on the
+    # CI runner without it, so the icon-drift check reported drift that was not
+    # there. The formatter inserts blank lines between top-level declarations,
+    # so the two variants differed in more than whitespace.
+    #
+    # Generated output must be a pure function of the spec. If you want the Dart
+    # formatted, format it and commit the result - do not make the generator
+    # depend on a toolchain it does not otherwise require.
     dart_src = dart_for(mark, accent)
-    dart_src = _dart_format(dart_src)
+
 
     for key, text in (("svg", svg_for(spec, mark, int(spec["emittedSources"]["svg"]["grid"]))),
                       ("tsx", tsx_for(mark, accent)),
