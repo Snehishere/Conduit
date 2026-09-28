@@ -46,6 +46,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 MANIFEST = os.path.join(REPO, "assets", "brand", "icon-manifest.json")
 RENDERABLE = (".png",)
+# `.ico` and `.icns` are directories of embedded PNGs, not rasters. Each
+# embedded PNG has its own deflate stream, so they get the same pixel-level
+# treatment as a bare .png - see frames().
+CONTAINERS = (".ico", ".icns")
 
 
 def git(*args: str) -> str:
@@ -77,6 +81,60 @@ def pixels(data: bytes) -> tuple:
 
     with Image.open(io.BytesIO(data)) as img:
         return (img.size, img.convert("RGBA").tobytes())
+
+
+def frames(data: bytes, path: str) -> tuple:
+    """Every image in a container asset, as a sorted tuple of comparable keys.
+
+    `.ico` and `.icns` are not rasters - they are directories of embedded PNGs,
+    and each embedded PNG has its own deflate stream. So the encoding differs
+    per frame, and the whole-file byte comparison in `pixels()` is not
+    meaningful for them either. Decode each frame and compare pixels.
+
+    Returned keys are (identity, size, rgba) so a frame that moved position or
+    changed size is still caught, while a re-deflate of identical pixels is not.
+    """
+    import io
+    import struct
+
+    lower = path.lower()
+    out = []
+
+    if lower.endswith(".ico"):
+        with Image.open(io.BytesIO(data)) as img:
+            ico = getattr(img, "ico", None)
+            if ico is None:  # a single-frame .ico
+                return ((None,) + pixels(data),)
+            for size in sorted(ico.sizes()):
+                frame = ico.getimage(size)
+                out.append((str(size), *pixels_data(frame)))
+        return tuple(out)
+
+    if lower.endswith(".icns"):
+        # The same layout `build_icons.encode_icns` writes: an "icns" magic,
+        # a total length, then [4-byte OSType][8-byte length][PNG payload]
+        # chunks. Parsed back rather than decoded so no library is needed.
+        if data[:4] != b"icns":
+            raise ValueError("not an icns file")
+        pos = 8
+        while pos + 8 <= len(data):
+            ostype = data[pos : pos + 4]
+            (length,) = struct.unpack(">I", data[pos + 4 : pos + 8])
+            if length < 8 or pos + length > len(data):
+                raise ValueError(f"bad icns chunk at {pos}")
+            payload = data[pos + 8 : pos + length]
+            pos += length
+            if payload[:8] == b"\x89PNG\r\n\x1a\n":
+                out.append((ostype.decode("latin1"),) + pixels(payload))
+        return tuple(out)
+
+    return (pixels(data),)
+
+
+def pixels_data(img) -> tuple:
+    """(size, rgba) for an already-open image."""
+    return (img.size, img.convert("RGBA").tobytes())
+
 
 
 def main() -> int:
@@ -116,12 +174,12 @@ def main() -> int:
             compared += 1
             continue
 
-        # Bytes differ. If it is a renderable image, decide whether the
-        # artwork changed or only the encoding did.
-        if path.lower().endswith(RENDERABLE):
+        # Bytes differ. If it is an image or an image container, decide whether
+        # the artwork changed or only the encoding did.
+        if path.lower().endswith(RENDERABLE + CONTAINERS):
             try:
-                if pixels(old) == pixels(new):
-                    compared += 1  # same image, different deflate stream
+                if frames(old, path) == frames(new, path):
+                    compared += 1  # same images, different deflate streams
                     continue
             except Exception as exc:  # noqa: BLE001 - report and treat as drift
                 problems.append(f"{path}: could not decode ({exc})")
