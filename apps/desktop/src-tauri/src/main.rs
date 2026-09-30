@@ -7,6 +7,7 @@ mod discovery;
 mod encryption;
 mod error;
 mod file_transfer;
+mod relay;
 mod security;
 mod server;
 mod storage;
@@ -37,7 +38,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use chrono::Timelike;
-use log::{error, info};
+use log::{debug, error, info, warn};
 use tauri::Manager;
 
 pub struct AppState {
@@ -51,6 +52,12 @@ pub struct AppState {
     pub token_store: Arc<security::TokenStore>,
     pub automation_engine: Arc<RwLock<automation::AutomationEngine>>,
     pub audio_stream: Arc<audio::AudioStream>,
+    /// The relay this app hosts, if the user has turned it on.
+    ///
+    /// A background task in this process, not a separate program: see
+    /// [`relay`] for why, and for what it does and does not change about the
+    /// threat model.
+    pub relay_host: Arc<relay::RelayHost>,
 }
 
 fn load_or_create_device_id() -> String {
@@ -127,6 +134,15 @@ fn main() {
     // Keep the runtime active for all sync and async setup and Tauri's event loop.
     let _guard = rt.enter();
 
+    // `rt` itself is not `Clone`, and the Tauri builder below takes everything
+    // it captures by move. A `Handle` is cloneable and can `block_on`, so this
+    // is what survives to the post-run cleanup.
+    // `Arc` because the setup closure below must be `'static`, and a bare
+    // `Handle` borrow of `rt` cannot outlive it. `rt.handle()` returns a
+    // reference, so the owned `Handle` is cloned out of it first.
+    let cleanup_rt = Arc::new(rt.handle().clone());
+    let cleanup_rt_in_setup = cleanup_rt.clone();
+
     // Run async initialization synchronously before handing off to Tauri's event loop.
     let (device_id, storage, encryption) = rt.block_on(async {
         let device_id = load_or_create_device_id();
@@ -192,9 +208,14 @@ fn main() {
         ))), // 1 min expiry
         automation_engine: Arc::new(RwLock::new(automation::AutomationEngine::new())),
         audio_stream: Arc::new(audio::AudioStream::new()),
+        relay_host: Arc::new(relay::RelayHost::new(storage.clone(), device_id.clone())),
     });
 
-    tauri::Builder::default()
+    // Survives the Tauri builder, which takes `state` by move, so the relay can
+    // be stopped after the event loop returns.
+    let cleanup_state = state.clone();
+
+    let app = tauri::Builder::default()
         // NOTE: `tauri-plugin-shell` is deliberately NOT registered. Its
         // `open()` used to be reachable from the webview via `shell:allow-open`
         // with whatever path a paired device put in a `file/complete` frame.
@@ -230,6 +251,7 @@ fn main() {
             commands::send_encrypted_message,
             commands::get_system_info,
             commands::get_settings,
+            commands::get_relay_status,
             commands::save_settings,
             commands::save_settings_field,
             commands::delete_paired_device,
@@ -262,6 +284,65 @@ fn main() {
             commands::get_local_ws_token,
         ])
         .setup(move |app| {
+            let cleanup_rt = cleanup_rt_in_setup.clone();
+            // One task owns the whole relay story, in the order it has to
+            // happen: read the settings once, start the listener, then join it.
+            // Splitting these up would let the client dial a relay that was
+            // never started, or read the settings twice and disagree with
+            // itself across a save.
+            {
+                let state_relay = state.clone();
+                cleanup_rt.spawn(async move {
+                    let settings = match state_relay.storage.get_settings().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // A desktop that cannot read its settings should not
+                            // open a listener the user may have turned off.
+                            warn!("Relay left off: could not read settings: {e}");
+                            commands::settings::ConduitSettings::default().with_relay_enabled(false)
+                        }
+                    };
+                    if !settings.relay_enabled {
+                        debug!("Relay is off in settings; not starting it or joining it");
+                        return;
+                    }
+
+                    let token = match relay::resolve_relay_token() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            // Without a token the relay cannot authenticate its
+                            // own client either, so there is nothing to retry.
+                            warn!("Relay not started: {e}");
+                            return;
+                        }
+                    };
+                    let device_id = state_relay.device_id.clone();
+
+                    state_relay.relay_host.start(&settings).await;
+
+                    // Join the relay this app hosts, so the desktop appears in
+                    // its routing table. A relay only delivers to connections it
+                    // holds, so without this the desktop is invisible to every
+                    // phone that is not on the same LAN. The hub may not exist
+                    // yet, and the client retries with backoff either way.
+                    let ws_server = state_relay.ws_server.clone();
+                    for _ in 0..100 {
+                        let guard = ws_server.read().await;
+                        if let Some(ws) = guard.as_ref() {
+                            ws.spawn_relay_client(
+                                relay::local_relay_url(),
+                                device_id.clone(),
+                                token.clone(),
+                            );
+                            return;
+                        }
+                        drop(guard);
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    warn!("Relay is running but the hub never came up, so it was not joined");
+                });
+            }
+
             // Load automation rules from database
             let state_auto = state.clone();
             tokio::spawn(async move {
@@ -277,7 +358,6 @@ fn main() {
 
             // Start WebSocket server
             let state_ws = state.clone();
-            let rt = tokio::runtime::Handle::current();
             let sync_engine = state_ws.sync_engine.clone();
             let encryption = Arc::new(state_ws.encryption.clone());
             let file_engine_clone = state_ws.file_engine.clone();
@@ -287,7 +367,7 @@ fn main() {
             let automation_clone = state_ws.automation_engine.clone();
             let audio_stream_clone = state_ws.audio_stream.clone();
             let app_handle_ws = app.handle().clone();
-            rt.spawn(async move {
+            cleanup_rt.spawn(async move {
                 let mut ws = server::WsServer::new(
                     crate::WS_BIND_ADDR.to_string(),
                     sync_engine,
@@ -297,13 +377,14 @@ fn main() {
                     storage_clone_ws,
                     automation_clone,
                     audio_stream_clone,
+                    Arc::new(state_ws.device_id.clone()),
+                    state_ws.relay_host.route_keys(),
                 )
                 .await;
                 ws.set_app_handle(app_handle_ws);
 
-                // Disabled cloud relay client to keep the app strictly local (LAN-only).
-                // ws.spawn_relay_client(relay_url, server_id);
-
+                // The relay client is spawned by the task above, which waits
+                // for this server to appear.
                 *state_ws.ws_server.write().await = Some(ws);
             });
 
@@ -311,7 +392,7 @@ fn main() {
             let state_disc = state.clone();
             let storage_clone_disc = state.storage.clone();
             let app_handle = app.handle().clone();
-            rt.spawn(async move {
+            cleanup_rt.spawn(async move {
                 let device_name_clone = storage_clone_disc
                     .get_settings()
                     .await
@@ -328,7 +409,7 @@ fn main() {
 
             // Background timer for time-based automation triggers (checks every 60s)
             let state_auto_timer = state.clone();
-            rt.spawn(async move {
+            cleanup_rt.spawn(async move {
                 let mut last_minute = String::new();
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -387,7 +468,7 @@ fn main() {
             // Restore window state
             let app_handle_win = app.handle().clone();
             let state_win = state.clone();
-            rt.spawn(async move {
+            cleanup_rt.spawn(async move {
                 // Small delay to let the window initialize
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -444,8 +525,18 @@ fn main() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+
+    // The event loop has returned, so the app is exiting. Stop the relay before
+    // the runtime is torn down: its shutdown drains connections with a bounded
+    // window and performs a final flush of the replay cache, and a nonce
+    // accepted in the last seconds before exit must not be replayable after the
+    // next launch.
+    cleanup_rt.block_on(async {
+        cleanup_state.relay_host.stop().await;
+    });
+
+    app.expect("error while running tauri application");
 }
 
 #[cfg(test)]

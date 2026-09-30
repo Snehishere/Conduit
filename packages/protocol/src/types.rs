@@ -145,6 +145,18 @@ pub struct PairingRequest {
 ///
 /// Desktop replies with its X25519 public key after validating the token.
 /// The shared secret is derived from the local private key + peer public key.
+///
+/// [`PairingAccept::device_id`] is the identifier the desktop has assigned to
+/// the *pairing* peer. The peer cannot choose it and cannot derive it: the
+/// desktop picks a `devices.id` (a per-connection UUID the first time, the
+/// stored `devices.id` on every re-pair with the same public key) and this
+/// field is the only way the peer learns it.
+///
+/// It matters because the peer must stamp that value into `source_device` on
+/// every `encrypted` envelope it sends — the desktop resolves the shared
+/// secret by that field when it opens the envelope. A peer that does not know
+/// its own id cannot send a single encrypted frame. This is optional on the
+/// wire so a pre-existing peer keeps parsing; the desktop always sets it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairingAccept {
     #[serde(rename = "type")]
@@ -157,6 +169,23 @@ pub struct PairingAccept {
     pub public_key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_info: Option<DeviceInfo>,
+    /// The `devices.id` the desktop has assigned to the peer.
+    ///
+    /// The peer must store this and send it as `source_device` on every
+    /// `encrypted` envelope. `None` means the sender is a desktop too old to
+    /// assign ids, in which case the receiver falls back to the
+    /// connection-derived identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    /// The desktop's own `device_id`.
+    ///
+    /// The peer needs it for the same reason the desktop needs one: a relayed
+    /// v2 frame is verified under the *sender's* route key, and that key is
+    /// derived with the sender's id bound into the label. A phone that does not
+    /// know the hub's id cannot derive the key that verifies a relayed file
+    /// chunk, so it would have to drop every one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hub_device_id: Option<String>,
 }
 
 /// `type: "pairing", action: "revoke"`
@@ -1445,21 +1474,25 @@ impl RelayRoute {
 
     /// Build a fully signed `relay_route` with a generated timestamp and nonce.
     ///
-    /// `signing_key` MUST be the relay's dedicated message-signing key — never
-    /// the relay token and never the master secret. See
-    /// [`crate::hmac::derive_signing_key`] and [`crate::hmac::SIGNING_KEY_LABEL`].
+    /// `route_key` MUST be this device's own key, from
+    /// [`crate::hmac::derive_route_key`] applied to the pairing secret the hub
+    /// holds for it. Never the relay token: every client holds that, so a route
+    /// signed with it could claim to be from any device.
     ///
-    /// `from_device_id` MUST be the sender's own authenticated device id.
+    /// `from_device_id` MUST be the sender's own authenticated device id. It is
+    /// also used as the `key_id`, so the receiver can look the key up and check
+    /// the two agree.
     pub fn signed(
-        signing_key: &[u8],
+        route_key: &[u8],
         from_device_id: impl Into<String>,
         to_device_id: impl Into<String>,
         payload: serde_json::Value,
     ) -> Self {
+        let from = from_device_id.into();
         Self::signed_with(
-            crate::hmac::DEFAULT_KEY_ID,
-            signing_key,
-            from_device_id,
+            &from.clone(),
+            route_key,
+            from,
             to_device_id,
             payload,
             crate::hmac::now_millis(),
@@ -1470,11 +1503,15 @@ impl RelayRoute {
     /// [`RelayRoute::signed`] with every signed field supplied explicitly.
     ///
     /// Use this when the caller owns the timestamp/nonce (clients SHOULD use a
-    /// cryptographically random nonce and a locally-synchronised clock) or
-    /// when pinning a specific `key_id` during a key-rotation window.
+    /// cryptographically random nonce and a locally-synchronised clock) or when
+    /// testing a specific field value.
+    ///
+    /// `key_id` must equal `from_device_id`: a receiver resolves the key by
+    /// `key_id` and then requires the attributed sender to match, so a
+    /// mismatched pair is rejected rather than mis-attributed.
     pub fn signed_with(
         key_id: &str,
-        signing_key: &[u8],
+        route_key: &[u8],
         from_device_id: impl Into<String>,
         to_device_id: impl Into<String>,
         payload: serde_json::Value,
@@ -1491,7 +1528,7 @@ impl RelayRoute {
             key_id: Some(key_id.to_string()),
             hmac: None,
         };
-        route.sign_with(key_id, signing_key);
+        route.sign_with(key_id, route_key);
         route
     }
 
@@ -1992,6 +2029,8 @@ mod tests {
             protocol_version: None,
             public_key: "ccdd".into(),
             device_info: None,
+            device_id: None,
+            hub_device_id: None,
         };
         let restored = roundtrip(&msg);
         assert_eq!(restored.public_key, "ccdd");
@@ -2010,9 +2049,17 @@ mod tests {
                 os: Some("macos".into()),
                 battery: None,
             }),
+            device_id: Some("assigned-1".into()),
+            hub_device_id: Some("hub-1".into()),
         };
         let restored = roundtrip(&msg);
         assert_eq!(restored.device_info.unwrap().os, Some("macos".into()));
+        // The assigned id has to survive the round trip, or the peer learns
+        // nothing and every envelope it sends names it wrong.
+        assert_eq!(restored.device_id.as_deref(), Some("assigned-1"));
+        // So does the hub's own id: without it the peer cannot derive the key
+        // that verifies a relayed frame, and drops every one of them.
+        assert_eq!(restored.hub_device_id.as_deref(), Some("hub-1"));
     }
 
     // ---------------------------------------------------------------
@@ -3511,7 +3558,11 @@ mod tests {
         let msg = RelayRoute::signed(key, "dev-a", "dev-b", json!({"type": "ping"}));
         assert!(msg.has_required_signed_fields());
         assert_eq!(msg.from_device(), Some("dev-a"));
-        assert_eq!(msg.key_id.as_deref(), Some(crate::hmac::DEFAULT_KEY_ID));
+        assert_eq!(
+            msg.key_id.as_deref(),
+            Some("dev-a"),
+            "key_id names the signer, so the receiver can look the key up"
+        );
 
         let restored = roundtrip(&msg);
         assert_eq!(restored, msg);
@@ -3559,7 +3610,7 @@ mod tests {
     fn relay_route_signed_with_honours_explicit_fields() {
         let key = b"k";
         let msg = RelayRoute::signed_with(
-            "k7",
+            "dev-a",
             key,
             "dev-a",
             "dev-b",
@@ -3567,13 +3618,107 @@ mod tests {
             1_700_000_000_000,
             "fixed-nonce",
         );
-        assert_eq!(msg.key_id.as_deref(), Some("k7"));
+        assert_eq!(msg.key_id.as_deref(), Some("dev-a"));
         assert_eq!(msg.timestamp, Some(1_700_000_000_000));
         assert_eq!(msg.nonce.as_deref(), Some("fixed-nonce"));
 
-        let ring = crate::hmac::SigningKeyring::new("k7", key.to_vec());
+        let mut ring = crate::hmac::RouteKeyring::new();
+        ring.insert("dev-a", key.to_vec());
         let wire = serde_json::to_value(&msg).unwrap();
-        assert_eq!(ring.verify(&wire).as_deref(), Some("k7"));
+        assert_eq!(ring.verify(&wire).as_deref(), Some("dev-a"));
+    }
+
+    /// `signed_with` accepts a mismatched pair because it does not know better
+    /// than its caller — but the receiver refuses it, so the mistake can never
+    /// reach a device. This is the reason the keyring checks both names.
+    #[test]
+    fn relay_route_signed_with_a_mismatched_key_id_is_rejected_downstream() {
+        let key = b"k";
+        let msg = RelayRoute::signed_with(
+            "someone-else",
+            key,
+            "dev-a",
+            "dev-b",
+            json!({"x": 1}),
+            1_700_000_000_000,
+            "fixed-nonce",
+        );
+
+        let mut ring = crate::hmac::RouteKeyring::new();
+        ring.insert("someone-else", key.to_vec());
+        let wire = serde_json::to_value(&msg).unwrap();
+        assert_eq!(
+            ring.verify(&wire),
+            None,
+            "a key id that disagrees with the attributed sender must not verify"
+        );
+    }
+
+    /// A route whose `key_id` names one device but whose payload is attributed
+    /// to another must not verify.
+    ///
+    /// The key is looked up by `key_id` and the attributed sender is then
+    /// required to match, so a valid signature cannot be re-labelled. Without
+    /// that second check, a compromised device holding its own key could sign a
+    /// route the receiver believes came from the desktop.
+    #[test]
+    fn relay_route_rejects_a_key_id_that_disagrees_with_the_sender() {
+        let key = b"relay-signing-key-32-bytes-long!";
+        // Sign honestly, then rewrite the attributed sender. `from_device_id`
+        // is signed, so this must not verify.
+        let msg = RelayRoute::signed(key, "dev-a", "dev-b", json!({"type": "ping"}));
+        let mut wire = serde_json::to_value(&msg).unwrap();
+        wire["from_device_id"] = json!("dev-b");
+
+        let mut ring = crate::hmac::RouteKeyring::new();
+        ring.insert("dev-a", key.to_vec());
+        ring.insert("dev-b", b"dev-b-route-key-32-bytes-long!!".to_vec());
+        assert_eq!(
+            ring.verify(&wire),
+            None,
+            "a signature from dev-a must not be accepted as dev-b"
+        );
+    }
+
+    /// A device that holds only its own key cannot produce a route that verifies
+    /// as some other device, even if it writes that device's id.
+    #[test]
+    fn a_device_cannot_sign_as_another_device() {
+        let dev_a_key = b"dev-a-route-key-32-bytes-long!!!!";
+
+        // dev-a forges a route claiming to be dev-b, signing with its own key.
+        let mut forged = RelayRoute::signed(
+            dev_a_key,
+            "dev-b",
+            "dev-c",
+            json!({"type": "sms", "body": "not mine"}),
+        );
+        forged.key_id = Some("dev-b".into());
+        let wire = serde_json::to_value(&forged).unwrap();
+
+        let mut ring = crate::hmac::RouteKeyring::new();
+        ring.insert("dev-a", dev_a_key.to_vec());
+        ring.insert("dev-b", b"dev-b-route-key-32-bytes-long!!".to_vec());
+
+        assert_eq!(
+            ring.verify(&wire),
+            None,
+            "dev-a holds only its own key, so nothing it signs may verify as dev-b"
+        );
+    }
+
+    /// Two devices that somehow shared a pairing secret still get unrelated
+    /// route keys, because the device id is bound into the derivation label.
+    #[test]
+    fn route_keys_are_domain_separated_by_device_id() {
+        let shared = b"a-pairing-secret";
+        let a = crate::hmac::derive_route_key(shared, "dev-a");
+        let b = crate::hmac::derive_route_key(shared, "dev-b");
+        assert_ne!(a, b, "one secret under two ids must not yield one key");
+        assert_ne!(
+            a,
+            crate::hmac::derive_key(shared, crate::hmac::ROUTE_KEY_LABEL)
+        );
     }
 
     #[test]
@@ -4998,6 +5143,8 @@ mod tests {
                     protocol_version: None,
                     public_key: "pk".into(),
                     device_info: None,
+                    device_id: None,
+                    hub_device_id: None,
                 })
                 .unwrap(),
             ),

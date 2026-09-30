@@ -8,8 +8,15 @@ type ManagedState = Arc<AppState>;
 
 /// Default value for `max_devices` (see [`default_max_devices`]).
 pub const DEFAULT_MAX_DEVICES: u32 = 5;
-/// Default relay endpoint (see [`default_relay_url`]).
-pub const DEFAULT_RELAY_URL: &str = "ws://127.0.0.1:9528";
+/// Default value for the legacy `relay_url` setting.
+///
+/// The desktop does **not** dial this: it hosts the relay in this process and
+/// joins it over loopback, which is [`crate::relay::local_relay_url`]. The field
+/// is kept because it is persisted in the settings table and the phone's relay
+/// address is a real, user-entered thing — but its default now names the port
+/// this app actually binds, rather than the 9528 the old standalone service used
+/// and nothing listens on any more.
+pub const DEFAULT_RELAY_URL: &str = "ws://127.0.0.1:9531";
 
 /// Every field carries a `#[serde(default …)]`.
 ///
@@ -56,6 +63,33 @@ pub struct ConduitSettings {
     pub notifications_enabled: bool,
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
+    /// Whether the desktop hosts a relay so a phone on a different network can
+    /// reach it.
+    ///
+    /// On by default. The relay is a background part of this app, not something
+    /// to deploy, so the intent is that it is already working by the time a
+    /// phone needs it. The costs of that choice are bounded: the listener is
+    /// useless without the bearer token *and* a registered device's route key,
+    /// and it routes only opaque envelopes (ADR-0007). Turn it off to keep the
+    /// desktop strictly LAN-only.
+    #[serde(default = "default_true")]
+    pub relay_enabled: bool,
+    /// Port the in-process relay serves TLS on.
+    #[serde(default = "default_relay_port")]
+    pub relay_port: u16,
+    /// Port the in-process relay serves `/healthz` and `/metrics` on.
+    ///
+    /// Loopback only, always. See the audit's W6.20.
+    #[serde(default = "default_relay_health_port")]
+    pub relay_health_port: u16,
+    /// The hostname clients use to reach this machine.
+    ///
+    /// A self-signed certificate is only valid for the names in it, so a relay
+    /// reachable at `relay.example.com` and one generated for `localhost` are
+    /// not the same relay. Leaving this empty means "localhost", which is right
+    /// for a tunnel that terminates elsewhere and wrong for a published port.
+    #[serde(default)]
+    pub relay_hostname: String,
 }
 
 fn default_theme() -> String {
@@ -67,11 +101,36 @@ fn default_accent_color() -> String {
 fn default_true() -> bool {
     true
 }
+
+/// Port the in-process relay serves TLS on by default.
+///
+/// Matches the relay crate's own default so a published port-forward rule
+/// survives the move from a self-hosted relay to the in-process one.
+fn default_relay_port() -> u16 {
+    crate::relay::DEFAULT_RELAY_PORT
+}
+
+/// Port the in-process relay serves `/healthz` and `/metrics` on by default.
+fn default_relay_health_port() -> u16 {
+    crate::relay::DEFAULT_RELAY_HEALTH_PORT
+}
 fn default_max_devices() -> u32 {
     DEFAULT_MAX_DEVICES
 }
 fn default_relay_url() -> String {
     DEFAULT_RELAY_URL.to_string()
+}
+
+impl ConduitSettings {
+    /// A copy with the relay turned on or off.
+    ///
+    /// Used at startup, where a settings read that failed has to produce a
+    /// "definitely off" configuration: a desktop that cannot read its settings
+    /// should not open a listener the user may have turned off.
+    pub fn with_relay_enabled(mut self, enabled: bool) -> Self {
+        self.relay_enabled = enabled;
+        self
+    }
 }
 
 /// Apps whose notifications are mirrored to other devices by default.
@@ -117,6 +176,10 @@ impl Default for ConduitSettings {
             auto_accept_files: default_true(),
             notifications_enabled: default_true(),
             relay_url: default_relay_url(),
+            relay_enabled: default_true(),
+            relay_port: default_relay_port(),
+            relay_health_port: default_relay_health_port(),
+            relay_hostname: String::new(),
         }
     }
 }
@@ -129,6 +192,50 @@ pub async fn get_settings(state: State<'_, ManagedState>) -> Result<ConduitSetti
     })
     .await
     .map_err(|e| ConduitError::Other(format!("get_settings task join error: {e}")))?
+}
+
+/// What the relay status UI renders.
+///
+/// A flattened view of [`crate::relay::RelayStatus`], so the frontend does not
+/// have to mirror the nested `Option<Status>` and get the nullability wrong.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RelayStatusView {
+    /// Whether the relay is accepting connections.
+    pub running: bool,
+    /// Why it is not, in words. A misconfiguration is a normal state here.
+    pub error: Option<String>,
+    /// The port the TLS listener bound, if it is up.
+    pub port: Option<u16>,
+    /// The port the loopback-only listener bound, if it is up.
+    pub local_port: Option<u16>,
+    /// `sha256/<base64>` SPKI pin, if TLS is up. The phone needs this.
+    pub tls_pin: Option<String>,
+    /// Live counters, when it is running.
+    pub active_connections: usize,
+    pub registered_devices: usize,
+}
+
+/// The relay's current state, for the settings UI.
+///
+/// Separate from `get_settings` on purpose: it changes on its own as devices
+/// connect and disconnect, so the UI polls it rather than expecting it to be
+/// part of a settings save.
+///
+/// Returns `Result` because that is what an `async` command holding a `State`
+/// reference must; there is nothing to fail here, so the error is never used.
+#[tauri::command]
+pub async fn get_relay_status(state: State<'_, ManagedState>) -> Result<RelayStatusView> {
+    let snapshot = state.relay_host.snapshot().await;
+    let status = snapshot.status;
+    Ok(RelayStatusView {
+        running: snapshot.running,
+        error: snapshot.error,
+        port: status.as_ref().and_then(|s| s.wss_port),
+        local_port: status.as_ref().and_then(|s| s.ws_port),
+        tls_pin: status.as_ref().and_then(|s| s.tls_pin.clone()),
+        active_connections: status.as_ref().map(|s| s.active_connections).unwrap_or(0),
+        registered_devices: status.as_ref().map(|s| s.registered_devices).unwrap_or(0),
+    })
 }
 
 #[tauri::command]
@@ -273,6 +380,10 @@ mod tests {
             auto_accept_files: false,
             notifications_enabled: false,
             relay_url: "wss://relay.example:9528".into(),
+            relay_enabled: false,
+            relay_port: crate::relay::DEFAULT_RELAY_PORT,
+            relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+            relay_hostname: String::new(),
         }
     }
 
@@ -305,7 +416,7 @@ mod tests {
             "default_download_folder": "",
             "auto_accept_files": true,
             "notifications_enabled": true,
-            "relay_url": "ws://127.0.0.1:9528"
+            "relay_url": "ws://127.0.0.1:9531"
         }))
         .expect("all fields present; deserialisation must succeed");
 
@@ -341,6 +452,10 @@ mod tests {
         "auto_accept_files",
         "notifications_enabled",
         "relay_url",
+        "relay_enabled",
+        "relay_port",
+        "relay_health_port",
+        "relay_hostname",
     ];
 
     /// Serialised key set of `ConduitSettings`, sorted, as owned strings.
@@ -351,6 +466,24 @@ mod tests {
         let mut keys: Vec<String> = obj.keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    #[test]
+    fn the_relay_is_on_by_default() {
+        // The relay is a background part of this app, not something the user
+        // deploys. A phone on another network must find it already running, so
+        // the default cannot be off. This is also the one setting where
+        // "sensible-looking" and "what was asked for" disagree, so it is pinned.
+        assert!(
+            ConduitSettings::default().relay_enabled,
+            "the relay must default to running"
+        );
+        // And the frontend default must agree, or a fresh install would save
+        // the opposite value the first time the user touches any other setting.
+        let json = serde_json::json!({ "relay_port": 9529 });
+        let parsed: ConduitSettings =
+            serde_json::from_value(json).expect("a partial settings payload still deserialises");
+        assert!(parsed.relay_enabled);
     }
 
     #[test]
@@ -515,6 +648,10 @@ mod tests {
             app.state(),
             ConduitSettings {
                 relay_url: "wss://relay.example:9528".into(),
+                relay_enabled: false,
+                relay_port: crate::relay::DEFAULT_RELAY_PORT,
+                relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+                relay_hostname: String::new(),
                 ..Default::default()
             },
         )

@@ -107,13 +107,17 @@ Consequently:
 
 ### 2.3 Relay listeners
 
-Separate service (`services/relay`), every port environment-overridable:
+The relay is a **library** (`conduit-relay`, in `services/relay`) with no binary
+target. The desktop app hosts it in-process as a background task
+(`apps/desktop/src-tauri/src/relay.rs`), so the configuration it runs with comes
+from the host's `conduit_relay::Overrides` — the desktop's Settings — over the
+environment, over the library defaults. See §2.3.1.
 
 | Transport | Default port | TLS | Use |
 |-----------|--------------|-----|-----|
-| WSS (relay) | 9529 | TLS 1.3 | Relay server. Always bound. |
-| WS (relay) | 9528 | No | Relay development. **Off by default** — set `RELAY_ENABLE_PLAIN_WS=true` to bind it. |
-| Health HTTP (relay) | 9530 | No | `/healthz`, `/health`, `/metrics`, `/pin` |
+| WSS (relay) | 9529 | TLS 1.3 | Relay server. Bound unless `relay_enabled` is false. |
+| WS (relay) | 9531 | No | The **desktop's loopback plaintext listener**: how the desktop joins the relay it hosts. Loopback-only by construction. 9528 is the library's unused default and the desktop does not bind it. |
+| Health HTTP (relay) | 9530 | No | `/healthz`, `/health`, `/metrics`, `/pin`. Loopback-only by construction. |
 
 The relay serves exactly these HTTP routes on the health port:
 
@@ -132,30 +136,42 @@ scrape does not need the health secret; set `RELAY_METRICS_TOKEN` to gate it.
 
 #### 2.3.1 Relay configuration
 
-All relay configuration is environment variables; there is no config file.
-Startup is fail-closed — a missing or empty `RELAY_TOKEN` aborts with
-`EX_CONFIG` (78), a port bind failure with `EX_IOERR` (74), and a process that
-ends up with no listeners at all with `EX_UNAVAILABLE` (69).
+There is no config file. Precedence, highest first:
+
+1. **`conduit_relay::Overrides`** — what the host passes to
+   `Config::resolve`. The desktop fills this from its Settings screen:
+   `relay_enabled`, `relay_port`, `relay_health_port` and `relay_hostname`, plus
+   the bearer token it generated. This is how the app is configured.
+2. **Environment variables** — the fallback, for headless and test use.
+3. **Library defaults.**
+
+A config or bind failure is **recorded and surfaced**, not fatal: the host
+records the reason (a config error, or a named port that could not be bound)
+where its status UI reads it, and the desktop carries on LAN-only. There is no
+process to exit, so no exit code.
+
+Two binds are **not** environment-overridable on the desktop: `health_bind` and
+`ws_bind` are hard-set to loopback in `build_config`. The health surface
+publishes the peer count, the payload-size distribution and the certificate pin;
+the plaintext listener carries the bearer token. Neither belongs on every
+interface of what is usually a laptop.
 
 | Variable | Required | Default | Purpose |
 |----------|----------|---------|---------|
-| `RELAY_TOKEN` | **yes** | — | Shared bearer token every client sends in `relay_auth`. Empty is refused. |
-| `RELAY_WS_PORT` | no | `9528` | Plaintext relay listener. Only bound when `RELAY_ENABLE_PLAIN_WS` is set. |
-| `RELAY_WSS_PORT` | no | `9529` | TLS relay listener. |
-| `RELAY_HEALTH_PORT` | no | `9530` | Plain HTTP health/metrics/pin listener. |
-| `RELAY_ENABLE_PLAIN_WS` | no | `false` | `true` or `1` binds the plaintext listener. |
+| `RELAY_TOKEN` | **yes**, unless the host supplies one | — | Shared bearer token every client sends in `relay_auth`. Empty is refused. The desktop **generates** this once and keeps it in the OS keyring under account `relay_token`; it is never typed by a user, and a host-supplied token always wins. |
+| `RELAY_WS_PORT` | no | `9528` | Plaintext relay listener. Only bound when `RELAY_ENABLE_PLAIN_WS` is set. **The desktop overrides this to 9531 and pins it to loopback** (`DEFAULT_RELAY_LOCAL_PORT`); 9528 is an unused library default that nothing binds. |
+| `RELAY_WSS_PORT` | no | `9529` | TLS relay listener. The desktop sets this from the `relay_port` setting. |
+| `RELAY_HEALTH_PORT` | no | `9530` | Plain HTTP health/metrics/pin listener. The desktop sets this from `relay_health_port`. |
+| `RELAY_ENABLE_PLAIN_WS` | no | `false` | `true` or `1` binds the plaintext listener. The desktop always enables it, on loopback. |
 | `RELAY_AUTH_TIMEOUT_SECS` | no | `10` | How long a fresh socket may take to send a valid `relay_auth` before it is dropped. |
-| `HMAC_SECRET` | no | — | Master secret. If unset, resolved from `HMAC_SECRET_FILE` or bootstrapped. |
-| `HMAC_SECRET_FILE` | no | `./secrets/hmac_secret` | Read the master secret from here; a missing file is generated (32 random bytes, hex, persisted `0600`). Fail-closed: an unreadable non-empty file aborts startup. |
-| `RELAY_SIGNING_KEY` | no | derived | The `relay_route`/binary-frame message-signing key. Defaults to `derive_signing_key(HMAC_SECRET)`. **Never set this to `RELAY_TOKEN`.** |
-| `RELAY_SIGNING_KEY_ID` | no | `v1` | The `key_id` the relay publishes for `RELAY_SIGNING_KEY`. |
-| `RELAY_SIGNING_KEY_PREVIOUS` | no | — | The retiring key, accepted for verification during a rotation window. |
-| `RELAY_SIGNING_KEY_PREVIOUS_ID` | with the above | — | Its `key_id`. Required whenever `RELAY_SIGNING_KEY_PREVIOUS` is set, and must differ from `RELAY_SIGNING_KEY_ID`. |
+| `HMAC_SECRET` | no | — | Master secret. If unset, resolved from `HMAC_SECRET_FILE` or bootstrapped. **No route-signing role:** it backs the `/health` token default and nothing else. |
+| `HMAC_SECRET_FILE` | no | `./secrets/hmac_secret` | Read the master secret from here; a missing file is generated (32 random bytes, hex, persisted `0600`). Fail-closed: an unreadable non-empty file is a config error. |
 | `RELAY_HEALTH_TOKEN` | no | `HMAC_SECRET` | Bearer token for `/health` and `/`. |
 | `RELAY_METRICS_TOKEN` | no | — | When set, `/metrics` requires it. |
-| `RELAY_NONCE_FILE` | no | `./data/nonces.json` | Persisted replay-nonce cache. |
-| `RELAY_CERT_DIR` | no | — | Directory holding the TLS certificate and key. |
-| `RELAY_TLS_HOSTNAME` | no | — | Hostname placed in the generated certificate. |
+| `RELAY_NONCE_FILE` | no | platform data dir | Persisted replay-nonce cache. The desktop sets this to `app_data_dir()/relay-nonces.json`. |
+| `RELAY_CERT_DIR` | no | — | Directory holding the TLS certificate and key. The desktop sets this to `app_data_dir()/relay-certs`. |
+| `RELAY_TLS_HOSTNAME` | no | — | Hostname placed in the generated certificate. The desktop supplies `relay_hostname` through `Overrides` instead. |
+| `RELAY_TLS_EXTRA_SANS` | no | — | Extra subject alternative names for the generated certificate. |
 | `RELAY_TLS_EXTRA_SANS` | no | — | Extra subject alternative names for the generated certificate. |
 
 ### 2.4 Connection Lifecycle
@@ -180,7 +196,7 @@ a factor of 50.
 
 | Where | Constant | Value | Enforcement |
 |-------|----------|-------|-------------|
-| Relay, inbound text frames | `MAX_TEXT_SIZE` (`services/relay/src/main.rs`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before parsing. Over the limit the relay logs and **closes the connection** — it does *not* send an `error` frame, so `message_too_large` is a documented code that is not currently emitted. |
+| Relay, inbound text frames | `MAX_TEXT_SIZE` (`services/relay/src/limits.rs`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before parsing. Over the limit the relay logs and **closes the connection** — it does *not* send an `error` frame, so `message_too_large` is a documented code that is not currently emitted. |
 | Relay, tungstenite read limits | tungstenite defaults | 64 MiB message / 16 MiB frame | The relay calls `accept_async` with no `WebSocketConfig`, so the defaults stand; the 1 MiB check above is what actually bounds memory. |
 | Desktop, WebSocket read limits | `security::MAX_MESSAGE_SIZE` / `MAX_FRAME_SIZE` | `50 * 1024 * 1024` (50 MiB) each | Passed to `WebSocketConfig::max_message_size` / `max_frame_size` by `ws_read_limits()` (`server/mod.rs`), so a too-large frame is refused *while it is being read*. |
 | Desktop, outbound queue | `security::MAX_SEND_BUFFER_BYTES` | `8 * 1024 * 1024` (8 MiB) | `max_write_buffer_size`; a client that stops reading is disconnected instead of growing server memory. |
@@ -244,7 +260,7 @@ Sent immediately after connecting. Both sides exchange device metadata.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `device_id` | string | yes | Stable device identifier. The relay requires 1–64 lowercase hex characters; PROTOCOL.md describes it as the first 16 hex characters of the X25519 public key. |
+| `device_id` | string | yes | Stable device identifier. 1–64 lowercase hex characters, optionally separated by single hyphens. A hyphenated UUID is what the app actually mints; the first 16 hex characters of the X25519 public key remains a valid spelling. |
 | `device_name` | string | yes | Human-readable name. Bounded to 256 bytes at the desktop. |
 | `device_type` | string | yes | `"phone"` \| `"tablet"` \| `"desktop"` |
 | `os` | string | yes | `"ios"` \| `"android"` \| `"windows"` \| `"macos"` \| `"linux"` |
@@ -1176,9 +1192,16 @@ First message a client sends to the relay. It must arrive within
 }
 ```
 
-`device_id` must be 1–64 lowercase hex characters; anything else is refused
-with `invalid_device_id` and the connection is closed. The token is compared in
-constant time.
+`device_id` must be 1–64 lowercase hex characters, optionally separated by
+single hyphens; anything else is refused with `invalid_device_id` and the
+connection is closed. Uppercase is refused because ids are compared as map keys
+in the routing table and the replay cache, so two spellings of one id must not
+be able to coexist. A hyphen may not start or end the id and may not repeat.
+Hyphenated UUIDs are what the app actually mints (the desktop's own id is a v4
+UUID; a phone's is either that or the per-connection UUID the pairing handshake
+falls back to), so a strict bare-hex rule would reject every real device. The
+16-character X25519 prefix below is a floor, not the only valid spelling. The
+token is compared in constant time.
 
 #### `relay_auth_ok`
 
@@ -1228,7 +1251,7 @@ This is the relay's whole routing API — the relay routes nothing else, and an
 | `payload` | object | yes | A complete JSON message to forward. Signed. |
 | `timestamp` | int | **yes** | Unix timestamp in **milliseconds**. Signed. Accepted window is −5 s … +30 s. |
 | `nonce` | string | **yes** | Unique-per-sender, non-empty. Signed. |
-| `key_id` | string | **yes** | Which signing key produced `hmac`. Signed. |
+| `key_id` | string | **yes** | The device that produced `hmac`, and it **must equal `from_device_id`**. Signed. Not a rotation id — there is no rotation state. |
 | `hmac` | string | **yes** | Lowercase hex HMAC-SHA256 over the canonical signed-field subset. Not itself part of the signed input. |
 
 The four optional fields are `#[serde(default)]`, so a minimal
@@ -1256,50 +1279,67 @@ carry an unauthenticated sender, so any new signed field MUST be added to
 
 The signer and the verifier MUST both go through the same function
 (`RelayRoute::signed` / `signed_with` / `sign_with` on the sender side,
-`SigningKeyring::verify` on the receiver's) rather than hand-serialising the
-subset, so the bytes hashed are exactly the bytes the verifier reconstructs.
+`hmac::verify_message_hmac` over the key the host resolved on the receiver's)
+rather than hand-serialising the subset, so the bytes hashed are exactly the
+bytes the verifier reconstructs.
 
 ```rust
-// Sign
-let route = RelayRoute::signed_with(key_id, &signing_key, from, to, payload, ts, nonce);
-// Verify (relay side)
-let accepted = signing_keys.verify(&json);
+// Sign — with this device's own route key
+let route = RelayRoute::signed_with(from_device_id, &route_key, from, to, payload, ts, nonce);
+// Verify (relay side) — ask the host for the key belonging to the
+// authenticated connection, then verify under it
+let accepted = verify_under(route_keys.key_for(authenticated_device_id), &json);
 ```
 
-##### 4.15.2.2 Key derivation
+##### 4.15.2.2 Per-device route signing
 
-The signing key is **not** the relay token and **not** the master secret.
+**Each device signs with its own key, and the key is derived from the pairing
+secret that device already shares with the hub.** There is no shared signing key
+and no relay-side key at all.
 
-* Default: `derive_signing_key(HMAC_SECRET)`, a labelled PRF-based KDF —
-  `HMAC-SHA256(hmac_secret, "conduit-protocol/v1/derive:" + "conduit-relay/v1/message-signing-key")`.
-* Override: `RELAY_SIGNING_KEY` / `RELAY_SIGNING_KEY_ID`.
+The derivation, exactly:
 
-The label is mandatory (`derive_key` panics on an empty one) and is part of the
-KDF input, so a derived key can never equal the master secret nor any other
-derived key. `RELAY_TOKEN` is a *bearer credential* held by every authenticated
-client; before the separation it doubled as the route MAC key, which meant any
-client could forge a route claiming to be any other device. Clients MUST
-therefore never sign with the token.
+```
+derive_key(master, label)    = HMAC-SHA256(master, "conduit-protocol/v1/derive:" || label)
+derive_route_key(secret, id) = derive_key(secret, "conduit-relay/v1/route-key:" || id)
+```
 
-##### 4.15.2.3 Rotation window
+`secret` is the 32-byte X25519 shared secret produced by pairing (§4.2). `id` is
+the device id the hub filed the device under. Both are inputs to a labelled
+PRF-based KDF (`conduit_protocol::hmac::derive_route_key`,
+`packages/protocol/src/lib.rs:136`), so:
 
-`SigningKeyring` holds a `current` key plus, during rotation, exactly one
-`previous` key.
+* a device's route key can never equal its pairing secret, the relay token, the
+  master secret, or any other device's route key — the label and the device id
+  are both inside the KDF input;
+* two devices that somehow shared a pairing secret would still get unrelated
+  keys, because the device id is in the label;
+* `device_id` is **not** secret. It is the lookup key.
 
-* Signing MUST use `current`. The default `key_id` is `v1`
-  (`hmac::DEFAULT_KEY_ID`).
-* Verification accepts either key, but only when the message's `key_id` names
-  it — the overlap window is explicit and auditable on the wire, not a
-  "try every key we know" oracle.
-* `key_id` is **mandatory**. A message without it is rejected
-  (`SigningKeyring::verify` returns `None`), because a missing id would make
-  the rotation state invisible.
-* Because `key_id` is itself in `SIGNED_FIELDS`, an attacker cannot rewrite a
-  message onto the retiring key.
-* The relay opens the window with `RELAY_SIGNING_KEY_PREVIOUS` +
-  `RELAY_SIGNING_KEY_PREVIOUS_ID`, and closes it by unsetting them.
+The relay **does not hold keys**. It asks its host, which implements the
+`RouteKeys` trait and resolves a device id to that device's key. The desktop
+answers from two sources: a paired device's key is derived from its `devices`
+row, and the desktop's own is held in the OS keyring. A device that is not
+registered is refused as `unknown_device`, not as a bad signature.
 
-##### 4.15.2.4 Replay protection
+`key_id` **MUST equal `from_device_id`.** The verifier resolves the key under
+`key_id`, then requires the signed sender to be the identity `relay_auth`
+established on this connection. Both are in `SIGNED_FIELDS`, so neither can be
+rewritten onto a valid signature.
+
+**There is no rotation window and no rotation state.** A device has exactly one
+route key at a time, and re-pairing produces a new pairing secret and therefore
+a new key, replacing the old one outright. There is never a moment when two
+keys are both accepted for one device, so there is nothing to overlap.
+
+`RELAY_TOKEN` is a *bearer credential* and is never a signing key. It is used to
+authenticate the connection in `relay_auth` and nothing else.
+
+The desktop signs with exactly the same derivation the relay verifies with, via
+`WsServer::send_to`; prefer `RelayRoute::signed_with` / `sign_with` so the bytes
+hashed are the bytes the verifier reconstructs.
+
+##### 4.15.2.3 Replay protection
 
 `timestamp` + `nonce` drive rejection, scoped **per authenticated device id**:
 
@@ -1406,14 +1446,15 @@ different authenticated client:
 
 ```
 tag = HMAC-SHA256(
-        relay_signing_key,
+        sender_route_key,
         hex( from_device_id_utf8 || 0x1F || frame[0..21] || frame[53..] ) )
 ```
 
 That is: the authenticated `from_device_id`, an ASCII unit separator (`0x1F`),
 then the header (version, target id, sequence) concatenated with the payload.
 `from_device_id` is taken from the *authenticated* connection identity, never
-from the frame — the 16-byte header names only the recipient.
+from the frame — the 16-byte header names only the recipient. The key is that
+connection's device's route key (§4.15.2.2), resolved through the host.
 
 A **v1** frame (`0x01`, 17 bytes: version + target id + payload) is **retired
 and rejected** with `binary_version_unsupported`. v1 carried no integrity
@@ -1428,10 +1469,12 @@ connection, so a reconnect resets the floor.
 
 #### 5.1.3 Key selection
 
-Unlike `relay_route`, a binary frame has no room for a `key_id` in its fixed
-header, so the relay tries every key in the ring (`current`, then `previous`).
-This is safe because each candidate is compared in constant time and the sender
-id is bound into the MAC input.
+A binary frame has no room for a `key_id` in its fixed header, and it does not
+need one. The relay resolves exactly one key — the one belonging to the device
+`relay_auth` established on this connection — through its host's `RouteKeys`
+resolver, and compares in constant time. There is no ring to walk, so there is
+no "try every key we know" oracle and no window during which a retired key is
+still accepted.
 
 **Mobile and desktop both send:**
 
@@ -1493,8 +1536,8 @@ hmac = HMAC-SHA256(shared_secret, hex(ciphertext))
 ```
 
 This is the `hmac` field **inside** the `encrypted` envelope, and is unrelated
-to the `hmac` field of a `relay_route` (§4.15.2), which is keyed by the relay's
-message-signing key instead of the peer shared secret.
+to the `hmac` field of a `relay_route` (§4.15.2), which is keyed by the sending
+device's own route key instead of the peer shared secret.
 
 ### 6.4 What Is Encrypted
 
@@ -1583,11 +1626,12 @@ listed above, before any handler runs.
 | Code | Condition |
 |------|-----------|
 | `malformed_json` | Inbound text frame was not valid JSON |
-| `invalid_device_id` | `relay_auth.device_id` was not 1–64 lowercase hex characters |
+| `invalid_device_id` | `relay_auth.device_id` was not 1–64 lowercase hex characters, optionally separated by single hyphens (§4.15.1) |
 | `malformed_relay_route` | The frame did not deserialise into `RelayRoute` |
 | `incomplete_relay_route` | `from_device_id`, `timestamp` or a non-empty `nonce` was missing |
 | `sender_mismatch` | The signed `from_device_id` is not the identity `relay_auth` established on this connection |
-| `hmac_invalid` | The signature did not verify under any accepted key — usually a wrong `key_id`, or signing with the relay token instead of the message-signing key |
+| `unknown_device` | The host has no route key registered for the authenticated device — it is not paired, or it has been revoked |
+| `hmac_invalid` | The signature did not verify under that device's own route key — usually a signer that used the relay token, or a stale key from before a re-pair |
 | `missing_target` | `to_device_id` was empty |
 | `replay_detected` | Nonce already used, or the timestamp was outside −5 s … +30 s |
 | `not_wrapped_in_relay_route` | An `encrypted` envelope arrived unwrapped |
@@ -1627,7 +1671,7 @@ no shim.
 
 | Change | Old | New | Relay's answer to the old form |
 |--------|-----|-----|--------------------------------|
-| `relay_route` signing | Unsigned, or HMAC keyed with the shared `RELAY_TOKEN`, over a 5-field subset (`type`, `to_device_id`, `payload`, `timestamp`, `nonce`) | HMAC keyed with the domain-separated message-signing key, over the 7-field `SIGNED_FIELDS` subset, with a mandatory `key_id` and a signed `from_device_id` checked against the connection identity | `incomplete_relay_route`, `hmac_invalid`, or `sender_mismatch` |
+| `relay_route` signing | Unsigned, or HMAC keyed with the shared `RELAY_TOKEN`, over a 5-field subset (`type`, `to_device_id`, `payload`, `timestamp`, `nonce`) | HMAC keyed with **the sending device's own route key**, derived from its pairing secret (§4.15.2.2), over the 7-field `SIGNED_FIELDS` subset, with a mandatory `key_id` equal to `from_device_id` and a signed `from_device_id` checked against the connection identity | `incomplete_relay_route`, `hmac_invalid`, `unknown_device`, or `sender_mismatch` |
 | Relay binary frame | 17 bytes: `0x01` + 16-byte target id + payload. No integrity protection. | 53 bytes: `0x02` + 16-byte target id + u32 sequence + 32-byte HMAC tag + payload | `binary_version_unsupported` |
 
 A client that predates these changes cannot route a single message through a
@@ -1639,19 +1683,22 @@ is intended — the old forms are the vulnerability the change fixed.
 
 1. **Sign every `relay_route`.** Include `from_device_id` (your own
    authenticated device id), `timestamp` in **milliseconds**, a non-empty
-   cryptographically random `nonce`, and `key_id`. Compute the HMAC over the
-   canonical signed-field subset (§4.15.2.1) with the relay's
-   message-signing key — **never** with `RELAY_TOKEN`, and never with the
-   master secret. Prefer `RelayRoute::signed_with` / `sign_with` so the bytes
-   match the verifier's.
+   cryptographically random `nonce`, and `key_id` **set to the same value as
+   `from_device_id`**. Compute the HMAC over the canonical signed-field subset
+   (§4.15.2.1) with **your own route key**, derived as in §4.15.2.2 — **never**
+   with `RELAY_TOKEN`, and never with the master secret. Prefer
+   `RelayRoute::signed_with` / `sign_with` so the bytes match the verifier's.
 2. **Wrap `encrypted` envelopes in a signed `relay_route`.** An unwrapped
    `encrypted` message is refused.
-3. **Rotate keys deliberately.** Sign with `current`; set `key_id` explicitly so
-   the relay's rotation window is usable during a re-key. Never omit `key_id`.
+3. **There is no key rotation to perform.** A device has exactly one route key.
+   A re-pair derives a new one from the new pairing secret and retires the old
+   one outright; the relay stops accepting the old key within its key-refresh
+   interval. Never omit `key_id`, and never reuse another device's.
 4. **Build 53-byte v2 binary frames**, with a strictly increasing per-connection
    sequence number and a tag computed over
    `hex(from_device_id || 0x1F || frame[0..21] || payload)`, where
-   `from_device_id` is the authenticated identity.
+   `from_device_id` is the authenticated identity, keyed with the same route
+   key.
 5. **Keep routed frames under 1 MiB** (§2.5) or move to a binary path.
 6. **Pair before anything except `pairing`, `ping` and `pong`** — `discovery`
    is now gated, and `pairing/local_auth` is mandatory for the desktop's own
@@ -1661,17 +1708,14 @@ is intended — the old forms are the vulnerability the change fixed.
 
 Documented, not fixed here:
 
-* **The desktop's own relay client does not yet sign conformantly.**
-  `apps/desktop/src-tauri/src/server/mod.rs` builds a `relay_route` in
-  `send_to` with five fields, omitting `from_device_id` and `key_id`, and MACs
-  it with `RELAY_TOKEN`. Such a frame is rejected by a current relay with
-  `incomplete_relay_route`. Until that call site is moved to
-  `RelayRoute::signed_with`, desktop-originated relay routing is broken and
-  `send_to`'s fallback path is dead against a compliant relay.
 * **`protocol_version` is not enforced by the relay** (§1.1), so the §9.1
   changes are not detectable through version negotiation.
+* **The mobile client does not pin correctly.** It hashes the whole DER
+  certificate where the pin is over the SPKI (§2.3), so a pinned phone cannot
+  complete a connection. The desktop has no pin configuration target at all.
+  This is live rather than hypothetical now that the relay runs by default.
 * **`sms/new` and `sms/sent` still have two incompatible shapes** (§4.11).
 * **Mobile-side drift could not be verified** from this crate. The Dart client
   was read only for the port constants that `types.rs` asserts against; whether
-  it has adopted the signed `relay_route`, the `remote_input/key` message, the
-  `fps` field, or `actionType: "move"` is **[unverified]**.
+  it has adopted the `remote_input/key` message, the `fps` field, or
+  `actionType: "move"` is **[unverified]**.

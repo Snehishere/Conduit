@@ -1024,7 +1024,27 @@ impl Storage {
                     "notifications_enabled",
                     "true",
                 )? == "true",
-                relay_url: Self::setting_or_default(&conn, "relay_url", "ws://127.0.0.1:9528")?,
+                relay_url: Self::setting_or_default(
+                    &conn,
+                    "relay_url",
+                    crate::commands::DEFAULT_RELAY_URL,
+                )?,
+                relay_enabled: Self::setting_or_default(&conn, "relay_enabled", "false")? == "true",
+                relay_port: Self::setting_or_default(
+                    &conn,
+                    "relay_port",
+                    &crate::relay::DEFAULT_RELAY_PORT.to_string(),
+                )?
+                .parse()
+                .unwrap_or(crate::relay::DEFAULT_RELAY_PORT),
+                relay_health_port: Self::setting_or_default(
+                    &conn,
+                    "relay_health_port",
+                    &crate::relay::DEFAULT_RELAY_HEALTH_PORT.to_string(),
+                )?
+                .parse()
+                .unwrap_or(crate::relay::DEFAULT_RELAY_HEALTH_PORT),
+                relay_hostname: Self::setting_or_default(&conn, "relay_hostname", "")?,
             })
         })
     }
@@ -1150,6 +1170,10 @@ impl Storage {
                 settings.notifications_enabled.to_string(),
             ),
             ("relay_url", settings.relay_url.clone()),
+            ("relay_enabled", settings.relay_enabled.to_string()),
+            ("relay_port", settings.relay_port.to_string()),
+            ("relay_health_port", settings.relay_health_port.to_string()),
+            ("relay_hostname", settings.relay_hostname.clone()),
         ];
 
         tokio::task::block_in_place(|| {
@@ -2327,7 +2351,7 @@ mod tests {
         assert!(settings.minimize_to_tray);
         assert!(settings.auto_accept_files);
         assert!(settings.notifications_enabled);
-        assert_eq!(settings.relay_url, "ws://127.0.0.1:9528");
+        assert_eq!(settings.relay_url, "ws://127.0.0.1:9531");
         assert_eq!(
             settings.notification_apps,
             crate::commands::default_notification_apps()
@@ -2354,6 +2378,10 @@ mod tests {
             auto_accept_files: false,
             notifications_enabled: false,
             relay_url: "wss://relay.example:9528".to_string(),
+            relay_enabled: false,
+            relay_port: crate::relay::DEFAULT_RELAY_PORT,
+            relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+            relay_hostname: String::new(),
         };
         storage.save_settings(&settings).await.unwrap();
 
@@ -2377,6 +2405,10 @@ mod tests {
             device_name: "Key Audit".to_string(),
             notification_apps: vec!["Signal".to_string()],
             relay_url: "wss://relay.example:9528".to_string(),
+            relay_enabled: false,
+            relay_port: crate::relay::DEFAULT_RELAY_PORT,
+            relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+            relay_hostname: String::new(),
             ..Default::default()
         };
         settings.max_devices = 9;
@@ -2438,6 +2470,10 @@ mod tests {
             auto_accept_files: true,
             notifications_enabled: true,
             relay_url: crate::commands::DEFAULT_RELAY_URL.to_string(),
+            relay_enabled: false,
+            relay_port: crate::relay::DEFAULT_RELAY_PORT,
+            relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+            relay_hostname: String::new(),
         };
         storage.save_settings(&s1).await.unwrap();
 
@@ -2460,7 +2496,8 @@ mod tests {
     /// `relay_url` — the upsert chain simply ended at `analytics` — while
     /// `get_settings` read `relay_url` back from the `settings` table. A relay
     /// URL chosen in the UI was silently dropped and reverted to
-    /// `ws://127.0.0.1:9528` on the next read. The test now pins the fix: the
+    /// `ws://127.0.0.1:9528` on the next read — the default the standalone
+    /// relay used. The test now pins the fix: the
     /// value is written and read back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_save_and_load_settings_roundtrips_relay_url() {

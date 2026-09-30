@@ -159,8 +159,19 @@ pub async fn handle_pairing_request(msg: Value, client_id: &str, ctx: &WsContext
             name: "Conduit Desktop".into(),
             device_type: "desktop".into(),
             os: Some(std::env::consts::OS.to_string()),
-            battery: Some(100),
+            battery: None,
         }),
+        // The peer cannot derive or choose this. It has to be told, because the
+        // peer is the only party that can stamp it into `source_device`, and
+        // the hub resolves the shared secret by that field when opening the
+        // next `encrypted` envelope. Omitting it left the phone sending the
+        // literal "mobile", which never resolved, so every encrypted frame the
+        // phone sent was dropped at `server/mod.rs`'s decrypt step.
+        device_id: Some(stable_id.clone()),
+        // The peer needs the hub's own id to verify anything the relay
+        // forwards it: a relayed v2 frame is checked under the sender's route
+        // key, and the sender's id is bound into that key's derivation.
+        hub_device_id: Some(ctx.device_id.as_str().to_string()),
     };
     let response = serde_json::to_string(&response).expect("PairingAccept serializes");
 
@@ -315,6 +326,89 @@ mod tests {
     use crate::server::handlers::{has_identity, paired_device_id};
 
     // ── handle_pairing_request tests ──────────────────────────────────────────
+
+    /// The `pairing/accept` reply must name the id the hub filed the peer
+    /// under.
+    ///
+    /// This is the fix for a silent total loss of the phone's encrypted
+    /// traffic. The hub resolves the shared secret for an `encrypted` envelope
+    /// by the `source_device` the sender stamps on it, and the peer has no way
+    /// to learn that value except this field. When it was absent, the phone
+    /// sent the literal `"mobile"`, the lookup missed, and every frame it sent
+    /// was dropped at the decrypt step — with only a server-side `warn!`, and
+    /// a phone that still showed "Connected".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_accept_reply_assigns_a_device_id_the_peer_can_learn() {
+        let ctx = create_test_ctx();
+        let ws_tx = add_test_unpaired_client(&ctx, "client_001").await;
+        let mut ws_rx = ws_tx.subscribe();
+        let _keep = ws_tx;
+
+        ctx.token_store.insert("ABCDEF".to_string()).await;
+
+        let peer_enc = crate::encryption::EncryptionManager::new_random();
+        let msg = serde_json::json!({
+            "type": "pairing",
+            "action": "request",
+            "public_key": peer_enc.public_key_hex(),
+            "token": "ABCDEF",
+            "device_info": { "name": "Pixel 7", "type": "phone", "os": "android" }
+        });
+
+        handle_pairing_request(msg, "client_001", &ctx).await;
+
+        let reply = ws_rx
+            .try_recv()
+            .expect("pairing must reply with an accept frame");
+        let accept: serde_json::Value = serde_json::from_str(&reply).expect("accept frame is JSON");
+
+        let assigned = accept
+            .get("device_id")
+            .and_then(|v| v.as_str())
+            .expect("accept must carry the assigned device_id");
+        assert!(!assigned.is_empty(), "assigned id must not be empty");
+
+        // It has to be the id the hub actually filed, or the peer stamps a value
+        // that resolves to nothing and we are back where we started.
+        let stored = ctx.storage.get_all_devices().await.unwrap();
+        assert_eq!(
+            assigned, stored[0].id,
+            "accept must carry the same devices.id the hub persisted"
+        );
+        assert_eq!(
+            paired_device_id(&ctx, "client_001").await.as_deref(),
+            Some(assigned),
+            "the assigned id must match the connection's mapped identity"
+        );
+
+        // And the hub must have a shared secret filed under exactly that id,
+        // since that is the lookup the peer's next envelope performs.
+        assert!(
+            ctx.sync_engine.read().await.get_client(assigned).is_some(),
+            "a shared secret must be resolvable by the assigned id"
+        );
+    }
+
+    /// A desktop that predates assigned ids omits the field; the reply must
+    /// still be well-formed rather than panicking or serialising `"null"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_accept_device_id_is_optional_on_the_wire() {
+        let absent: PairingAccept = serde_json::from_value(serde_json::json!({
+            "type": "pairing",
+            "action": "accept",
+            "public_key": "aabb",
+        }))
+        .expect("an accept without device_id must still parse");
+        assert_eq!(absent.device_id, None);
+
+        // `skip_serializing_if` means it is genuinely absent, not null — a
+        // client that force-unwraps `json["device_id"]` must not see a crash.
+        let json = serde_json::to_value(&absent).unwrap();
+        assert!(
+            json.get("device_id").is_none(),
+            "device_id must be omitted, not null"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pairing_request_happy_path() {

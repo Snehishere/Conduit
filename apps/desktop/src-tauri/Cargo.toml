@@ -17,6 +17,10 @@ tauri-plugin-process = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 conduit-protocol = { path = "../../../packages/protocol" }
+# The relay, as a library. There is no relay executable: the hub hosts it as a
+# background task, so reaching a phone on another network is a setting in this
+# app rather than a second deployment. See `src/relay.rs`.
+conduit-relay = { path = "../../../services/relay" }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 tungstenite = "0.30"

@@ -14,9 +14,9 @@ Conduit links a phone to a desktop over your local network. It relays clipboard
 history, files, SMS threads and notifications, call signalling, screen
 mirroring, remote input as a trackpad and keyboard, and trigger-to-action
 automation. Transport is a local WebSocket hub on the desktop with mDNS
-discovery. An optional relay is included that you can host yourself, for when
-the two devices are not on the same network. There is no account system, no
-hosted service, and no telemetry.
+discovery. A relay is built into the desktop app, for when the two devices are
+not on the same network. There is no account system, no hosted service, and no
+telemetry.
 
 The repository is a Cargo virtual workspace of three Rust crates plus two
 non-Rust frontends:
@@ -26,7 +26,7 @@ non-Rust frontends:
 | `packages/protocol` | `conduit-protocol` | Shared wire format. Library only, no binary, no I/O. |
 | `apps/desktop` | `conduit-desktop` (npm) and `conduit` (Rust, in `src-tauri/`) | Tauri v2 desktop app. React 19 + TypeScript + Vite 8 + Tailwind 4 in `src/`, Rust backend in `src-tauri/`. |
 | `apps/mobile` | `conduit` (Flutter) | Android and iOS app. |
-| `services/relay` | `relay` | Optional self-hostable relay. |
+| `services/relay` | `conduit-relay` | The relay, as a library the desktop hosts. |
 | `scripts` | — | PowerShell build and lint wrappers, and the code generation scripts. |
 
 ## Before you start: this is a spare-time project
@@ -59,12 +59,11 @@ of the change before writing it.
 | npm | 11 or later | desktop frontend, code generation | `npm --version` |
 | Flutter | 3.47 or later | mobile app | `flutter --version` |
 | Dart | 3.13 or later | mobile app | `dart --version` |
-| Docker | any recent | relay container only | `docker --version` |
 | Vendored OpenSSL | 3.5.8, win64 | **desktop backend only** | see below |
 
-Node, Flutter, and Docker are each needed for one part of the project only. If
-you are working on the desktop frontend you do not need Flutter. If you are
-working on `relay` or `conduit-protocol` you need none of them.
+Node and Flutter are each needed for one part of the project only. If you are
+working on the desktop frontend you do not need Flutter. If you are working on
+`conduit-relay` or `conduit-protocol` you need neither of them.
 
 On Windows, Flutter is often not on `PATH`. If `flutter` is not recognised, add
 it for the current session:
@@ -134,8 +133,8 @@ is the highest-value onboarding fix available. A Linux equivalent, or a
 platform-conditional `.cargo/config.toml`, would be needed to unblock the
 desktop build on Linux and in CI.
 
-`conduit-protocol` and `relay` do not need this. Neither depends on `rusqlite` or
-SQLCipher, and both build with no vendored dependencies.
+`conduit-protocol` and `conduit-relay` do not need this. Neither depends on
+`rusqlite` or SQLCipher, and both build with no vendored dependencies.
 
 ## The three working directories, and the crate-name trap
 
@@ -158,7 +157,7 @@ Cargo commands go from the root and select the crate with `-p`.
 |---|---|
 | `packages/protocol` | `conduit-protocol` |
 | `apps/desktop/src-tauri` | `conduit` |
-| `services/relay` | `relay` |
+| `services/relay` | `conduit-relay` |
 
 So `apps/desktop/src-tauri` builds a crate called `conduit`, and the mobile app
 in `apps/mobile` is a Flutter package also called `conduit`. `-p` is required,
@@ -179,27 +178,27 @@ cargo doc   -p conduit-protocol --no-deps
 Library only. This is the fastest crate to build, and a good place to start if
 you are still getting the toolchain to work.
 
-### Relay
+### Relay library
 
 ```bash
 # repository root
-cargo build -p relay
-cargo test  -p relay
-cargo run   -p relay
+cargo build  -p conduit-relay
+cargo test   -p conduit-relay
+cargo clippy -p conduit-relay --all-targets -- -D warnings
 ```
 
-Configuration comes from **process environment variables only**. A bare
-`cargo run -p relay` does not read `.env`; that is what `docker compose` does.
-For a local run, export the variables yourself. [`\.env.example`](.env.example)
-is the annotated list of what exists, and the relay refuses to start without
-`RELAY_TOKEN` and its HMAC secret.
+This is a **library**, not a program. There is no `[[bin]]`, no `src/main.rs`
+and no `cargo run` for it: the desktop app hosts the relay as a background task
+in `apps/desktop/src-tauri/src/relay.rs`, which is also where the ports, the
+certificates and the bearer token come from.
 
-The relay container:
+Configuration is the desktop's **Settings screen** — `relay_enabled`,
+`relay_port`, `relay_health_port` and `relay_hostname` — passed into
+`conduit_relay::Config` as `conduit_relay::Overrides`. Environment variables
+(`RELAY_WS_PORT`, `RELAY_HEALTH_PORT`, …) are still read, and are still a
+fallback for headless and test use, but they are not how the app is configured.
 
-```bash
-# repository root - the build context must be the repository root
-docker build -t conduit-relay -f services/relay/Dockerfile .
-```
+There is no container build and nothing to deploy.
 
 ### Desktop
 
@@ -260,36 +259,32 @@ The results below were measured on a fresh checkout of this tree.
 
 | Suite | Directory | Command | Result |
 |---|---|---|---|
-| relay | repository root | `cargo test -p relay` | 189 passed |
-| protocol | repository root | `cargo test -p conduit-protocol` | 266 passed |
-| desktop backend | repository root | `cargo test -p conduit` | not run, see note |
+| conduit-relay | repository root | `cargo test -p conduit-relay` | 187 passed, plus 2 doctests |
+| protocol | repository root | `cargo test -p conduit-protocol` | 275 passed |
+| desktop backend | repository root | `cargo test -p conduit` | 724 passed |
 | format | repository root | `cargo fmt --all -- --check` | clean |
-| clippy | repository root | `cargo clippy -p <crate> --all-targets -- -D warnings` | clean for `conduit-protocol` and `relay` |
+| clippy | repository root | `cargo clippy -p <crate> --all-targets -- -D warnings` | clean for `conduit-protocol` and `conduit-relay` |
 | typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
-| unit | `apps/desktop` | `npx vitest run` | 216 passed, 20 files |
+| unit | `apps/desktop` | `npx vitest run` | 222 passed, 20 files |
 | build | `apps/desktop` | `npm run build` | ok |
 | codegen | `apps/desktop` | `npm run generate` | ok, 55 message types |
-| mobile unit | `apps/mobile` | `flutter test` | fails, see note |
+| mobile unit | `apps/mobile` | `flutter test` | 87 passed |
 | mobile analyze | `apps/mobile` | `dart analyze --fatal-infos` | fails, see note |
 | mobile integration | `apps/mobile` | `flutter test integration_test` | needs a device or running emulator |
 
-Notes on the ones that do not pass.
+Two of the rows above still need a note.
 
-**`cargo test -p conduit` could not be run.** It needs `.tools/openssl-win64/`,
-which no script in the repository provides. On a machine where that directory is
-present the suite is expected to pass; it has not been re-measured here.
+**`cargo test -p conduit` needs `.tools/openssl-win64/`.** No script in the
+repository provides it. It is present on the machine these numbers were measured
+on, so the suite runs and passes 724; on a machine without it the desktop crate
+will not build at all. The other two crates need nothing.
 
-**The mobile Dart tree does not currently compile.** The generated file
-`apps/mobile/lib/widgets/conduit_logo.dart` uses `Offset`, `Canvas`, `Size`,
-`Paint`, and `Path` but carries no import that provides them, because
-`scripts/icons/emit_sources.py` does not emit one. The measured results are 41
-unit tests passing with `test/screens/home_screen_test.dart` failing to load,
-and 34 analyzer errors, of which 31 are in `conduit_logo.dart` and 3 cascade
-into `lib/screens/home_screen.dart`. Running `npm run icons` does not fix it,
-because the generator is the source of the defect. The fix is an import line in
-the Dart header in `scripts/icons/emit_sources.py`, after which
-`npm run icons` regenerates a compiling file. The protocol, relay, and desktop
-suites are unaffected, which is why the tree is worth publishing as it is.
+**`dart analyze --fatal-infos` exits non-zero** because the flag promotes style
+infos to failures, and the Dart tree carries a few hundred of them (mostly
+`prefer_single_quotes` and naming rules inside the generated
+`lib/models/protocol.dart`). Plain `dart analyze` exits 0, which is why the CI
+step that uses the fatal form is non-blocking. `flutter test` itself passes —
+87 of 87.
 
 A single test by name:
 
@@ -326,8 +321,8 @@ and runs on Linux.
 
 ### Rust
 
-- `conduit` and `relay` are edition 2024. `conduit-protocol` is edition 2021.
-  The workspace mixes editions on purpose.
+- `conduit` and `conduit-relay` are edition 2024. `conduit-protocol` is
+  edition 2021. The workspace mixes editions on purpose.
 - [`rustfmt.toml`](rustfmt.toml) exists and sets `edition = "2021"`. It is
   deliberately minimal, and its comment explains why: adding `style_edition`
   at the root would apply to all three crates and reformat the 2021 crate
@@ -475,7 +470,7 @@ layout.
    ```bash
    # repository root
    cargo test -p conduit-protocol
-   cargo test -p relay
+   cargo test -p conduit-relay
    cargo test -p conduit
    # apps/desktop
    npx tsc --noEmit && npx vitest run
@@ -497,7 +492,11 @@ one, update all of:
   call sites, which broke LAN pairing entirely.
 - `WS_BIND_ADDR` in `apps/desktop/src-tauri/src/main.rs`, which a test pins to
   the plaintext port and asserts does not parse as the TLS port.
-- `docker-compose.yml` and `.env.example` for the relay ports.
+- `relay_port`, `relay_health_port` and `DEFAULT_RELAY_LOCAL_PORT` in
+  `apps/desktop/src-tauri/src/relay.rs`, which is where the relay's ports are
+  resolved for the hosted relay. 9531 is deliberately shared: it is both the
+  desktop's LAN TLS listener and the relay's loopback-only plaintext listener
+  that the desktop joins its own relay over.
 
 Then run `cargo test -p conduit-protocol`.
 

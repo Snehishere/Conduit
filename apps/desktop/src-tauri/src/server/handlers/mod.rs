@@ -41,6 +41,11 @@ pub struct WsContext {
     pub storage: Arc<Storage>,
     pub automation_engine: Arc<RwLock<crate::automation::AutomationEngine>>,
     pub audio_stream: Arc<AudioStream>,
+    /// This desktop's own device id, which is also its relay route-key id.
+    pub device_id: Arc<String>,
+    /// How a device id becomes the key it signs relayed frames with. Shared with
+    /// the relay host, so the two can never disagree about who may route.
+    pub route_keys: Arc<crate::relay::DeviceRouteKeys>,
     pub relay_tx: Arc<RwLock<Option<tokio::sync::mpsc::Sender<String>>>>,
 }
 
@@ -185,6 +190,11 @@ pub(crate) mod test_helpers {
         let per_type_limiter = Arc::new(PerTypeRateLimiter::new());
         let automation_engine = Arc::new(RwLock::new(crate::automation::AutomationEngine::new()));
         let audio_stream = Arc::new(AudioStream::new());
+        let device_id = Arc::new("test-device".to_string());
+        let route_keys = Arc::new(crate::relay::DeviceRouteKeys::new(
+            storage.clone(),
+            device_id.as_str().to_string(),
+        ));
 
         WsContext {
             clients,
@@ -198,6 +208,8 @@ pub(crate) mod test_helpers {
             storage,
             automation_engine,
             audio_stream,
+            device_id,
+            route_keys,
             relay_tx: Arc::new(RwLock::new(None)),
         }
     }

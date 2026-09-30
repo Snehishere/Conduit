@@ -1,6 +1,29 @@
 # ADR-0004: The relay message-signing key is domain-separated from the relay token
 
-- **Status:** Accepted
+> ## Status: SUPERSEDED by ADR-0011
+>
+> **This record is kept as written.** Its Context and Decision are not edited;
+> the reversal is recorded in a new record, per the rule in
+> [`README.md`](README.md) that a decision that is later replaced gets a new
+> file rather than a rewritten one.
+>
+> **What replaced it:** [ADR-0011](0011-per-device-relay-route-keys.md).
+> Instead of one relay-wide signing key derived from the relay's master secret,
+> **every device has its own route key**, derived from the pairing secret that
+> device already shares with the desktop. `RELAY_SIGNING_KEY`,
+> `RELAY_SIGNING_KEY_ID`, `RELAY_SIGNING_KEY_PREVIOUS` and
+> `RELAY_SIGNING_KEY_PREVIOUS_ID` no longer exist, the `{current, previous}`
+> ring is gone, and there is no rotation window.
+>
+> **Why:** the objection this record raises against itself — quoted verbatim
+> under *Consequences* below, that an unset `RELAY_SIGNING_KEY` means "the
+> master secret is effectively still the root of trust — the separation is
+> between *roles*, not between *custodians*" — is the defect ADR-0011 fixes.
+> Separating roles inside one custodian is not enough when the clients cannot
+> hold the key at all: see ADR-0011's Context for the two dead ends this
+> record's design leads to.
+
+- **Status:** Superseded by [ADR-0011](0011-per-device-relay-route-keys.md)
 - **Date:** 2026-09
 
 ## Context
@@ -135,3 +158,40 @@ remove the need to sign the sender claim.
 Rejected: it turns a routine key change into a coordinated outage of every
 client. The `{current, previous}` ring exists precisely so that window does not
 have to be instantaneous.
+
+---
+
+## What changed
+
+Everything below describes the relay **as it is not**. None of it is in the code.
+
+1. **`RELAY_SIGNING_KEY[_ID]` and `RELAY_SIGNING_KEY_PREVIOUS[_ID]` are
+   gone.** There is no relay-side signing key to configure, and no `.env` to
+   configure it in.
+2. **`SigningKeyring` and its `{current, previous}` ring are gone.** Verification
+   resolves the one key belonging to the device that claims to have sent the
+   route, by asking the host through the `RouteKeys` trait
+   (`services/relay/src/route.rs:89-137`). A device can sign for itself and for
+   nothing else, so there is no ring and no rotation window.
+3. **The derivation is per device, not per relay.** ADR-0004 derived one key from
+   the relay's master secret; the current scheme derives each device's key from
+   that device's own pairing secret
+   (`conduit_protocol::hmac::derive_route_key`, `packages/protocol/src/lib.rs:136`).
+   The master secret no longer sits in the route-verification path at all — it
+   only backs the `/health` bearer-token default.
+4. **`key_id` is still mandatory, but it is no longer a rotation id.** It must
+   equal `from_device_id`. That is what closes the "rewrite the signature onto
+   another device" hole without a second, separate id to remember.
+5. **Revocation is immediate** rather than impossible. A revoked device's row
+   stops being registered as a key source, and the desktop drops its key within
+   `KEY_REFRESH_INTERVAL` (5 s), with no overlap window in which the old key is
+   still accepted.
+
+The wire-level guarantee this record was reaching for — a valid signature alone
+must not be enough, because every client holds the signing key — is preserved
+and tightened. Under ADR-0011 a valid signature is *never* alone enough: the key
+that verifies a route is the key belonging to the authenticated connection, so
+no other client can produce a signature this one can.
+
+See [ADR-0011](0011-per-device-relay-route-keys.md) for the replacement
+decision.

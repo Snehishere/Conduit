@@ -165,7 +165,7 @@ Two caveats:
 1. Edit `src/types.rs`.
 2. Edit `schema.json` to match.
 3. Add or update the message's section in `PROTOCOL.md`.
-4. `cargo test -p conduit-protocol` — 266 tests, including the schema/Rust sync
+4. `cargo test -p conduit-protocol` — 275 tests, including the schema/Rust sync
    tests and three tests that read `PROTOCOL.md` directly.
 5. If the wire format changed incompatibly, add a Compatibility entry to
    `PROTOCOL.md` §9 and bump `PROTOCOL_VERSION` (or

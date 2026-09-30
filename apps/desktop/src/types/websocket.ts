@@ -86,6 +86,8 @@ export interface PairingAcceptMessage {
   protocol_version?: number;
   public_key: string;
   device_info?: DeviceInfo;
+  device_id?: string;
+  hub_device_id?: string;
 }
 
 export interface PairingRevokeMessage {

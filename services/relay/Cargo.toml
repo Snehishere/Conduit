@@ -1,16 +1,26 @@
 [package]
-name = "relay"
+name = "conduit-relay"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Router that carries already-encrypted Conduit traffic between devices on different networks. Runs in-process inside the desktop app."
+
+# A library, not a program. The relay is a background task owned by the desktop
+# app; there is deliberately no binary target, so there is no second way to run
+# it and no way to end up with two deployments disagreeing about ports, secrets
+# or certificates. See `service::RelayService`.
+[lib]
+name = "conduit_relay"
+path = "src/lib.rs"
 
 [dev-dependencies]
-tokio-test = "0.4"
 serial_test = "3"
 
 [dependencies]
+conduit-protocol = { path = "../../packages/protocol" }
+dirs = "7"
 env_logger = { workspace = true }
 futures-util = { workspace = true }
-conduit-protocol = { path = "../../packages/protocol" }
 hex = { workspace = true }
 hyper = { version = "1.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }

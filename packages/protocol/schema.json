@@ -360,6 +360,14 @@
         },
         "device_info": {
           "$ref": "#/definitions/DeviceInfo"
+        },
+        "device_id": {
+          "type": "string",
+          "description": "The devices.id the desktop assigned to the peer. The peer stores it and sends it as source_device on every encrypted envelope; without it the receiver cannot resolve the shared secret. Absent when the sender predates assigned ids."
+        },
+        "hub_device_id": {
+          "type": "string",
+          "description": "The desktop's own device_id. A relayed v2 frame is verified under the sender's route key, and the sender's id is bound into that key's derivation, so a peer that does not know this cannot verify a relayed frame and must drop it. Absent when the sender predates it."
         }
       }
     },

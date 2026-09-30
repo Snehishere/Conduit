@@ -3,6 +3,7 @@ export type SettingsCategory =
   | 'appearance'
   | 'notifications'
   | 'files'
+  | 'relay'
   | 'advanced'
   | 'about';
 
@@ -50,6 +51,16 @@ export interface SettingsData {
   auto_accept_files: boolean;
   notifications_enabled: boolean;
   relay_url: string;
+  // relay_enabled / relay_port / relay_health_port / relay_hostname configure
+  // the relay this app hosts in-process. On by default, because the relay is a
+  // background part of this app rather than something to deploy; the ports
+  // match the values in packages/protocol. relay_hostname is what the
+  // self-signed certificate must be valid for, and is empty (meaning
+  // "localhost") unless the relay is published under a real name.
+  relay_enabled: boolean;
+  relay_port: number;
+  relay_health_port: number;
+  relay_hostname: string;
 }
 
 export type SettingsKey = keyof SettingsData;
@@ -76,6 +87,10 @@ export const SETTINGS_KEYS = {
   auto_accept_files: true,
   notifications_enabled: true,
   relay_url: true,
+  relay_enabled: true,
+  relay_port: true,
+  relay_health_port: true,
+  relay_hostname: true,
 } as const satisfies Record<SettingsKey, true>;
 
 /** `SETTINGS_KEYS` as an array, for runtime iteration and tests. */
@@ -102,7 +117,11 @@ export const DEFAULT_SETTINGS: SettingsData = {
   default_download_folder: '',
   auto_accept_files: true,
   notifications_enabled: true,
-  relay_url: 'ws://127.0.0.1:9528',
+  relay_url: 'ws://127.0.0.1:9531',
+  relay_enabled: true,
+  relay_port: 9529,
+  relay_health_port: 9530,
+  relay_hostname: '',
 };
 
 export type UpdateSetting = <K extends SettingsKey>(

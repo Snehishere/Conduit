@@ -843,6 +843,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "conduit-protocol",
+ "conduit-relay",
  "cpal",
  "dirs 7.0.0",
  "enigo",
@@ -900,6 +901,32 @@ dependencies = [
  "sha2 0.10.9",
  "subtle",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "conduit-relay"
+version = "0.1.0"
+dependencies = [
+ "conduit-protocol",
+ "dirs 7.0.0",
+ "env_logger",
+ "futures-util",
+ "hex",
+ "hyper",
+ "hyper-util",
+ "log",
+ "rand 0.8.8",
+ "rcgen 0.13.2",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.24.0",
+ "tungstenite 0.24.0",
 ]
 
 [[package]]
@@ -4588,32 +4615,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
-name = "relay"
-version = "0.1.0"
-dependencies = [
- "conduit-protocol",
- "env_logger",
- "futures-util",
- "hex",
- "hyper",
- "hyper-util",
- "log",
- "rand 0.8.8",
- "rcgen 0.13.2",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serial_test",
- "subtle",
- "tokio",
- "tokio-rustls",
- "tokio-test",
- "tokio-tungstenite 0.24.0",
- "tungstenite 0.24.0",
-]
-
-[[package]]
 name = "reqwest"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6119,28 +6120,6 @@ checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

@@ -68,16 +68,11 @@ pub mod hmac {
     /// (`^[0-9a-f]{1,64}$`) and keeps the on-disk keys unambiguous.
     pub const SCOPE_SEPARATOR: char = '\u{1f}';
 
-    /// `key_id` written into messages signed with [`SigningKeyring::current`]
-    /// when the caller does not choose one explicitly.
-    pub const DEFAULT_KEY_ID: &str = "v1";
-
-    /// Domain-separation label for the `relay_route` message-signing key.
+    /// Domain-separation label for a device's `relay_route` signing key.
     ///
-    /// Used by [`derive_key`] when no dedicated signing key is configured.
-    /// The label is part of the KDF input, so a key derived with this label can
-    /// never equal the master secret itself, nor any other derived key.
-    pub const SIGNING_KEY_LABEL: &str = "conduit-relay/v1/message-signing-key";
+    /// The device id is appended to this label, so two devices sharing a
+    /// pairing secret still get unrelated keys. See [`derive_route_key`].
+    pub const ROUTE_KEY_LABEL: &str = "conduit-relay/v1/route-key";
 
     /// Fixed prefix binding every derived key to this protocol and KDF version.
     ///
@@ -97,9 +92,9 @@ pub mod hmac {
     /// remaining a single HMAC invocation with no extra dependency.
     ///
     /// The `label` is a **required** argument by design: it is the mechanism
-    /// that stops the relay's message-signing key from being the auth token or
-    /// the master secret. Never call this with an empty label, and never pass a
-    /// user-supplied string as the label.
+    /// that stops a derived key from being the auth token or the master secret.
+    /// Never call this with an empty label, and never pass a user-supplied
+    /// string as the label.
     pub fn derive_key(master: &[u8], label: &str) -> [u8; 32] {
         assert!(
             !label.is_empty(),
@@ -114,13 +109,33 @@ pub mod hmac {
         key
     }
 
-    /// Derive the `relay_route` message-signing key from the master secret.
+    /// Derive the key a device signs its `relay_route` messages with.
     ///
-    /// Convenience wrapper over [`derive_key`] that pins the label to
-    /// [`SIGNING_KEY_LABEL`]. This is *not* the relay token and *not* the
-    /// master secret — see [`derive_key`].
-    pub fn derive_signing_key(master: &[u8]) -> [u8; 32] {
-        derive_key(master, SIGNING_KEY_LABEL)
+    /// `pairing_secret` is the X25519 secret already established when this
+    /// device paired with the desktop hub; `device_id` is the id the hub filed
+    /// it under, and is bound into the label so the same secret under two
+    /// device ids yields unrelated keys.
+    ///
+    /// # Why this replaces a shared signing key
+    ///
+    /// The relay used to verify every route against one key derived from its
+    /// own master secret. That key was, by construction, something no client
+    /// could hold — so no client could produce a valid route, and the whole
+    /// relay path was unreachable from either end. The only alternative, giving
+    /// clients the bearer token, lets any one of them forge a route claiming to
+    /// be any other.
+    ///
+    /// Deriving from the per-device pairing secret closes both gaps at once: the
+    /// client already holds this secret, and the hub can derive the same key
+    /// from the row it stored at pairing time. A device can sign for itself and
+    /// for nothing else, and a rotated secret (a re-pair) retires the old key
+    /// automatically — which is why there is no rotation window here.
+    ///
+    /// The device id is caller-supplied and must be the one on the wire, or
+    /// verification will not find the key. It is not treated as secret.
+    pub fn derive_route_key(pairing_secret: &[u8], device_id: &str) -> [u8; 32] {
+        let label = format!("{ROUTE_KEY_LABEL}:{device_id}");
+        derive_key(pairing_secret, &label)
     }
 
     // =====================================================================
@@ -171,9 +186,10 @@ pub mod hmac {
     /// `relay_route` carry an unauthenticated sender, so any new signed field
     /// MUST be added here **and** to the client signers.
     ///
-    /// `from_device_id` is covered so a route cannot be replayed on behalf of a
-    /// different device; `key_id` is covered so an attacker cannot downgrade a
-    /// message onto the previous (retiring) key.
+    /// `from_device_id` and `key_id` are both covered because a route is
+    /// verified by looking its key up under `key_id` and then requiring
+    /// `from_device_id` to match. Both are signed, so neither can be rewritten
+    /// to point a valid signature at a different device.
     pub const SIGNED_FIELDS: [&str; 7] = [
         "type",
         "from_device_id",
@@ -202,128 +218,119 @@ pub mod hmac {
 
     /// Verify the `hmac` field on a signed JSON message (canonical field subset).
     pub fn verify_message_hmac(secret: &[u8], json: &Value) -> bool {
-        verify_message_hmac_raw(secret, json, None).is_some()
+        verify_message_hmac_raw(secret, json, None)
     }
 
     /// Verify a signed message, optionally requiring a specific `key_id`.
     ///
-    /// Returns the key id that validated the message. Used by
-    /// [`SigningKeyring::verify`]; prefer the keyring in production so that
-    /// rotation (accept `{current, previous}`) works without touching callers.
-    fn verify_message_hmac_raw(
-        secret: &[u8],
-        json: &Value,
-        required_key_id: Option<&str>,
-    ) -> Option<String> {
-        let hmac_hex = json.get("hmac").and_then(|v| v.as_str())?;
-        if let Some(want) = required_key_id {
-            let got = json.get("key_id").and_then(|v| v.as_str())?;
-            if got != want {
-                return None;
+    /// The primitive behind [`RouteKeyring::verify`]. It does **not** require
+    /// `key_id` to be present: that is the keyring's job, and a caller checking a
+    /// bare MAC is asking a narrower question.
+    fn verify_message_hmac_raw(secret: &[u8], json: &Value, required_key_id: Option<&str>) -> bool {
+        if let Some(hmac_hex) = json.get("hmac").and_then(|v| v.as_str()) {
+            if let Some(want) = required_key_id {
+                if json.get("key_id").and_then(|v| v.as_str()) != Some(want) {
+                    return false;
+                }
             }
+            let message_str = canonical_signing_string(json);
+            return verify_hmac(secret, &message_str, hmac_hex);
         }
-        let message_str = canonical_signing_string(json);
-        if verify_hmac(secret, &message_str, hmac_hex) {
-            Some(
-                json.get("key_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(DEFAULT_KEY_ID)
-                    .to_string(),
-            )
-        } else {
-            None
-        }
+        false
     }
 
     // =====================================================================
-    //  Key rotation
+    //  Route keys
     // =====================================================================
 
-    /// One HMAC key plus the `key_id` published in messages it signs.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct KeyMaterial {
-        pub id: String,
-        pub secret: Vec<u8>,
-    }
-
-    impl KeyMaterial {
-        pub fn new(id: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
-            Self {
-                id: id.into(),
-                secret: secret.into(),
-            }
-        }
-    }
-
-    /// The set of keys a relay accepts: the current key plus, during a rotation
-    /// window, exactly one previous key.
+    /// The per-device keys a relay accepts, keyed by device id.
     ///
-    /// Signing MUST use [`SigningKeyring::current`]. Verification accepts either
-    /// key, but only when the message's `key_id` names it — that is what makes
-    /// the overlap window explicit and auditable on the wire rather than a
-    /// silent "try every key we know" oracle.
-    #[derive(Debug, Clone, PartialEq)]
-    pub struct SigningKeyring {
-        current: KeyMaterial,
-        previous: Option<KeyMaterial>,
+    /// One key per device, each derived from that device's own pairing secret
+    /// (see [`derive_route_key`]). There is deliberately no rotation window and
+    /// no shared operator key:
+    ///
+    /// * a device can sign for itself and for nothing else, so a compromised
+    ///   phone cannot forge traffic as the desktop or as another phone;
+    /// * a key changes only when the device re-pairs, which is exactly when
+    ///   its pairing secret changes, so there is no window to manage and no
+    ///   `RELAY_SIGNING_KEY_PREVIOUS` to unset and forget.
+    ///
+    /// The relay builds this from its own device registry; a client holds one
+    /// key, its own.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    pub struct RouteKeyring {
+        keys: HashMap<String, Vec<u8>>,
     }
 
-    impl SigningKeyring {
-        /// A single-key ring (no rotation in progress).
-        pub fn new(id: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
-            Self {
-                current: KeyMaterial::new(id, secret),
-                previous: None,
-            }
+    impl RouteKeyring {
+        /// An empty ring. Nothing verifies until a device is registered.
+        pub fn new() -> Self {
+            Self::default()
         }
 
-        /// Open a rotation window: `current` signs, `previous` is still accepted.
-        pub fn with_previous(mut self, id: impl Into<String>, secret: impl Into<Vec<u8>>) -> Self {
-            self.previous = Some(KeyMaterial::new(id, secret));
-            self
+        /// Register (or replace) the key for `device_id`.
+        ///
+        /// Replacing rather than rejecting is deliberate: re-pairing a device
+        /// changes its secret, and a ring that pinned the old key would leave
+        /// the device permanently unable to route.
+        pub fn insert(&mut self, device_id: impl Into<String>, secret: impl Into<Vec<u8>>) {
+            self.keys.insert(device_id.into(), secret.into());
         }
 
-        /// Close the rotation window; the previous key stops being accepted.
-        pub fn end_rotation(mut self) -> Self {
-            self.previous = None;
-            self
+        /// Forget `device_id`. Called when a device is unpaired, so a revoked
+        /// device cannot keep signing.
+        pub fn remove(&mut self, device_id: &str) {
+            self.keys.remove(device_id);
         }
 
-        pub fn current(&self) -> &KeyMaterial {
-            &self.current
+        /// Retain only the devices in `keep`.
+        pub fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+            self.keys.retain(|id, _| keep(id));
         }
 
-        pub fn previous(&self) -> Option<&KeyMaterial> {
-            self.previous.as_ref()
+        /// The key for `device_id`, if it is registered.
+        pub fn key_for(&self, device_id: &str) -> Option<&[u8]> {
+            self.keys.get(device_id).map(|v| v.as_slice())
         }
 
-        /// Every accepted `key_id`, current first.
-        pub fn ids(&self) -> Vec<&str> {
-            let mut ids = vec![self.current.id.as_str()];
-            if let Some(prev) = &self.previous {
-                ids.push(prev.id.as_str());
-            }
+        /// Every registered device id, sorted.
+        pub fn device_ids(&self) -> Vec<&str> {
+            let mut ids: Vec<&str> = self.keys.keys().map(|s| s.as_str()).collect();
+            ids.sort_unstable();
             ids
         }
 
-        /// Secret for `id`, if that key is currently accepted.
-        pub fn signing_key_for(&self, id: &str) -> Option<&[u8]> {
-            if self.current.id == id {
-                return Some(&self.current.secret);
-            }
-            self.previous
-                .as_ref()
-                .filter(|p| p.id == id)
-                .map(|p| p.secret.as_slice())
+        /// How many devices are registered.
+        pub fn len(&self) -> usize {
+            self.keys.len()
         }
 
-        /// Verify a signed message, returning the `key_id` that matched.
+        /// Whether no device is registered.
+        pub fn is_empty(&self) -> bool {
+            self.keys.is_empty()
+        }
+
+        /// Verify a signed `relay_route`.
         ///
-        /// `None` when `key_id` is absent, unknown/retired, or the MAC fails.
+        /// Returns the device id that validated it. `None` when the message
+        /// does not name its signer, names one that is not registered, or the
+        /// MAC fails.
+        ///
+        /// The signer is taken from `key_id`, and `from_device_id` is required
+        /// to equal it. Requiring the two to agree is what stops a valid
+        /// signature from being replayed under a different claimed sender: the
+        /// key is looked up by the same name the payload is attributed to.
         pub fn verify(&self, json: &Value) -> Option<String> {
-            let key_id = json.get("key_id").and_then(|v| v.as_str())?;
-            let secret = self.signing_key_for(key_id)?;
-            verify_message_hmac_raw(secret, json, Some(key_id))
+            // The key id is what the key is looked up by, so it is mandatory:
+            // defaulting it would attribute a route to whichever device happened
+            // to be registered.
+            let signer = json.get("key_id").and_then(|v| v.as_str())?;
+            let claimed = json.get("from_device_id").and_then(|v| v.as_str())?;
+            if signer != claimed {
+                return None;
+            }
+            let secret = self.key_for(signer)?;
+            verify_message_hmac_raw(secret, json, Some(signer)).then(|| signer.to_string())
         }
     }
 
@@ -879,7 +886,7 @@ pub mod hmac {
                 ("payload", serde_json::json!({"type": "ping"})),
                 ("timestamp", serde_json::json!(now_millis())),
                 ("nonce", serde_json::json!(nonce)),
-                ("key_id", serde_json::json!(DEFAULT_KEY_ID)),
+                ("key_id", serde_json::json!(from)),
             ]
         }
 
@@ -964,34 +971,13 @@ pub mod hmac {
         #[test]
         fn derive_key_is_deterministic_and_label_dependent() {
             let master = b"master-secret";
-            let a = derive_key(master, SIGNING_KEY_LABEL);
-            let b = derive_key(master, SIGNING_KEY_LABEL);
+            let a = derive_key(master, ROUTE_KEY_LABEL);
+            let b = derive_key(master, ROUTE_KEY_LABEL);
             assert_eq!(a, b, "derivation must be deterministic");
             assert_ne!(
                 a,
                 derive_key(master, "conduit-relay/v1/some-other-purpose"),
                 "different labels must give different keys"
-            );
-        }
-
-        #[test]
-        fn derive_key_never_returns_the_master_secret() {
-            let master = b"master-secret";
-            let derived = derive_signing_key(master);
-            assert_ne!(&derived[..], &master[..]);
-            assert_ne!(
-                hex::encode(derived),
-                hex::encode(master),
-                "the derived signing key must not be the master secret"
-            );
-        }
-
-        #[test]
-        fn derive_signing_key_matches_explicit_label() {
-            let master = b"master-secret";
-            assert_eq!(
-                derive_signing_key(master),
-                derive_key(master, SIGNING_KEY_LABEL)
             );
         }
 
@@ -1002,100 +988,186 @@ pub mod hmac {
         }
 
         #[test]
-        fn derived_signing_key_does_not_verify_mac_made_with_master_secret() {
-            // The core of VULNERABILITY 1: a token is a *credential*, not a
-            // signing key. Knowing the token must not let you forge a route.
-            let master = b"master-secret";
-            let signing = derive_signing_key(master);
-            let forged = sign_fields(master, &full_route_fields("mallory", "bob", "n-x"));
+        fn a_derived_route_key_does_not_verify_mac_made_with_the_pairing_secret() {
+            // The point of the derivation: holding the secret that a route key is
+            // derived from is not the same as holding the route key, so a peer
+            // that knows the secret cannot forge a MAC for a different purpose.
+            let secret = b"pairing-secret";
+            let route_key = derive_route_key(secret, "mallory");
+            let forged = sign_fields(secret, &full_route_fields("mallory", "bob", "n-x"));
             assert!(
-                !verify_message_hmac(&signing, &forged),
-                "master-secret MACs must not validate under the derived signing key"
+                !verify_message_hmac(&route_key, &forged),
+                "a MAC under the pairing secret must not validate as a route key"
             );
             assert!(verify_message_hmac(
-                &signing,
-                &sign_fields(&signing, &full_route_fields("mallory", "bob", "n-x"))
+                &route_key,
+                &sign_fields(&route_key, &full_route_fields("mallory", "bob", "n-x"))
             ));
         }
 
         // ---------------------------------------------------------------
-        //  SigningKeyring (key rotation)
+        //  RouteKeyring (per-device route keys)
         // ---------------------------------------------------------------
 
-        fn ring_signed(keyring: &SigningKeyring, key_id: &str, nonce: &str) -> Value {
-            let fields: Vec<(&str, serde_json::Value)> = full_route_fields("alice", "bob", nonce)
+        /// Sign a route envelope as `signer`, with `secret` as its route key.
+        fn signed_as(signer: &str, secret: &[u8], to: &str, nonce: &str) -> Value {
+            let fields: Vec<(&str, serde_json::Value)> = full_route_fields(signer, to, nonce)
                 .into_iter()
                 .map(|(k, v)| {
                     if k == "key_id" {
-                        (k, serde_json::json!(key_id))
+                        (k, serde_json::json!(signer))
                     } else {
                         (k, v)
                     }
                 })
                 .collect();
-            let secret = keyring
-                .signing_key_for(key_id)
-                .expect("test keyring should know this key id");
             sign_fields(secret, &fields)
         }
 
-        #[test]
-        fn keyring_verifies_with_current_key_only() {
-            let ring = SigningKeyring::new("k2", b"secret-two");
-            let msg = ring_signed(&ring, "k2", "n1");
-            assert_eq!(ring.verify(&msg).as_deref(), Some("k2"));
+        fn ring_of(entries: &[(&str, &[u8])]) -> RouteKeyring {
+            let mut ring = RouteKeyring::new();
+            for (id, key) in entries {
+                ring.insert(*id, key.to_vec());
+            }
+            ring
         }
 
         #[test]
-        fn keyring_accepts_previous_key_during_rotation() {
-            let ring = SigningKeyring::new("k2", b"secret-two").with_previous("k1", b"secret-one");
-            assert_eq!(ring.ids(), vec!["k2", "k1"]);
-
-            // A message signed with the previous key still validates...
-            let old = ring_signed(&ring, "k1", "n-old");
-            assert_eq!(ring.verify(&old).as_deref(), Some("k1"));
-
-            // ...and so does one signed with the current key.
-            let new = ring_signed(&ring, "k2", "n-new");
-            assert_eq!(ring.verify(&new).as_deref(), Some("k2"));
+        fn route_keyring_verifies_a_devices_own_route() {
+            let ring = ring_of(&[("alice", b"alice-route-key")]);
+            let msg = signed_as("alice", b"alice-route-key", "bob", "n1");
+            assert_eq!(ring.verify(&msg).as_deref(), Some("alice"));
+            assert_eq!(ring.device_ids(), vec!["alice"]);
         }
 
         #[test]
-        fn keyring_rejects_previous_key_after_rotation_ends() {
-            let ring = SigningKeyring::new("k2", b"secret-two")
-                .with_previous("k1", b"secret-one")
-                .end_rotation();
-            let old = ring_signed(&SigningKeyring::new("k1", b"secret-one"), "k1", "n-old");
+        fn route_keyring_rejects_a_key_that_belongs_to_another_device() {
+            // Bob signs a route and attributes it to Alice. Alice's key is the
+            // one the ring holds for that id, so the MAC cannot match.
+            let ring = ring_of(&[("alice", b"alice-route-key")]);
+            let forged = signed_as("alice", b"bob-route-key", "carol", "n1");
             assert!(
-                ring.verify(&old).is_none(),
-                "the retired key must stop being accepted"
+                ring.verify(&forged).is_none(),
+                "a device must not be able to sign as another device"
             );
-            assert_eq!(ring.ids(), vec!["k2"]);
         }
 
         #[test]
-        fn keyring_rejects_unknown_key_id() {
-            let ring = SigningKeyring::new("k2", b"secret-two");
-            let forged = ring_signed(&SigningKeyring::new("evil", b"secret-two"), "evil", "n-e");
-            assert!(ring.verify(&forged).is_none());
+        fn route_keyring_rejects_an_unregistered_device() {
+            let ring = ring_of(&[("alice", b"alice-route-key")]);
+            let stranger = signed_as("mallory", b"mallory-route-key", "bob", "n1");
+            assert!(ring.verify(&stranger).is_none());
         }
 
         #[test]
-        fn keyring_rejects_message_without_key_id() {
-            let ring = SigningKeyring::new("k2", b"secret-two");
-            let mut msg = ring_signed(&ring, "k2", "n1");
+        fn route_keyring_rejects_a_missing_key_id() {
+            // key_id is what the key is looked up by. Without it there is no key
+            // to check against, and defaulting it would attribute the route to
+            // whichever device happened to be registered.
+            let ring = ring_of(&[("alice", b"alice-route-key")]);
+            let mut msg = signed_as("alice", b"alice-route-key", "bob", "n1");
             msg.as_object_mut().unwrap().remove("key_id");
+            assert!(ring.verify(&msg).is_none());
+        }
+
+        #[test]
+        fn route_keyring_rejects_a_key_id_that_disagrees_with_the_sender() {
+            let ring = ring_of(&[("alice", b"alice-route-key"), ("bob", b"bob-route-key")]);
+            let mut msg = signed_as("alice", b"alice-route-key", "carol", "n1");
+            // Re-label the route to Bob. `from_device_id` is signed, so this
+            // cannot verify as Bob.
+            msg["from_device_id"] = serde_json::json!("bob");
             assert!(
                 ring.verify(&msg).is_none(),
-                "key_id is mandatory so rotation state is explicit on the wire"
+                "a valid signature must not be re-attributed to another device"
             );
         }
 
         #[test]
-        fn keyring_rejects_wrong_secret_for_known_key_id() {
-            let ring = SigningKeyring::new("k2", b"secret-two");
-            let forged = ring_signed(&SigningKeyring::new("k2", b"attacker-key"), "k2", "n1");
-            assert!(ring.verify(&forged).is_none());
+        fn route_keyring_forgets_an_unpaired_device() {
+            let mut ring = ring_of(&[("alice", b"alice-route-key"), ("bob", b"bob-route-key")]);
+            ring.remove("bob");
+            let revoked = signed_as("bob", b"bob-route-key", "alice", "n1");
+            assert!(
+                ring.verify(&revoked).is_none(),
+                "an unpaired device must stop being able to sign"
+            );
+            assert_eq!(ring.device_ids(), vec!["alice"]);
+        }
+
+        #[test]
+        fn route_keyring_re_registering_replaces_the_key() {
+            // A re-pair changes the device's secret, and the old key must not
+            // keep working afterwards.
+            let mut ring = ring_of(&[("alice", b"old-route-key")]);
+            ring.insert("alice", b"new-route-key".to_vec());
+            let stale = signed_as("alice", b"old-route-key", "bob", "n1");
+            assert!(ring.verify(&stale).is_none());
+            let fresh = signed_as("alice", b"new-route-key", "bob", "n2");
+            assert_eq!(ring.verify(&fresh).as_deref(), Some("alice"));
+        }
+
+        #[test]
+        fn route_keyring_retain_drops_unlisted_devices() {
+            let mut ring = ring_of(&[("alice", b"alice-route-key"), ("bob", b"bob-route-key")]);
+            ring.retain(|id| id == "alice");
+            assert_eq!(ring.len(), 1);
+            assert!(!ring.is_empty());
+            assert!(ring
+                .verify(&signed_as("bob", b"bob-route-key", "alice", "n1"))
+                .is_none());
+        }
+
+        #[test]
+        fn an_empty_route_keyring_verifies_nothing() {
+            let ring = RouteKeyring::new();
+            assert!(ring.is_empty());
+            assert!(ring
+                .verify(&signed_as("alice", b"a", "bob", "n1"))
+                .is_none());
+        }
+
+        // ---------------------------------------------------------------
+        //  derive_route_key
+        // ---------------------------------------------------------------
+
+        #[test]
+        fn derive_route_key_is_deterministic_per_device() {
+            let secret = b"pairing-secret";
+            assert_eq!(
+                derive_route_key(secret, "alice"),
+                derive_route_key(secret, "alice"),
+                "both ends must derive the same key"
+            );
+        }
+
+        #[test]
+        fn derive_route_key_separates_by_device_id() {
+            let secret = b"pairing-secret";
+            assert_ne!(
+                derive_route_key(secret, "alice"),
+                derive_route_key(secret, "bob"),
+                "the device id is part of the derivation, so one secret under two \
+                 ids must not yield one key"
+            );
+        }
+
+        #[test]
+        fn derive_route_key_never_returns_the_pairing_secret() {
+            let secret = b"a-32-byte-pairing-secret-value!!";
+            let derived = derive_route_key(secret, "alice");
+            assert_ne!(&derived[..], &secret[..]);
+            assert_ne!(hex::encode(derived), hex::encode(secret));
+        }
+
+        #[test]
+        fn derive_route_key_differs_from_other_purposes() {
+            let secret = b"a-32-byte-pairing-secret-value!!";
+            assert_ne!(
+                derive_route_key(secret, "alice"),
+                derive_key(secret, ROUTE_KEY_LABEL),
+                "the device id must be bound into the label"
+            );
         }
 
         // ---------------------------------------------------------------

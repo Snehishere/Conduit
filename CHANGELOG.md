@@ -28,8 +28,10 @@ First public release of the source tree.
 - mDNS advertisement from the desktop and mDNS browsing from the phone, so a
   phone on the same network can find the desktop without typing an address.
 - Two local listeners on the desktop: `ws://` on port 9527 for the local hub
-  and diagnostics, and `wss://` on port 9531, which is the only port a LAN peer
-  is expected to dial.
+  and diagnostics, and `wss://` on port 9531, which is the port a LAN peer is
+  expected to dial. Port 9531 has a second, internal role: it is also the
+  relay's own loopback-only plaintext listener, which the desktop uses to join
+  the relay it hosts itself (see *Relay* below).
 - Protocol-version enforcement at the desktop hub. A peer announcing a version
   above `PROTOCOL_VERSION` is answered with `unsupported_protocol_version`.
 
@@ -85,27 +87,52 @@ First public release of the source tree.
   existing database, and there is a test that pins this behaviour.
 - Mobile secure storage via the platform keystore.
 - The desktop reports that this encryption is **not** end-to-end. The envelope
-  is hop encryption terminated by the desktop process, so a LAN peer and any
-  relay can read the traffic. See [ADR-0007](docs/decisions/0007-refuse-to-ship-end-to-end-encryption-claims.md)
+  is hop encryption terminated by the desktop process. A relay routes it without
+  ever decrypting it — it forwards opaque envelopes — but the relay runs inside
+  the desktop process, so it terminates nowhere and isolates nothing. See
+  [ADR-0007](docs/decisions/0007-refuse-to-ship-end-to-end-encryption-claims.md)
   and [`SECURITY.md`](SECURITY.md).
 
-#### Optional relay
+#### Relay
 
-- A self-hostable relay, crate `relay`, shipped with a `Dockerfile` and a
-  compose file. It is optional; Conduit works on a LAN without it.
-- Relay authentication handshake, `relay_route` HMAC verification with a
-  domain-separated key and a key-rotation window, and a replay-protection nonce
-  cache.
-- Binary frame v2 with a versioned prefix. The relay rejects the superseded
-  v1 prefix rather than guessing.
-- Health, metrics, and certificate-pin HTTP endpoints, all behind bearer
-  tokens.
+- The relay, crate `conduit-relay`, is a **library**, not a service. It has no
+  `[[bin]]` and no `src/main.rs`, and the desktop app hosts it in-process as a
+  background task (`apps/desktop/src-tauri/src/relay.rs`, `RelayHost`). There is
+  nothing to deploy, install or configure, and no container image: the
+  `Dockerfile`, the compose file and the container build script that used to ship
+  it are gone. `relay_enabled` defaults to true, and a relay restart is a desktop
+  restart.
+- Because it is a library hosted by the desktop, the relay operator *is* the
+  desktop user. There is no third party to trust and no service to harden, and
+  equally no process boundary between the relay and the hub it runs inside.
+- Relay authentication handshake, `relay_route` HMAC verification under a
+  **per-device** key, and a replay-protection nonce cache.
+  `relay_route` is HMAC-SHA256 over
+  `"conduit-protocol/v1/derive:conduit-relay/v1/route-key:" + device_id`, keyed by
+  the pairing secret, with `key_id` required to equal `from_device_id`. There is
+  no shared signing key: the former `RELAY_SIGNING_KEY`, `RELAY_SIGNING_KEY_ID`,
+  `RELAY_SIGNING_KEY_PREVIOUS` and `RELAY_SIGNING_KEY_PREVIOUS_ID` settings are
+  gone, and with them the current/previous key ring and the rotation window they
+  implied. A re-pair rotates a device's key automatically, and the relay resolves
+  keys by asking its host through a `RouteKeys` trait, so a removed device loses
+  its key within five seconds.
+- Binary frame v2 with a versioned prefix. The relay rejects the superseded v1
+  prefix rather than guessing.
+- Health, metrics and certificate-pin HTTP endpoints on port 9530, bound to
+  loopback only. `/health` and `/` are behind a bearer token. `/metrics` is
+  behind `RELAY_METRICS_TOKEN` **when one is configured** and open when it is
+  not. `/healthz` and `/pin` are **not** behind bearer tokens.
 - Self-signed certificate generation with SAN handling, key-format detection,
   key and certificate mismatch refusal, and permission tightening on the key
   file.
-- Fail-closed startup: the relay refuses to start without its master HMAC
-  secret rather than generating a temporary one, and reads its configuration
-  from process environment variables only.
+- Startup bootstraps rather than fails closed: with no master HMAC secret
+  configured, the relay generates one and persists it. Failing to start would
+  have meant a key that changed on every launch.
+- Configuration precedence is desktop **Settings** (passed in as
+  `conduit_relay::Overrides`) → environment variables → library defaults. The
+  environment is a fallback for headless and test use, not how the app is
+  configured. `health_bind` and `ws_bind` are pinned to loopback by the desktop
+  and are deliberately not environment-overridable.
 
 #### Shared protocol and tooling
 
@@ -122,16 +149,17 @@ First public release of the source tree.
 
 #### Tests and CI
 
-- 189 tests in `relay`, 266 in `conduit-protocol`, and a 696-test suite in the
-  desktop backend, covering per-message-type handlers, the pairing and
-  authentication boundary, automation rule evaluation, encryption key
-  resolution, storage migrations, file transfer chunking, rate limiters, and
-  discovery.
+- 187 tests in `conduit-relay` plus 2 doctests, 275 in `conduit-protocol`, and
+  a 724-test suite in the desktop backend, covering per-message-type handlers,
+  the pairing and authentication boundary, automation rule evaluation,
+  encryption key resolution, storage migrations, file transfer chunking, rate
+  limiters, and discovery.
 - The authentication boundary has exploit-shaped tests that walk the actual
   attack path rather than asserting on a helper.
-- 216 frontend unit tests across 20 files, plus a Playwright suite that
+- 222 frontend unit tests across 20 files, plus a Playwright suite that
   exercises the React shell in a plain browser.
-- 43 mobile unit tests for screens and widgets.
+- 87 mobile unit tests, including one for the phone's relay route-key derivation
+  and binary frame codec.
 - A CI workflow with six jobs: Rust, Node, codegen drift, brand asset drift,
   Flutter, and repository hygiene.
 
@@ -151,14 +179,19 @@ this tree.
   by hand on Windows, and on Linux there is no working path at all because
   `.cargo/config.toml` is unconditional. The other two crates build without it.
   This is the single largest onboarding obstacle.
-- **The cloud relay client on the desktop is compiled but not enabled.** The
-  `relay_url` setting is persisted but not dialled. Enabling it is a code
-  change, not a configuration change.
-- **The mobile client is not yet updated for the current relay wire format.**
-  The mobile client emits the superseded v1 frame prefix while the relay
-  accepts only v2, so a phone cannot complete a relayed connection. Relay
-  routing from the phone is therefore not functional even where the desktop
-  side could support it.
+- **The cloud relay client on the desktop is not a client.** The `relay_url`
+  setting is legacy: it is still persisted, and it is not dialled. What the
+  desktop does dial is its own relay, over the loopback-only plaintext listener
+  on 9531, because the relay runs in the same process and a relay can only
+  reach a device that is itself connected to it. Pointing `relay_url` at a
+  third-party relay is not a configuration change that works today; it needs a
+  code change.
+- **The mobile client and the relay agree on the wire format.** The superseded
+  v1 frame limitation from the previous pass is resolved: the phone now emits
+  v2 frames through `lib/services/relay_route.dart` and signs its routes with a
+  key derived from its own pairing secret. There is no separate integration
+  test proving a real phone completes a relayed connection end to end, though —
+  see [`docs/TESTING.md`](docs/TESTING.md) §7.
 - **Call signalling verbs differ between the two clients.** The phone emits
   `incoming` and `forward`; the desktop emits `answer` and `reject`. This is
   deliberate, because the two sides do not share a verb set, and the protocol
@@ -172,7 +205,7 @@ this tree.
   `prefer_single_quotes` and naming rules inside the generated
   `lib/models/protocol.dart`). The `--fatal-infos` flag promotes those to a
   non-zero exit, which is why that step is non-blocking in CI. `flutter test`
-  passes 43 of 43.
+  passes 87 of 87.
 - **`dart format` is not enforced.** The check runs in CI and in the lint
   script but is non-blocking in both, and most of the Dart tree is unformatted.
   Dart diffs carry unrelated churn until that is fixed.

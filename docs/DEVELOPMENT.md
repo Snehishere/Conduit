@@ -25,7 +25,7 @@ Flutter project; there *is* a root `Cargo.toml` that owns all three Rust crates.
 
 | What you are working on | Run commands from | Why |
 |---|---|---|
-| Any Rust crate (`conduit-protocol`, `conduit`, `relay`) | **repository root** | The root `Cargo.toml` is a virtual workspace whose members are the three crate directories. A crate directory has no `Cargo.toml` workspace of its own. |
+| Any Rust crate (`conduit-protocol`, `conduit`, `conduit-relay`) | **repository root** | The root `Cargo.toml` is a virtual workspace whose members are the three crate directories. A crate directory has no `Cargo.toml` workspace of its own. |
 | Desktop frontend / codegen | `apps/desktop` | Own `package.json`, `node_modules`, `vite.config.ts`, `vitest.config.ts`, `playwright.config.ts`. |
 | Mobile | `apps/mobile` | Own `pubspec.yaml`. |
 
@@ -35,17 +35,11 @@ Flutter project; there *is* a root `Cargo.toml` that owns all three Rust crates.
 |---|---|
 | `packages/protocol` | `conduit-protocol` |
 | `apps/desktop/src-tauri` | `conduit` |
-| `services/relay` | `relay` |
+| `services/relay` | `conduit-relay` |
 
 `scripts/lint-all.ps1` follows this convention: it resolves the repository root
 from `$PSScriptRoot` and runs every cargo step from there with an explicit
 `-p <crate>`.
-
-`scripts/build-relay.ps1` still `Set-Location`s to `services/relay` and runs a
-bare `cargo build`. That works, because Cargo walks up to the root
-`Cargo.toml`, but it is worth replacing with `-p relay` from the root for
-consistency. The `docker` branch of that script already uses the root as the
-build context.
 
 `build-desktop.ps1` and `build-mobile.ps1` build their paths from `$PSScriptRoot`
 and work from anywhere.
@@ -61,12 +55,11 @@ and work from anywhere.
 
 | Tool | Required version | Needed for | Verify with |
 |---|---|---|---|
-| Rust toolchain | 1.98+ | `conduit`, `relay` (edition 2024) | `cargo --version` |
+| Rust toolchain | 1.98+ | `conduit`, `conduit-relay` (edition 2024) | `cargo --version` |
 | Node.js | 24+ | desktop frontend, codegen | `node --version` |
 | npm | 11+ | desktop frontend, codegen | `npm --version` |
 | Flutter | 3.47+ | mobile app | `flutter --version` |
 | Dart | 3.13+ (`>=3.12.0 <4.0.0` per `pubspec.yaml`) | mobile app | `dart --version` |
-| Docker | any recent | relay container only | `docker --version` |
 | Vendored OpenSSL | 3.5.8 win64 | **desktop Rust only** | see [§3](#3-the-vendored-openssl-problem) |
 
 ### Rust editions differ between crates
@@ -74,7 +67,7 @@ and work from anywhere.
 | Crate | Edition | Consequence |
 |---|---|---|
 | `conduit` (desktop) | 2024 | needs Rust 1.85+ |
-| `relay` | 2024 | needs Rust 1.85+ |
+| `conduit-relay` | 2024 | needs Rust 1.85+ |
 | `conduit-protocol` | 2021 | builds on older toolchains, but shares the root lockfile so the toolchain is effectively workspace-wide |
 
 ### Node / npm
@@ -94,12 +87,6 @@ $env:PATH = "C:\flutter\bin;" + $env:PATH
 
 Without it you get `flutter : The term 'flutter' is not recognized ...`. The
 `C:\flutter` path is machine-specific — substitute your own SDK location.
-
-### Docker
-
-Required only to run the relay as a container. `docker` is not on `PATH` in
-this environment either, so `docker compose up` and
-`scripts/build-relay.ps1 -Docker` cannot be exercised locally as configured.
 
 ---
 
@@ -190,8 +177,8 @@ A `scripts/fetch-openssl.ps1` that:
 Plus a Linux equivalent or a platform-conditional cargo config. Tracked in
 `docs/REMAINING_WORK.md`.
 
-`conduit-protocol` and `relay` do **not** have this problem — neither depends on
-`rusqlite` or SQLCipher. Both build with no vendored dependencies.
+`conduit-protocol` and `conduit-relay` do **not** have this problem — neither
+depends on `rusqlite` or SQLCipher. Both build with no vendored dependencies.
 
 ---
 
@@ -202,7 +189,7 @@ Plus a Linux equivalent or a platform-conditional cargo config. Tracked in
 ```bash
 # repository root
 cargo build -p conduit-protocol
-cargo test  -p conduit-protocol      # 266 tests
+cargo test  -p conduit-protocol      # 275 tests
 cargo doc   -p conduit-protocol --no-deps
 ```
 
@@ -210,35 +197,34 @@ Library only. No binary, no server, no I/O. If `cargo doc` emits warnings about
 missing intra-doc links to `PROTOCOL_VERSION` / `LAN_WS_PORT`, those are
 `[bracket]` references into `types.rs` and are not errors.
 
-### `relay`
+### `conduit-relay` (library)
 
 ```bash
 # repository root
-cargo build -p relay
-cargo test  -p relay                 # 189 tests
-cargo run   -p relay                 # needs RELAY_TOKEN + HMAC_SECRET in the environment
+cargo build  -p conduit-relay
+cargo test   -p conduit-relay         # 187 tests
+cargo clippy -p conduit-relay --all-targets -- -D warnings
 ```
 
-Configuration comes from **process environment variables only**
-(`RELAY_WS_PORT`, `RELAY_WSS_PORT`, `RELAY_HEALTH_PORT`,
-`RELAY_ENABLE_PLAIN_WS`, `RELAY_TOKEN`, `HMAC_SECRET` / `HMAC_SECRET_FILE`,
-…). A bare `cargo run -p relay` does **not** read `.env` — only
-`docker compose` does. For local runs either export the variables or use
-compose. `.env.example` is the authoritative annotated list.
+**Library only.** There is no `[[bin]]` and no `src/main.rs`, so there is no
+`cargo run -p conduit-relay`, no release binary to ship and no container to
+build. The desktop app hosts it as a background task in
+`apps/desktop/src-tauri/src/relay.rs`, which is the only way to run it.
 
-`cargo build -p relay --release` for a release binary. The container path:
-
-```powershell
-# repository root — the build context must be the repo root
-docker build -t conduit-relay -f services\relay\Dockerfile .
-```
+Configuration comes from the desktop's **Settings** — `relay_enabled`,
+`relay_port`, `relay_health_port`, `relay_hostname` — passed to
+`Config::resolve` as `conduit_relay::Overrides`. The precedence is
+`Overrides` → environment variables → library defaults. The environment is a
+fallback for headless and test use only; it is not how the app is configured.
+`health_bind` and `ws_bind` are pinned to loopback in `build_config` and are
+deliberately **not** inheritable from the environment.
 
 ### `conduit` (desktop Rust) — requires the vendored OpenSSL
 
 ```bash
 # repository root
 cargo build -p conduit
-cargo test  -p conduit               # 696 tests: all passing
+cargo test  -p conduit               # 724 tests: all passing
 cargo clippy -p conduit -- -D warnings
 ```
 
@@ -304,7 +290,7 @@ table, and exits non-zero if any blocking step failed.
 |---|---|---|---|
 | 1 | Format check | repository root | `cargo fmt --all -- --check` |
 | 2 | Clippy | repository root | `cargo clippy -p conduit-protocol --all-targets -- -D warnings` |
-| 3 | Clippy | repository root | `cargo clippy -p relay --all-targets -- -D warnings` |
+| 3 | Clippy | repository root | `cargo clippy -p conduit-relay --all-targets -- -D warnings` |
 | 4 | Clippy | repository root | `cargo clippy -p conduit --all-targets -- -D warnings` |
 | 5–7 | Rust tests | repository root | `cargo test -p <crate> --locked` |
 | 8 | Release build | repository root | `cargo build --workspace --release --locked` (skipped by `-Fast`) |
@@ -328,8 +314,9 @@ dart analyze --fatal-infos
 ```
 
 CI (`.github/workflows/ci.yml`) is the merge gate. It runs the same Rust,
-Node, codegen and hygiene gates, plus `flutter analyze`, `docker compose
-config` and a relay image build.
+Node, codegen and hygiene gates, plus `flutter analyze`. There is no image build
+and no compose validation: the relay is a library, so the `rust` job compiles
+and tests it like any other crate.
 
 ---
 
@@ -394,7 +381,7 @@ will tell you. This is the single highest-value CI check in the project.
 
 ### Rust
 
-- `conduit` and `relay`: edition 2024. `conduit-protocol`: edition 2021.
+- `conduit` and `conduit-relay`: edition 2024. `conduit-protocol`: edition 2021.
 - `cargo fmt` (rustfmt defaults — no `rustfmt.toml` in the tree).
 - `cargo clippy -- -D warnings` per crate, from the root with `-p`.
 - Test modules are `mod tests { ... }` at the bottom of the file, `#[cfg(test)]`
@@ -544,8 +531,8 @@ binary frame layout.
    ```bash
    # repository root
    cargo test -p conduit-protocol
-   cargo test -p relay
-   cargo test -p conduit          # 696 tests, all passing
+   cargo test -p conduit-relay
+   cargo test -p conduit          # 724 tests, all passing
    cd apps/desktop && npx tsc --noEmit && npm test
    cd apps/mobile && flutter test && dart analyze --fatal-infos
    ```
@@ -564,8 +551,12 @@ Port numbers live in `packages/protocol/src/types.rs`
   `apps/mobile/lib/services/websocket_service.dart` (asserted by test — the
   tests also assert that **no call site** hard-codes either number, and that no
   call site builds a `wss://` URL against the plaintext port),
-- update `WS_BIND_ADDR` in `apps/desktop/src-tauri/src/main.rs` and
-  `.env.example` / `docker-compose.yml` for relay ports,
+- update `WS_BIND_ADDR` in `apps/desktop/src-tauri/src/main.rs`,
+- update `relay_port`, `relay_health_port` and `DEFAULT_RELAY_LOCAL_PORT` in
+  `apps/desktop/src-tauri/src/relay.rs` for the relay ports. Note that 9531 is
+  deliberately shared: it is both the desktop's LAN TLS listener and the relay's
+  loopback-only plaintext listener (`DEFAULT_RELAY_LOCAL_PORT`) that the
+  desktop joins its own relay over,
 - run `cargo test -p conduit-protocol`.
 
 ---
@@ -612,7 +603,8 @@ Two invariants worth defending in CI:
   declares `libasound2` (deb) / `alsa-lib` (rpm) as bundle dependencies.
 - **The vendored-OpenSSL config blocks the Linux desktop build.** See
   [§3](#3-the-vendored-openssl-problem). There is no installable path today.
-- `relay` and `conduit-protocol` build on Linux with no extra system packages.
+- `conduit-relay` and `conduit-protocol` build on Linux with no extra system
+  packages.
 
 ### macOS
 

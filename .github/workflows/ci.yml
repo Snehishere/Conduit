@@ -23,7 +23,6 @@ name: ci
 #   flutter   - `dart format --set-exit-if-changed` fails: 63 of 74 Dart files
 #               are unformatted. `flutter analyze --fatal-infos` is
 #               non-blocking for a different reason. Both already were.
-#   docker    - fixed in this file; see the RELAY_TOKEN comment in that job.
 #   codegen   - fixed in this file. The drift gate itself is expected to pass:
 #               `npm run generate` exits 0, is byte-for-byte idempotent, and
 #               both generated clients are a fresh render of schema.json.
@@ -32,9 +31,9 @@ name: ci
 #
 # Verified green before the first run, on the crates that build portably:
 #   cargo fmt --all -- --check                                  exit 0
-#   cargo clippy -p conduit-protocol -p relay --all-targets    exit 0
-#   cargo test  -p conduit-protocol -p relay                    266 + 189 passed
-#   cargo build -p conduit-protocol -p relay --release          exit 0
+#   cargo clippy -p conduit-protocol -p conduit-relay --all-targets    exit 0
+#   cargo test  -p conduit-protocol -p conduit-relay                    266 + 183 passed
+#   cargo build -p conduit-protocol -p conduit-relay --release          exit 0
 #
 # Policy applied throughout, so the above list is not a matter of taste:
 #   - A step that fails for a reason fixable inside this file (a wrong path, a
@@ -139,23 +138,23 @@ jobs:
 
       # ---- portable crates: BLOCKING -------------------------------------
 
-      - name: cargo clippy -p conduit-protocol -p relay
+      - name: cargo clippy -p conduit-protocol -p conduit-relay
         # Neither crate's tree depends on a system library that CI would have
         # to install: no OpenSSL, no webview, no X11, no audio, no SQLite.
         # ring (via rustls) compiles its own vendored C and asm with `cc`,
         # which every runner has. Nothing in either tree is gated on a
         # package that is not already present, so a pass here is a pass on
         # Linux, not just on this Windows checkout. Verified exit 0.
-        run: cargo clippy -p conduit-protocol -p relay --all-targets --locked -- -D warnings
+        run: cargo clippy -p conduit-protocol -p conduit-relay --all-targets --locked -- -D warnings
 
-      - name: cargo test -p conduit-protocol -p relay
-        # 266 protocol + 189 relay. Verified 0 failures.
-        run: cargo test -p conduit-protocol -p relay --locked
+      - name: cargo test -p conduit-protocol -p conduit-relay
+        # 266 protocol + 183 relay. Verified 0 failures.
+        run: cargo test -p conduit-protocol -p conduit-relay --locked
 
-      - name: cargo build --release -p conduit-protocol -p relay
+      - name: cargo build --release -p conduit-protocol -p conduit-relay
         # Verified exit 0. This is the release artefact that matters for
         # self-hosted relay operators.
-        run: cargo build -p conduit-protocol -p relay --release --locked
+        run: cargo build -p conduit-protocol -p conduit-relay --release --locked
 
       # ---- desktop crate: NON-BLOCKING, see below -----------------------
 
@@ -587,51 +586,10 @@ jobs:
         run: flutter test
 
   # ------------------------------------------------------------------
-  # Docker / compose validity, and the relay image build.
+  # The relay used to be a Docker image built and validated here. It is
+  # now a library (`conduit-relay`) compiled and tested by the `rust` job
+  # above, so there is no image to build and no compose file to validate.
   # ------------------------------------------------------------------
-  docker:
-    name: docker
-    runs-on: ubuntu-latest
-    # No `defaults.run.working-directory` on purpose: both steps below
-    # need the repository root, and the build context must be the root.
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate compose file
-        # FIXED. docker-compose.yml line 34 reads
-        #   RELAY_TOKEN=${RELAY_TOKEN:?RELAY_TOKEN is required}
-        # which is a deliberate fail-closed guard. `docker compose config`
-        # interpolates before it validates, so with no RELAY_TOKEN in the
-        # environment - and there is no .env in the repository, it is
-        # gitignored by design - the step aborted with exactly the error
-        # the guard exists to produce. The guard is correct; the CI step was
-        # calling it without its input.
-        #
-        # A placeholder is the right input here. `config` renders and
-        # validates the file; it does not start a container, does not read
-        # the token, and does not write it anywhere. No secret is involved.
-        # Leaving this blocking, because compose validity is cheap to check
-        # and the failure mode it catches (a typo'd volume, a missing
-        # build context) is exactly the kind that only shows up in
-        # production.
-        env:
-          RELAY_TOKEN: ci-placeholder-not-a-real-token
-        run: docker compose config -q
-
-      # Build context MUST be the repo root - the Dockerfile copies
-      # packages/protocol and Cargo.lock in, and needs
-      # apps/desktop/src-tauri/Cargo.toml present so the virtual workspace
-      # resolves even though the desktop app is never compiled here.
-      # Passing apps/ or services/relay as the context is the most common
-      # way to break this, so the `.` is explicit here rather than relying
-      # on the default.
-      #
-      # Never executed before. The two things that could go wrong are the
-      # `rust:1.98-alpine` and `alpine:3.20` tags not existing under those
-      # names, and `cargo build --locked` rejecting a lockfile that has
-      # drifted. Both surface as a normal build failure on the first run.
-      - name: Build relay image
-        run: docker build -f services/relay/Dockerfile -t conduit-relay:test .
 
   # ------------------------------------------------------------------
   # Guard rails on repository hygiene. Four cheap invariants that a

@@ -88,6 +88,8 @@ impl WsServer {
         storage: Arc<Storage>,
         automation_engine: Arc<RwLock<automation::AutomationEngine>>,
         audio_stream: Arc<AudioStream>,
+        device_id: Arc<String>,
+        route_keys: Arc<crate::relay::DeviceRouteKeys>,
     ) -> Self {
         let addr: SocketAddr = match addr.parse() {
             Ok(a) => a,
@@ -125,6 +127,8 @@ impl WsServer {
                     storage,
                     automation_engine,
                     audio_stream,
+                    device_id: device_id.clone(),
+                    route_keys: route_keys.clone(),
                     relay_tx: Arc::new(RwLock::new(None)),
                 };
                 return WsServer {
@@ -148,6 +152,8 @@ impl WsServer {
             storage,
             automation_engine,
             audio_stream,
+            device_id: device_id.clone(),
+            route_keys: route_keys.clone(),
             relay_tx: Arc::new(RwLock::new(None)),
         };
 
@@ -556,6 +562,58 @@ impl WsServer {
         }
     }
 
+    /// Resolve the shared secret to open an `encrypted` envelope with, or `None`
+    /// if this socket is not a paired peer.
+    ///
+    /// Order of trust, highest first:
+    ///
+    /// 1. **The connection's own identity** (`ws_to_device_id`). The hub wrote this
+    ///    at pairing time, from a one-time token, so it cannot be spoofed.
+    /// 2. **The peer's claimed `source_device`.** Consulted *only* when the socket
+    ///    has no entry of its own — which is an already-paired peer reconnecting
+    ///    over a fresh socket, before it re-pairs.
+    ///
+    /// The claim is deliberately never allowed to override the connection
+    /// identity. A mapped socket that names a different device is reaching for
+    /// someone else's shared secret; it would fail the HMAC anyway, and letting the
+    /// claim win would mean one socket has as many identities as it cares to
+    /// claim. One socket, one identity.
+    ///
+    /// Step 2 is what rescues a peer that has not been told its own id. The peer
+    /// cannot derive one — the desktop picks it — and it is the only value stamped
+    /// into `source_device`. When a desktop predates assigned ids, or the field is
+    /// simply wrong, this is the only path that still works; without it the frame
+    /// is dropped here and the peer sees nothing but a silent failure.
+    async fn resolve_sender_secret(
+        ctx: &WsContext,
+        client_id: &str,
+        claimed_id: Option<&str>,
+    ) -> Option<String> {
+        let connection_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
+
+        let engine = ctx.sync_engine.read().await;
+        let by_connection = connection_id
+            .as_deref()
+            .and_then(|id| engine.get_client(id))
+            .map(|c| c.shared_secret.clone());
+
+        // The claim is consulted only when the socket's own identity did not
+        // resolve. A *live* connection identity always wins, so one socket has
+        // exactly one identity and cannot borrow another device's secret by
+        // naming it. A *dangling* one — the hub still has a mapping but the
+        // device row is gone, e.g. the database was reset — falls through to
+        // the claim, because refusing there would strand a peer that has since
+        // legitimately re-paired.
+        //
+        // Note this is a secret *lookup*, not an authentication decision: the
+        // caller still has to produce a valid HMAC over the ciphertext with
+        // whatever secret comes back. Resolving to a device you are not does
+        // not let you read its traffic.
+        by_connection.or_else(|| {
+            claimed_id.and_then(|id| engine.get_client(id).map(|c| c.shared_secret.clone()))
+        })
+    }
+
     async fn handle_message(text: &str, client_id: &str, ctx: &WsContext) {
         let msg: Value = match serde_json::from_str(text) {
             Ok(v) => v,
@@ -597,25 +655,17 @@ impl WsServer {
         }
 
         let processed_msg = if raw_type == "encrypted" {
-            let mut stable_id = msg
-                .get("source_device")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if stable_id.is_none() {
-                stable_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
-            }
-            let stable_id = stable_id.unwrap_or_default();
+            let claimed_id = msg.get("source_device").and_then(|v| v.as_str());
 
-            let shared_secret =
-                if let Some(client) = ctx.sync_engine.read().await.get_client(&stable_id) {
-                    client.shared_secret.clone()
-                } else {
-                    warn!(
-                        "Received encrypted message but no shared secret found for {}",
-                        client_id
-                    );
-                    return;
-                };
+            let Some(shared_secret) = Self::resolve_sender_secret(ctx, client_id, claimed_id).await
+            else {
+                warn!(
+                    "Received encrypted message but no shared secret found for {} (claimed {})",
+                    client_id,
+                    claimed_id.unwrap_or("<none>")
+                );
+                return;
+            };
 
             let nonce_hex = msg.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
             let hmac_hex = msg.get("hmac").and_then(|v| v.as_str()).unwrap_or("");
@@ -980,43 +1030,34 @@ impl WsServer {
         // 3. Not connected directly — try the relay.
         let relay_lock = self.ctx.relay_tx.read().await;
         if let Some(relay_tx) = &*relay_lock {
-            let mut relay_val = serde_json::json!({
-                "type": "relay_route",
-                "to_device_id": device_id,
-                "payload": serde_json::from_str::<serde_json::Value>(&message).unwrap_or(serde_json::Value::Null),
-                "timestamp": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
-                "nonce": uuid::Uuid::new_v4().to_string(),
-            });
+            // Signing uses this desktop's *own* route key, never the relay
+            // token. The token authenticates the connection; the key proves
+            // which device is speaking. Conflating the two let anyone who had
+            // seen the token route as anyone, and left `from_device_id`
+            // unsigned, so the relay could not tell a spoof from the truth.
+            let from_device_id = self.ctx.device_id.as_str().to_string();
+            let Some(route_key) = self.ctx.route_keys.signing_key(&from_device_id) else {
+                error!(
+                    "Cannot route through the relay: no route key is registered for this \
+                     desktop ({from_device_id}). The device registry has not been read yet."
+                );
+                return false;
+            };
 
-            let mut message_for_hmac = serde_json::Map::new();
-            if let Some(t) = relay_val.get("type") {
-                message_for_hmac.insert("type".to_string(), t.clone());
-            }
-            if let Some(to) = relay_val.get("to_device_id") {
-                message_for_hmac.insert("to_device_id".to_string(), to.clone());
-            }
-            if let Some(payload) = relay_val.get("payload") {
-                message_for_hmac.insert("payload".to_string(), payload.clone());
-            }
-            if let Some(ts) = relay_val.get("timestamp") {
-                message_for_hmac.insert("timestamp".to_string(), ts.clone());
-            }
-            if let Some(n) = relay_val.get("nonce") {
-                message_for_hmac.insert("nonce".to_string(), n.clone());
-            }
-
-            let message_str = serde_json::to_string(&serde_json::Value::Object(message_for_hmac))
-                .unwrap_or_default();
-            let relay_token = std::env::var("RELAY_TOKEN").unwrap_or_default();
-            let hmac_hex =
-                conduit_protocol::hmac::compute_hmac(relay_token.as_bytes(), &message_str);
-
-            relay_val
-                .as_object_mut()
-                .unwrap()
-                .insert("hmac".to_string(), serde_json::Value::String(hmac_hex));
-
-            let relay_msg_str = serde_json::to_string(&relay_val).unwrap_or_default();
+            let route = RelayRoute::signed_with(
+                &from_device_id,
+                &route_key,
+                from_device_id.clone(),
+                device_id,
+                serde_json::from_str::<serde_json::Value>(&message)
+                    .unwrap_or(serde_json::Value::Null),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                uuid::Uuid::new_v4().to_string(),
+            );
+            let relay_msg_str = serde_json::to_string(&route).unwrap_or_default();
             if let Err(e) = relay_tx.send(relay_msg_str).await {
                 warn!("Failed to route message through relay: {}", e);
                 return false;
@@ -1026,7 +1067,12 @@ impl WsServer {
         false
     }
 
-    pub fn spawn_relay_client(&self, relay_url: String, server_id: String) {
+    /// Dial a relay and keep the connection up.
+    ///
+    /// `relay_token` is passed in rather than read from the environment: the
+    /// host keeps the token in the OS keyring, so a client that reached for
+    /// `RELAY_TOKEN` here would silently authenticate with an empty string.
+    pub fn spawn_relay_client(&self, relay_url: String, server_id: String, relay_token: String) {
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
             let mut first_failure = true;
@@ -1045,8 +1091,7 @@ impl WsServer {
                         info!("Connected to Relay Server!");
                         let (mut write, mut read) = ws_stream.split();
 
-                        let relay_token = std::env::var("RELAY_TOKEN").unwrap_or_default();
-                        let auth_msg = RelayAuth::new(server_id.as_str(), relay_token);
+                        let auth_msg = RelayAuth::new(server_id.as_str(), relay_token.clone());
                         let auth_msg =
                             serde_json::to_string(&auth_msg).expect("RelayAuth serializes");
                         if let Err(e) = write.send(Message::Text(auth_msg.into())).await {
@@ -2442,6 +2487,149 @@ mod tests {
         assert!(
             !server.send_to("no_such_device", "x".to_string()).await,
             "an undeliverable message must be reported, not silently dropped"
+        );
+    }
+
+    // ── resolve_sender_secret ────────────────────────────────────────────────
+
+    /// Two paired devices with distinct shared secrets, each behind its own
+    /// socket. Returns the two secrets so a test can assert *which* one was
+    /// resolved — asserting on the device id would not distinguish them, since
+    /// the id is the lookup key rather than the answer.
+    async fn ctx_with_two_paired() -> (WsContext, String, String) {
+        let ctx = create_test_ctx();
+        let secret_1 = "a1".repeat(32);
+        let secret_2 = "b2".repeat(32);
+        for ((device, ws), secret) in [("dev_1", "ws-1"), ("dev_2", "ws-2")]
+            .into_iter()
+            .zip([secret_1.clone(), secret_2.clone()])
+        {
+            ctx.sync_engine.write().await.add_client(ConnectedClient {
+                device_id: device.to_string(),
+                device_name: device.to_string(),
+                device_type: "phone".to_string(),
+                shared_secret: secret,
+                last_heartbeat: 0,
+                battery_level: None,
+            });
+            ctx.ws_to_device_id
+                .write()
+                .await
+                .insert(ws.to_string(), device.to_string());
+        }
+        (ctx, secret_1, secret_2)
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// A peer whose socket is mapped is decrypted with the secret filed under
+    /// its *own* identity, no matter what it claims. Before the change, a peer
+    /// that had not been told its assigned id stamped a placeholder
+    /// (`"mobile"`) into `source_device`, the lookup missed, and the envelope
+    /// was dropped with a server-side `warn!` the peer could not see — so the
+    /// phone's entire encrypted outbound stream was silently dead while the UI
+    /// read "Connected".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mapped_socket_decrypts_as_itself_even_when_it_claims_a_placeholder() {
+        let (ctx, secret_1, _) = ctx_with_two_paired().await;
+        assert_eq!(
+            WsServer::resolve_sender_secret(&ctx, "ws-1", Some("mobile")).await,
+            Some(secret_1),
+            "a placeholder claim must not cost the peer its own secret"
+        );
+    }
+
+    /// One socket, one identity. `ws-1` is paired as `dev_1` and must not be
+    /// able to borrow `dev_2`'s secret by naming it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_cannot_override_the_connection_identity() {
+        let (ctx, secret_1, _) = ctx_with_two_paired().await;
+        assert_eq!(
+            WsServer::resolve_sender_secret(&ctx, "ws-1", Some("dev_2")).await,
+            Some(secret_1),
+            "the connection identity wins; a claim must not borrow another device"
+        );
+    }
+
+    /// An unmapped socket may still be resolved by its claim, which is how a
+    /// paired peer that reconnected over a fresh socket keeps working before it
+    /// re-pairs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unmapped_socket_falls_back_to_the_claim() {
+        let (ctx, _, secret_2) = ctx_with_two_paired().await;
+        assert_eq!(
+            WsServer::resolve_sender_secret(&ctx, "ws-new", Some("dev_2")).await,
+            Some(secret_2),
+            "a socket with no entry of its own may present a claim"
+        );
+    }
+
+    /// A socket with no pairing entry at all resolves to nothing when it
+    /// offers nothing usable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unmapped_socket_with_no_usable_claim_resolves_to_nothing() {
+        let (ctx, _, _) = ctx_with_two_paired().await;
+        assert!(
+            WsServer::resolve_sender_secret(&ctx, "ws-stranger", None)
+                .await
+                .is_none()
+        );
+        assert!(
+            WsServer::resolve_sender_secret(&ctx, "ws-stranger", Some("nonsense"))
+                .await
+                .is_none()
+        );
+    }
+
+    /// An unmapped socket presenting a *real* device id does resolve — and that
+    /// is deliberate, not a hole.
+    ///
+    /// A paired phone that reconnects after a desktop restart lands on a fresh
+    /// socket with no `ws_to_device_id` entry. If that were refused, every peer
+    /// would have to re-pair from a QR code after every hub restart. Device ids
+    /// are not secret anyway: they ride along in `discovery/announce`.
+    ///
+    /// So this is a secret *lookup*, not an authentication decision. The caller
+    /// still has to produce a valid HMAC over the ciphertext with whatever
+    /// comes back, and an attacker who is not in possession of a device's
+    /// shared secret cannot forge one. Naming a device you are not buys you
+    /// nothing — which is exactly what the test above pins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnecting_peer_resolves_by_claim_without_re_pairing() {
+        let (ctx, secret_1, _) = ctx_with_two_paired().await;
+        assert_eq!(
+            WsServer::resolve_sender_secret(&ctx, "ws-fresh", Some("dev_1")).await,
+            Some(secret_1),
+            "a paired peer reconnecting on a new socket must not have to re-pair"
+        );
+    }
+
+    /// A mapped socket pointing at a device the hub has since forgotten (the
+    /// desktop's database was reset, say) must fall back to the claim rather
+    /// than resolving to nothing, so a re-paired peer recovers instead of
+    /// going permanently silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_connection_mapping_does_not_strand_the_peer() {
+        let ctx = create_test_ctx();
+        let secret = "33".repeat(32);
+        ctx.sync_engine.write().await.add_client(ConnectedClient {
+            device_id: "dev_new".to_string(),
+            device_name: "Peer".to_string(),
+            device_type: "phone".to_string(),
+            shared_secret: secret.clone(),
+            last_heartbeat: 0,
+            battery_level: None,
+        });
+        // Mapped to a device that no longer exists.
+        ctx.ws_to_device_id
+            .write()
+            .await
+            .insert("ws-1".to_string(), "dev_gone".to_string());
+
+        assert_eq!(
+            WsServer::resolve_sender_secret(&ctx, "ws-1", Some("dev_new")).await,
+            Some(secret),
+            "a dangling mapping must not make the peer permanently undecryptable"
         );
     }
 

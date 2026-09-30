@@ -1,7 +1,7 @@
 ﻿import React, { useState, useEffect, useCallback } from 'react';
 import {
   Settings as SettingsIcon, Check,
-  FolderOpen, Bell, Palette, Info, Wrench, Keyboard,
+  FolderOpen, Bell, Palette, Info, Wrench, Keyboard, Globe,
 } from 'lucide-react';
 import { useTheme } from '../../lib/theme';
 import type { Theme } from '../../lib/theme';
@@ -12,6 +12,7 @@ import GeneralSection from './GeneralSection';
 import AppearanceSection from './AppearanceSection';
 import NotificationsSection from './NotificationsSection';
 import FilesSection from './FilesSection';
+import RelaySection from './RelaySection';
 import AdvancedSection from './AdvancedSection';
 import AboutSection from './AboutSection';
 import { DEFAULT_SETTINGS } from './settingsTypes';
@@ -22,6 +23,7 @@ const CATEGORIES: { id: SettingsCategory; label: string; icon: React.ElementType
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'notifications', label: 'Notifications', icon: Bell },
   { id: 'files', label: 'File Transfers', icon: FolderOpen },
+  { id: 'relay', label: 'Other Networks', icon: Globe },
   { id: 'advanced', label: 'Advanced', icon: Wrench },
   { id: 'about', label: 'About', icon: Info },
 ];
@@ -111,6 +113,8 @@ const Settings: React.FC = () => {
         return <NotificationsSection settings={settings} updateSetting={updateSetting} />;
       case 'files':
         return <FilesSection settings={settings} updateSetting={updateSetting} />;
+      case 'relay':
+        return <RelaySection settings={settings} updateSetting={updateSetting} />;
       case 'advanced':
         return <AdvancedSection settings={settings} setSettings={setSettings} />;
       case 'about':

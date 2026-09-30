@@ -12,13 +12,14 @@ old one is marked `Superseded by ADR-NNNN` with a link.
 | [0001](0001-single-cargo-lockfile-and-workspace-dependencies.md) | Accepted | Only the workspace-root `Cargo.lock` is authoritative; nested lockfiles are deleted and forbidden by `.gitignore`. |
 | [0002](0002-deny-by-default-shell-command-allowlist.md) | Accepted | `CommandAllowlist` becomes real: a deny-by-default `allowed_commands` setting, one process-wide instance, enforced at every call site and at the dispatch gate. |
 | [0003](0003-per-launch-local-capability-token.md) | Provisional | A 43-character, per-launch, in-memory capability token replaces "any loopback peer is trusted". |
-| [0004](0004-domain-separated-relay-signing-key.md) | Accepted | The relay token is no longer the message-signing key; a labelled KDF derives a distinct key, `from_device_id` is signed, and a `key_id` rotation window is added. |
+| [0004](0004-domain-separated-relay-signing-key.md) | Superseded by ADR-0011 | The relay token is no longer the message-signing key; a labelled KDF derives a distinct key, `from_device_id` is signed, and a `key_id` rotation window is added. |
 | [0005](0005-same-user-local-access-is-not-a-boundary.md) | Accepted | Same-user local access is explicitly **not** defended against; this ADR records the threat model, not a control. |
 | [0006](0006-spki-pinning-not-whole-certificate.md) | Accepted | Pinning is SPKI on both sides, plus a `GET /pin` discovery endpoint; the documented workflow could never previously have matched. |
 | [0007](0007-refuse-to-ship-end-to-end-encryption-claims.md) | Accepted | `MessageProtection` is a closed union of `'envelope' \| 'plaintext'`, so a future `'e2e'` claim is a compile error. |
 | [0008](0008-keyring-fallback-over-hard-exit.md) | Accepted | A secret is never returned before a verified read-back; the keyring falls back to a `0600` key file instead of silently resetting the database. |
 | [0009](0009-untrusted-fields-must-fail-closed.md) | Provisional | "Absent" and "failed to read" are different states (`Result<Option<T>>`), corrupt values fail closed, and SQL limits are clamped at the storage layer. |
 | [0010](0010-schema-json-is-hand-maintained-and-test-enforced.md) | Accepted | `types.rs` is the single source of truth; `schema.json` is hand-maintained and pinned by five invariant tests. |
+| [0011](0011-per-device-relay-route-keys.md) | Accepted | Every device signs relay routes with its own key derived from its pairing secret; the relay resolves keys through its host, and a re-pair is the rotation mechanism. |
 
 ## Format
 

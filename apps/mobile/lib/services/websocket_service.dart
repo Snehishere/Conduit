@@ -1,12 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'encryption_service.dart';
+import 'relay_route.dart'
+    show
+        BinaryFrame,
+        buildBinaryFrame,
+        deriveRouteKey,
+        parseBinaryFrame,
+        signRoute,
+        verifyBinaryFrame;
+
+/// Shorthand for the hex decode used all over the relay paths.
+List<int> hexToBytes(String hex) => EncryptionService.hexToBytes(hex);
 
 typedef MessageHandler = void Function(Map<String, dynamic> message);
 
@@ -34,6 +46,14 @@ const int kLanWsPort = 9527;
 /// made pairing impossible.
 const int kLanWssPort = 9531;
 
+/// Nonce width in the hub's binary chunk envelope. Matches `CHUNK_NONCE_LEN`
+/// in `apps/desktop/src-tauri/src/server/handlers/files.rs` — XChaCha20-Poly1305
+/// uses a 24-byte nonce, and the two cannot disagree.
+const int chunkNonceLen = 24;
+
+/// Width of the little-endian metadata-length field in the same envelope.
+const int chunkLenFieldLen = 4;
+
 class WebSocketService extends ChangeNotifier {
   WebSocketChannel? _channel;
   bool _isConnected = false;
@@ -49,6 +69,21 @@ class WebSocketService extends ChangeNotifier {
   String? _apnsToken;
   String? _osVersion;
   String? _relayToken;
+  /// The v2 binary frame counter. Strictly increasing per connection, because
+  /// the relay drops a frame whose sequence does not advance — that is its
+  /// replay defence for file chunks, which carry no nonce to dedupe on.
+  int _binarySequence = 0;
+  /// Highest inbound binary sequence accepted from the current peer, for the
+  /// same reason: a relayed chunk replayed at the client must not reappear.
+  int? _lastInboundSequence;
+
+  /// The desktop's own device id, learned at pairing.
+  ///
+  /// Needed to verify anything the relay forwards: a v2 frame is checked under
+  /// the *sender's* route key, and the sender's id is bound into the key's
+  /// derivation, so a phone that does not know the hub's id has no way to check
+  /// a relayed frame and must drop it.
+  String? _relayPeerDeviceId;
   final Map<String, List<MessageHandler>> _messageHandlers = {};
   final List<Map<String, dynamic>> _connectedDevices = [];
 
@@ -67,7 +102,23 @@ class WebSocketService extends ChangeNotifier {
   /// Secure-storage key for the persisted certificate pin.
   static const String _pinStorageKey = 'pinned_cert_sha256';
   static const String _urlStorageKey = 'last_connected_url';
+
+  /// Secure-storage key for the id the desktop assigned us at pairing time.
+  ///
+  /// This is not a local choice: the desktop picks the `devices.id` and we are
+  /// told it in `pairing/accept`. It has to survive a restart because it is
+  /// the value stamped into `source_device` on every `encrypted` envelope, and
+  /// the desktop resolves the shared secret by that field. Sending a guess
+  /// means the hub finds no secret and drops the frame.
+  static const String _deviceIdStorageKey = 'paired_device_id';
+
+  /// The desktop's own device id, learned in the same `pairing/accept` that
+  /// assigns ours. Cleared on revoke alongside [_deviceIdStorageKey].
+  static const String _hubDeviceIdStorageKey = 'hub_device_id';
   static const FlutterSecureStorage _secureStorage = FlutterSecureStorage();
+
+  /// Whether the persisted device id has been loaded from secure storage.
+  bool _deviceIdLoaded = false;
 
   /// Whether the persisted pin has been loaded from secure storage.
   bool _pinLoaded = false;
@@ -105,6 +156,23 @@ class WebSocketService extends ChangeNotifier {
 
   void setDeviceId(String id) {
     _deviceId = id;
+  }
+
+  /// Forget the assigned device id, in memory and in secure storage.
+  ///
+  /// Call when the pairing is deliberately ended (revoke, or an explicit
+  /// unpair). Leaving a stale id behind would have the next session name the
+  /// phone as a device the hub no longer knows.
+  void clearDeviceId() {
+    if (_deviceId == null) return;
+    _deviceId = null;
+    unawaited(_secureStorage.delete(key: _deviceIdStorageKey));
+    // The desktop's id goes with it: it is part of the same pairing, and a
+    // re-pair may land on a different hub with a different id.
+    _relayPeerDeviceId = null;
+    _lastInboundSequence = null;
+    _binarySequence = 0;
+    unawaited(_secureStorage.delete(key: _hubDeviceIdStorageKey));
   }
 
   void setDeviceInfo(String name, String osVersion) {
@@ -153,6 +221,59 @@ class WebSocketService extends ChangeNotifier {
       debugPrint('WS: Failed to load certificate pin: $e');
     }
     _pinLoaded = true;
+  }
+
+  /// Load the device id the desktop assigned us at pairing time.
+  ///
+  /// Must complete before the first frame is sent: until it does, [deviceId] is
+  /// null and every `encrypted` envelope carries the placeholder `"mobile"`,
+  /// which the hub cannot resolve to a shared secret. Call once during startup,
+  /// before [autoConnect].
+  Future<void> restoreDeviceId() async {
+    if (_deviceIdLoaded) return;
+    try {
+      final stored = await _secureStorage.read(key: _deviceIdStorageKey);
+      if (stored != null && stored.isNotEmpty) {
+        _deviceId = stored;
+        debugPrint('WS: Restored paired device id');
+      }
+    } catch (e) {
+      debugPrint('WS: Failed to load paired device id: $e');
+    }
+    try {
+      final hubId = await _secureStorage.read(key: _hubDeviceIdStorageKey);
+      if (hubId != null && hubId.isNotEmpty) {
+        _relayPeerDeviceId = hubId;
+        debugPrint('WS: Restored desktop device id');
+      }
+    } catch (e) {
+      debugPrint('WS: Failed to load desktop device id: $e');
+    }
+    _deviceIdLoaded = true;
+  }
+
+  /// Record the id the desktop assigned us, and persist it for next launch.
+  ///
+  /// Called from the `pairing/accept` handler. A no-op when the field is
+  /// absent, which is how a desktop predating assigned ids is handled: the
+  /// hub falls back to the connection identity in that case.
+  void _adoptAssignedDeviceId(String? id) {
+    if (id == null || id.isEmpty || id == _deviceId) return;
+    _deviceId = id;
+    debugPrint('WS: Desktop assigned device id');
+    unawaited(_secureStorage.write(key: _deviceIdStorageKey, value: id));
+  }
+
+  /// Record the desktop's own device id, and persist it for next launch.
+  ///
+  /// Sent alongside the assigned id in the same `pairing/accept`, and needed
+  /// for the same reason from the other direction: verifying a relayed frame
+  /// means deriving the *sender's* route key, which is bound to the sender's id.
+  void _adoptHubDeviceId(String? id) {
+    if (id == null || id.isEmpty || id == _relayPeerDeviceId) return;
+    _relayPeerDeviceId = id;
+    debugPrint('WS: Learned the desktop device id');
+    unawaited(_secureStorage.write(key: _hubDeviceIdStorageKey, value: id));
   }
 
   /// Enable or disable prefer WSS for LAN connections.
@@ -357,70 +478,45 @@ class WebSocketService extends ChangeNotifier {
           try {
             if (data is Uint8List || data is List<int>) {
               final bytes = data is Uint8List ? data : Uint8List.fromList(data);
-              if (bytes.length < 28) {
-                debugPrint('WS: Binary message too short');
-                return;
-              }
-              final nonce = bytes.sublist(0, 24);
-              final byteData = ByteData.sublistView(bytes, 24, 28);
-              final jsonLen = byteData.getUint32(0, Endian.little);
-              if (bytes.length < 28 + jsonLen) {
-                debugPrint('WS: Binary message metadata length mismatch');
-                return;
-              }
-              final metadataBytes = bytes.sublist(28, 28 + jsonLen);
-              final ciphertext = bytes.sublist(28 + jsonLen);
-              
-              final metadata = jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
-              
-              final sharedSecretHex = getSharedSecret?.call();
-              if (sharedSecretHex != null) {
-                final secretBytes = EncryptionService.hexToBytes(sharedSecretHex);
-                try {
-                  final decrypted = await EncryptionService().decryptBinary(secretBytes, nonce, ciphertext);
-                  final msg = {
-                    'type': 'file',
-                    'action': 'chunk_binary',
-                    'id': metadata['id'],
-                    'index': metadata['index'],
-                    'data': decrypted,
-                  };
-                  _handleMessage(msg);
-                } catch (e) {
-                  debugPrint('WS: Failed to decrypt binary chunk: $e');
-                }
+              // The two binary formats are unrelated and must not be confused:
+              // on a relay connection it is a v2 frame (version byte, target
+              // id, sequence, tag, payload) addressed to us, while on a LAN
+              // connection it is the hub's own chunk envelope
+              // (24-byte nonce, 4-byte length, JSON metadata, ciphertext).
+              // Decoding a v2 frame as the LAN form would read the target id
+              // as a nonce and silently drop every relayed file.
+              if (_isRelayConnection) {
+                await _handleRelayBinary(bytes);
+              } else {
+                await _handleLanBinary(bytes);
               }
               return;
             }
 
             final rawMessage = jsonDecode(data as String) as Map<String, dynamic>;
             final type = rawMessage['type'] as String?;
-            
+
             if (type == 'ping') {
               _sendMessage({'type': 'pong'});
               return;
             }
 
-            if (type == 'encrypted') {
-              final sharedSecretHex = getSharedSecret?.call();
-              if (sharedSecretHex != null) {
-                final secretBytes = EncryptionService.hexToBytes(sharedSecretHex);
-                final nonceBytes = EncryptionService.hexToBytes(rawMessage['nonce'] as String);
-                final hmacHex = rawMessage['hmac'] as String;
-                final dataHex = rawMessage['data'] as String;
-
-                if (!EncryptionService.verifyHmac(secretBytes, dataHex, hmacHex)) {
-                  debugPrint('WS: HMAC verification failed');
-                  return;
-                }
-
-                final dataBytes = EncryptionService.hexToBytes(dataHex);
-                final decrypted = await EncryptionService().decrypt(secretBytes, nonceBytes, dataBytes);
-                final message = jsonDecode(decrypted) as Map<String, dynamic>;
-                _handleMessage(message);
-              } else {
-                debugPrint('WS: Received encrypted message but no shared secret available');
+            if (type == 'relay_delivery') {
+              // The relay verified the route signature and forwards the
+              // attribution with it. Unwrap before anything else, so the rest
+              // of the app sees the message exactly as a LAN one.
+              final sender = rawMessage['from_device_id'];
+              final inner = rawMessage['payload'];
+              if (sender is! String || inner is! Map<String, dynamic>) {
+                debugPrint('WS: malformed relay_delivery envelope');
+                return;
               }
+              _handleAttributed(inner, sender).then((_) {});
+              return;
+            }
+
+            if (type == 'encrypted') {
+              _handleEncrypted(rawMessage);
             } else {
               _handleMessage(rawMessage);
             }
@@ -473,6 +569,198 @@ class WebSocketService extends ChangeNotifier {
     }
   }
 
+  /// Verify and handle a v2 binary frame the relay forwarded to us.
+  ///
+  /// Fails closed on every check: a frame addressed to someone else, one whose
+  /// tag does not verify under the sending device's route key, and one whose
+  /// sequence does not advance are all dropped rather than surfaced.
+  Future<void> _handleRelayBinary(Uint8List bytes) async {
+    final BinaryFrame frame;
+    try {
+      frame = parseBinaryFrame(bytes);
+    } on FormatException catch (e) {
+      debugPrint('WS: malformed relay binary frame: ${e.message}');
+      return;
+    }
+
+    // The relay only forwards to the named recipient, so a frame naming anyone
+    // else means the routing table and the wire disagree.
+    if (frame.targetId != _deviceId) {
+      debugPrint('WS: relay frame addressed to ${frame.targetId}, not us');
+      return;
+    }
+
+    // The tag is what proves the sender. The route key comes from the pairing
+    // secret, which this device shares with the hub — so this check proves the
+    // frame came through the relay from the hub itself, and not from whoever
+    // else can reach that relay.
+    final secretHex = getSharedSecret?.call();
+    final sender = _relayPeerDeviceId;
+    if (secretHex == null || sender == null) {
+      debugPrint(
+        'WS: cannot verify a relayed frame — '
+        '${secretHex == null ? 'no shared secret' : 'the desktop device id was never learned'}',
+      );
+      return;
+    }
+    if (!verifyBinaryFrame(
+      routeKey: deriveRouteKey(hexToBytes(secretHex), sender),
+      fromDeviceId: sender,
+      frame: bytes,
+    )) {
+      debugPrint('WS: relay frame tag did not verify; dropping');
+      return;
+    }
+
+    final last = _lastInboundSequence;
+    if (last != null && frame.sequence <= last) {
+      debugPrint('WS: replayed relay frame (sequence ${frame.sequence} <= $last); dropping');
+      return;
+    }
+    _lastInboundSequence = frame.sequence;
+
+    await _deliverChunkPayload(frame.payload);
+  }
+
+  /// Verify, decrypt and dispatch an `encrypted` envelope.
+  ///
+  /// Fails closed: no shared secret, a bad HMAC, or malformed base64 all mean
+  /// the message is dropped. It is never surfaced undecrypted, because the
+  /// alternative is a peer receiving a peer handshake's contents in clear.
+  Future<void> _handleEncrypted(Map<String, dynamic> envelope) async {
+    final sharedSecretHex = getSharedSecret?.call();
+    if (sharedSecretHex == null) {
+      debugPrint('WS: Received encrypted message but no shared secret available');
+      return;
+    }
+    try {
+      final secretBytes = hexToBytes(sharedSecretHex);
+      final nonceBytes = hexToBytes(envelope['nonce'] as String);
+      final hmacHex = envelope['hmac'] as String;
+      final dataHex = envelope['data'] as String;
+
+      if (!EncryptionService.verifyHmac(secretBytes, dataHex, hmacHex)) {
+        debugPrint('WS: HMAC verification failed');
+        return;
+      }
+
+      final decrypted = await EncryptionService().decrypt(secretBytes, nonceBytes, hexToBytes(dataHex));
+      _handleMessage(jsonDecode(decrypted) as Map<String, dynamic>);
+    } catch (e) {
+      debugPrint('WS: could not decrypt an encrypted message: $e');
+    }
+  }
+
+  /// Handle a message the relay forwarded, stamped with the sender it verified.
+  ///
+  /// The relay only produces this envelope after checking the route signature
+  /// against the connection's authenticated device, so `sender` is the
+  /// relay's assertion rather than something the payload claims about itself.
+  /// It is recorded on the message so a handler that cares about who is talking
+  /// does not have to trust a self-reported `source_device`.
+  Future<void> _handleAttributed(Map<String, dynamic> message, String sender) async {
+    _lastRelaySender = sender;
+    if (message['type'] == 'encrypted') {
+      // Reuse the ordinary decrypt-and-dispatch path; the envelope is the same
+      // one the hub sends on the LAN, and its own HMAC still has to check out.
+      _handleEncrypted(message);
+      return;
+    }
+    _handleMessage(message);
+  }
+
+  /// The most recent sender the relay has vouched for, or null on a LAN
+  /// connection where the connection itself is the attribution.
+  String? _lastRelaySender;
+
+  /// The device id the relay last attributed an inbound message to.
+  ///
+  /// Set only on a relay connection, and only from the relay's own verified
+  /// attribution rather than anything the payload says about itself. Null means
+  /// "the connection is the attribution" — a phone is paired with one hub, so on
+  /// the LAN there is nothing to add.
+  String? get relayPeerDeviceId => _lastRelaySender ?? _relayPeerDeviceId;
+
+  /// Decrypt a relayed file chunk and dispatch it.
+  ///
+  /// The payload inside a v2 frame is the same chunk envelope the LAN path
+  /// uses — a 24-byte nonce, a 4-byte little-endian metadata length, the JSON
+  /// metadata, then the ciphertext — so it is parsed by the same code rather
+  /// than a second, differently-shaped decoder.
+  Future<void> _deliverChunkPayload(Uint8List payload) async {
+    final sharedSecretHex = getSharedSecret?.call();
+    if (sharedSecretHex == null) {
+      debugPrint('WS: received a relayed chunk with no shared secret');
+      return;
+    }
+    try {
+      final nonce = payload.sublist(0, chunkNonceLen);
+      final jsonLen =
+          ByteData.sublistView(payload, chunkNonceLen, chunkNonceLen + chunkLenFieldLen)
+              .getUint32(0, Endian.little);
+      if (payload.length < chunkNonceLen + chunkLenFieldLen + jsonLen) {
+        debugPrint('WS: relayed chunk metadata length mismatch');
+        return;
+      }
+      final metadataBytes = payload.sublist(chunkNonceLen + chunkLenFieldLen, chunkNonceLen + chunkLenFieldLen + jsonLen);
+      final ciphertext = payload.sublist(chunkNonceLen + chunkLenFieldLen + jsonLen);
+      final metadata = jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
+      final decrypted = await EncryptionService()
+          .decryptBinary(hexToBytes(sharedSecretHex), nonce, ciphertext);
+      _handleMessage({
+        'type': 'file',
+        'action': 'chunk_binary',
+        'id': metadata['id'],
+        'index': metadata['index'],
+        'data': decrypted,
+      });
+    } catch (e) {
+      debugPrint('WS: failed to decrypt relayed binary chunk: $e');
+    }
+  }
+
+  /// Verify and handle the hub's own LAN chunk envelope.
+  ///
+  /// Unchanged in shape from the relay path: a 24-byte nonce, a 4-byte
+  /// little-endian metadata length, the JSON metadata, then the ciphertext.
+  Future<void> _handleLanBinary(Uint8List bytes) async {
+    if (bytes.length < chunkNonceLen + chunkLenFieldLen) {
+      debugPrint('WS: Binary message too short');
+      return;
+    }
+    final nonce = bytes.sublist(0, chunkNonceLen);
+    final byteData = ByteData.sublistView(bytes, chunkNonceLen, chunkNonceLen + chunkLenFieldLen);
+    final jsonLen = byteData.getUint32(0, Endian.little);
+    if (bytes.length < chunkNonceLen + chunkLenFieldLen + jsonLen) {
+      debugPrint('WS: Binary message metadata length mismatch');
+      return;
+    }
+    final metadataBytes =
+        bytes.sublist(chunkNonceLen + chunkLenFieldLen, chunkNonceLen + chunkLenFieldLen + jsonLen);
+    final ciphertext = bytes.sublist(chunkNonceLen + chunkLenFieldLen + jsonLen);
+
+    final metadata = jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
+
+    final sharedSecretHex = getSharedSecret?.call();
+    if (sharedSecretHex == null) {
+      debugPrint('WS: Received binary chunk but no shared secret available');
+      return;
+    }
+    try {
+      final decrypted = await EncryptionService()
+          .decryptBinary(hexToBytes(sharedSecretHex), nonce, ciphertext);
+      _handleMessage({
+        'type': 'file',
+        'action': 'chunk_binary',
+        'id': metadata['id'],
+        'index': metadata['index'],
+        'data': decrypted,
+      });
+    } catch (e) {
+      debugPrint('WS: Failed to decrypt binary chunk: $e');
+    }
+  }
+
   /// Send the relay authentication message.
   /// The token is sent in plaintext over the WSS (TLS) connection
   /// because it is used by the relay itself to authorize the connection.
@@ -519,6 +807,15 @@ class WebSocketService extends ChangeNotifier {
 
     // Track connected devices
     if (type == 'pairing' && action == 'accept') {
+      // The desktop tells us the id it filed us under. This is the only time we
+      // can learn it, and without it every envelope we send names us
+      // "mobile" and is dropped by the hub's decrypt step.
+      _adoptAssignedDeviceId(message['device_id'] as String?);
+      // It also tells us its own id in the same breath, and that is equally
+      // load-bearing in the other direction: a relayed frame is verified under
+      // the *sender's* route key, and the sender's id is bound into the key's
+      // derivation. Without it every relayed file chunk would be unverifiable.
+      _adoptHubDeviceId(message['hub_device_id'] as String?);
       final deviceInfo = message['device_info'] as Map<String, dynamic>?;
       if (deviceInfo != null) {
         final device = {
@@ -533,6 +830,7 @@ class WebSocketService extends ChangeNotifier {
     } else if (type == 'pairing' && action == 'revoke') {
       // P1.7: Server revoked this device's pairing — notify the UI
       debugPrint('WS: Device pairing revoked by server');
+      clearDeviceId();
       _isConnected = false;
       _connectedUri = null;
       _connectedDevices.clear();
@@ -583,41 +881,81 @@ class WebSocketService extends ChangeNotifier {
     }
   }
 
+  /// The key this device signs its relayed routes with, or null if it cannot
+  /// sign yet.
+  ///
+  /// Derived from the pairing secret under this device's own id, so the relay
+  /// can verify it without a shared operator key and another device's key is
+  /// useless here. Null until pairing has produced both a secret and an id,
+  /// which is the correct state to be in: an unroutable device, not a device
+  /// that signs with something weaker.
+  List<int>? _routeKey() {
+    final secretHex = getSharedSecret?.call();
+    final deviceId = _deviceId;
+    if (secretHex == null || secretHex.isEmpty) return null;
+    if (deviceId == null || deviceId.isEmpty) return null;
+    return deriveRouteKey(hexToBytes(secretHex), deviceId);
+  }
+
+  /// Wrap [message] in a signed `relay_route` addressed to [_targetDeviceId].
+  ///
+  /// Returns null when this device cannot sign, which the caller must treat as
+  /// "do not send" rather than "send it unsigned": the relay rejects an
+  /// unsigned route anyway, and quietly sending one hides the real fault.
+  Map<String, dynamic>? _asSignedRoute(Object? message) {
+    final target = _targetDeviceId;
+    final deviceId = _deviceId;
+    final key = _routeKey();
+    if (target == null || deviceId == null || key == null) {
+      debugPrint(
+        'WS: cannot route through the relay — '
+        'missing ${target == null ? 'target' : deviceId == null ? 'own device id' : 'pairing secret'}',
+      );
+      return null;
+    }
+    return signRoute(
+      routeKey: key,
+      fromDeviceId: deviceId,
+      toDeviceId: target,
+      payload: message,
+    );
+  }
+
+  /// Next value for the v2 binary frame sequence counter.
+  int _nextSequence() => _binarySequence = (_binarySequence + 1) & 0xFFFFFFFF;
+
   void sendBinaryMessage(dynamic message) {
-    if (_channel != null && _isConnected) {
-      if (_isRelayConnection && _targetDeviceId != null && (message is Map ? message['type'] != 'relay_auth' : true)) {
-        if (message is Uint8List) {
-          final targetBytes = utf8.encode(_targetDeviceId!.padRight(16).substring(0, 16));
-          final routedBytes = Uint8List(1 + 16 + message.length);
-          routedBytes[0] = 0x01;
-          routedBytes.setRange(1, 17, targetBytes);
-          routedBytes.setRange(17, routedBytes.length, message);
-          _channel!.sink.add(routedBytes);
-        } else {
-          final timestamp = DateTime.now().millisecondsSinceEpoch;
-          final nonceBytes = crypto.sha256.convert(utf8.encode(DateTime.now().microsecondsSinceEpoch.toString())).bytes;
-          final nonce = EncryptionService.bytesToHex(nonceBytes).substring(0, 32);
-          final messageForHmac = {
-            'type': 'relay_route',
-            'to_device_id': _targetDeviceId,
-            'payload': message,
-            'timestamp': timestamp,
-            'nonce': nonce,
-          };
-          final hmacHex = EncryptionService.generateHmac(utf8.encode(_relayToken ?? ''), jsonEncode(messageForHmac));
-          
-          _channel!.sink.add(jsonEncode({
-            ...messageForHmac,
-            'hmac': hmacHex,
-          }));
-        }
-      } else {
-        if (message is Uint8List) {
-          _channel!.sink.add(message);
-        } else {
-          _channel!.sink.add(jsonEncode(message));
-        }
+    if (_channel == null || !_isConnected) return;
+
+    if (_isRelayConnection && _targetDeviceId != null) {
+      final target = _targetDeviceId!;
+      final deviceId = _deviceId;
+      final key = _routeKey();
+      if (deviceId == null || key == null) {
+        debugPrint('WS: cannot route a binary frame through the relay: no route key');
+        return;
       }
+      final Uint8List payload = message is Uint8List
+          ? message
+          : Uint8List.fromList(utf8.encode(jsonEncode(message)));
+      try {
+        _channel!.sink.add(buildBinaryFrame(
+          routeKey: key,
+          fromDeviceId: deviceId,
+          targetDeviceId: target,
+          sequence: Uint32List.fromList([_nextSequence()]),
+          payload: payload,
+        ));
+      } on FormatException catch (e) {
+        _surfaceSendError('Could not build the relayed file frame: ${e.message}');
+      }
+      return;
+    }
+
+    if (message is Uint8List) {
+      _channel!.sink.add(message);
+    } else {
+      _channel!.sink.add(jsonEncode(message));
     }
   }
 
@@ -666,22 +1004,19 @@ class WebSocketService extends ChangeNotifier {
       }
 
       if (_isRelayConnection && _targetDeviceId != null && !isRelayAuth) {
-        final timestamp = DateTime.now().millisecondsSinceEpoch;
-        final nonceBytes = crypto.sha256.convert(utf8.encode(DateTime.now().microsecondsSinceEpoch.toString())).bytes;
-        final nonce = EncryptionService.bytesToHex(nonceBytes).substring(0, 32);
-        final messageForHmac = {
-          'type': 'relay_route',
-          'to_device_id': _targetDeviceId,
-          'payload': payloadToSend,
-          'timestamp': timestamp,
-          'nonce': nonce,
-        };
-        final hmacHex = EncryptionService.generateHmac(utf8.encode(_relayToken ?? ''), jsonEncode(messageForHmac));
-        
-        _channel!.sink.add(jsonEncode({
-          ...messageForHmac,
-          'hmac': hmacHex,
-        }));
+        // Signed with this device's own route key, never the bearer token: the
+        // token authenticates the connection, the key proves which device is
+        // speaking. Signing with the token let any paired phone forge a route
+        // claiming to be the desktop or another phone.
+        final route = _asSignedRoute(payloadToSend);
+        if (route == null) {
+          _surfaceSendError(
+            'Cannot reach the other device through the relay — this device is not '
+            'paired yet, so it has no key to sign with',
+          );
+          return;
+        }
+        _channel!.sink.add(jsonEncode(route));
       } else {
         _channel!.sink.add(jsonEncode(payloadToSend));
       }

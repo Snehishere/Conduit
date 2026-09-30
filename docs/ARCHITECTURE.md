@@ -39,29 +39,39 @@ Conduit is a Cargo virtual workspace with three members
                                     │ path dependency
               ┌─────────────────────┼─────────────────────┐
               │                     │                     │
-   ┌──────────▼──────────┐ ┌────────▼─────────┐ ┌─────────▼──────────┐
-   │ apps/desktop/       │ │ services/relay   │ │ apps/mobile        │
-   │   src-tauri         │ │   (relay)        │ │   (Flutter)        │
-   │   (conduit)         │ │                 │ │                    │
-   │  + src/ React+TS    │ │  message router  │ │  Dart services     │
-   └─────────────────────┘ └──────────────────┘ └────────────────────┘
+   ┌──────────▼──────────┐          │                ┌─────────▼──────────┐
+   │ apps/desktop/       │          │                │ apps/mobile        │
+   │   src-tauri         │          │                │   (Flutter)        │
+   │   (conduit)         │          │                │                    │
+   │  + src/ React+TS    │          │                │  Dart services     │
+   │ ┌─────────────────┐ │          │                └────────────────────┘
+   │ │ services/relay  │ │          │
+   │ │ (conduit-relay) │ │          │
+   │ │ in-process host │ │          │
+   │ └─────────────────┘ │          │
+   └─────────────────────┘          │
+              └─────────────────────┴─────────────────────┘
 ```
 
 | Component | Crate / package | Owns | Depends on |
 |---|---|---|---|
-| `packages/protocol` | `conduit-protocol` | Every wire message struct, the port constants, the `hmac` module (HMAC-SHA256, domain separation, replay cache, nonce persistence, binary frame constants), the JSON Schema, `PROTOCOL.md` | `serde`, `serde_json`, `hmac`, `sha2`, `hex`, `subtle`, `log` |
-| `apps/desktop/src-tauri` | `conduit` | The hub: WebSocket server (two listeners), mDNS advertisement, pairing, the pairing registry, SQLCipher storage, file-transfer engine, automation engine, audio capture, screen capture, input injection, all Tauri commands | `conduit-protocol` |
-| `services/relay` | `relay` | Optional self-hosted router: bearer auth, signed `relay_route` verification, v2 binary frame verification, replay cache persistence, TLS, health/metrics/pin HTTP endpoints | `conduit-protocol` |
+| `packages/protocol` | `conduit-protocol` | Every wire message struct, the port constants, the `hmac` module (HMAC-SHA256, domain separation, per-device route-key derivation, replay cache, nonce persistence, binary frame constants), the JSON Schema, `PROTOCOL.md` | `serde`, `serde_json`, `hmac`, `sha2`, `hex`, `subtle`, `log` |
+| `apps/desktop/src-tauri` | `conduit` | The hub: WebSocket server (two listeners), mDNS advertisement, pairing, the pairing registry, SQLCipher storage, file-transfer engine, automation engine, audio capture, screen capture, input injection, all Tauri commands, **and the hosted relay** | `conduit-protocol`, `conduit-relay` |
+| `services/relay` | `conduit-relay` | The router: bearer auth, per-device `relay_route` verification, v2 binary frame verification, replay cache persistence, TLS, health/metrics/pin HTTP endpoints. A library with no binary target — hosted in-process as a background task by the desktop (`apps/desktop/src-tauri/src/relay.rs`) | `conduit-protocol` |
 | `apps/desktop/src` | not a workspace member | React/TypeScript UI | the desktop backend over Tauri IPC **and** a loopback WebSocket |
 | `apps/mobile` | not a workspace member | Flutter app: platform services (notification listeners, SMS, calls, MediaProjection capture, accessibility input injection), secure storage, sqflite database | the wire format, transcribed into `lib/models/protocol.dart` by codegen |
 
 ### Dependency direction
 
 `conduit-protocol` depends on nothing in the workspace. Both `conduit` and
-`relay` depend on it, and they do not depend on each other. There is no
-shared mutable state between the desktop hub and the relay; the only coupling
-is the wire format, which is what the codegen pipeline in §8 exists to keep
-honest.
+`conduit-relay` depend on it. `conduit` also depends on `conduit-relay`, and
+that is not a layering violation: **the desktop hosts the relay in the same
+process**, in the same Tokio runtime, sharing one SQLCipher connection, one
+keyring handle, and the `devices` table that both the pairing registry and the
+relay's `RouteKeys` resolver read. The relay holds no key material of its own —
+it asks its host for a device's route key — so the trust boundary between them
+is a function call inside one address space, not an IPC hop. It is therefore
+not a boundary in the isolation sense either.
 
 The mobile app is not a Rust crate and therefore does not import
 `conduit-protocol`; it gets an equivalent view of the schema through
@@ -120,6 +130,14 @@ Dart. Four tests pin the three representations plus the table in `PROTOCOL.md`
 against each other, so a drift in any of them fails the build:
 `types.rs:1608-1653`, `types.rs:1664-1676`, and
 `apps/desktop/src-tauri/src/main.rs:461-507`.
+
+> **9531 has a second, unrelated job.** The relay the desktop hosts also binds
+> a *plaintext* loopback listener on 9531 (`DEFAULT_RELAY_LOCAL_PORT`,
+> `apps/desktop/src-tauri/src/relay.rs`), and the desktop joins its own relay
+> over it. Same number, different socket, different process-local purpose: the
+> LAN TLS listener above is bound `0.0.0.0:9531`, the relay's plaintext listener
+> is pinned to `127.0.0.1:9531` and is deliberately not inheritable from the
+> environment.
 
 ### Why both exist
 
@@ -328,12 +346,17 @@ frame is encrypted, and it applies exactly one layer:
 | 2 | Webview → local hub | React app → `ws://127.0.0.1:9527` | protocol frames, both directions | **Nothing yet** — the webview does not send `local_auth` (§3). Until it does, it is treated as an unpaired peer. | `server/mod.rs:377-389`; `handlers/pairing.rs:290-309` |
 | 3 | LAN peer → desktop | phone → `0.0.0.0:9527` or `:9531` | any protocol frame | one-time pairing token (60 s TTL) → X25519 shared secret; thereafter `is_trusted_peer` per connection | `handlers/pairing.rs:26-58`; `server/mod.rs:672-704` |
 | 4 | Desktop → LAN peer | hub → paired phone | encrypted envelope per peer, or plaintext for `local_desktop` | per-peer X25519 shared secret; TLS 1.3 on 9531 | `server/mod.rs:321-361`; `tls.rs:120-128` |
-| 5 | Desktop → relay | hub → `services/relay` | signed `relay_route`; v2 binary frames | relay bearer token for the connection; HMAC over the canonical field set with the relay's *signing* key; `from_device_id` bound to the authenticated connection | `services/relay/src/main.rs:1870-1932` |
+| 5 | Desktop → relay | hub → the relay it hosts | signed `relay_route`; v2 binary frames | the relay's bearer token for the connection; HMAC over the canonical field set under **the sending device's own route key**, resolved by asking its host (`RouteKeys`), with `from_device_id` bound to the authenticated connection and `key_id == from_device_id` | `services/relay/src/route.rs:89-137`; `apps/desktop/src-tauri/src/server/mod.rs:1039-1050` |
 | 6 | Mobile → desktop | phone → hub over `wss://` | protocol frames, wrapped in the `encrypted` envelope where the type is enveloped (§6.4 of `PROTOCOL.md`); most types are not | TLS 1.3 + SPKI pin captured during the pairing handshake; shared secret from X25519 | `websocket_service.dart:188-222`, `291-316` |
 | 7 | Mobile ↔ desktop key exchange | `pairing/request` → `pairing/accept` | X25519 public keys both ways | the one-time token, out-of-band via the QR code | `handlers/pairing.rs:84-94`, `213-223` |
-| 8 | Client → relay (mobile) | phone → relay | `relay_auth` then `relay_route` | same as boundary 5 | `websocket_service.dart:453-480` |
-| 9 | Operator → relay config | `.env` / mounted file | `RELAY_TOKEN`, `HMAC_SECRET`, optional signing keys | filesystem permissions (`0600`) plus container env | `docker-compose.yml`, `.env.example` |
+| 8 | Client → relay (mobile) | phone → relay | `relay_auth` then `relay_route` | same as boundary 5: the phone's own route key, derived from the pairing secret | `websocket_service.dart:453-480`; `relay_route.dart:74` |
+| 9 | Desktop settings + keyring → hosted relay | the Settings screen and the OS keyring → the in-process relay | `relay_enabled`, `relay_port`, `relay_health_port`, `relay_hostname`; the bearer token from keyring account `relay_token`; the desktop's own route key from keyring account `relay_route_key`; peer route keys derived from each `devices` row | no authentication — this is the host configuring its own library. What it buys is the loopback pins: `health_bind` and `ws_bind` are hard-set to `127.0.0.1` in `build_config` and are **not** environment-overridable | `apps/desktop/src-tauri/src/relay.rs:48-79`, `:455-478` |
 | 10 | Database at rest | SQLite file → disk | devices, notifications, clipboard history, settings, transfers, automation | SQLCipher; the key itself comes from the OS keyring, or a `0600` key file | `storage.rs:464-472`; `encryption.rs:264-406` |
+
+Boundary 9 replaces what used to be an operator-to-container boundary. There is
+no operator and no separate deployment: the values come from the desktop's own
+Settings and keyring, and the port the phone dials (9529) is the one thing the
+user may still have to arrange reachability for outside Conduit.
 
 Boundary 7 deserves a note: the token is the *consent* event, and the public
 keys are exchanged over the same TLS-protected socket that the QR code
@@ -569,13 +592,31 @@ The mobile database uses plain `sqflite` on-version callbacks
 
 ### Key management, desktop
 
-Two long-lived secrets: the X25519 identity key (`x25519_private_key`) and the
-SQLCipher key (`sqlite_key`), both under service name `conduit_app`
-(`encryption.rs:54-58`). `load_or_create_secret` → `resolve_secret`
-(`encryption.rs:264-406`) is the whole policy, and it exists because the
+Four long-lived secrets, all under service name `conduit_app`:
+
+| Keyring account | What it protects |
+|---|---|
+| `x25519_private_key` | The desktop's X25519 identity key. Everything peer-to-peer is sealed to it, and the per-device relay route keys for paired phones are derived from it, so a re-pair rotates them for free. |
+| `sqlite_key` | The SQLCipher database key. Lose it and the device registry, clipboard history, notifications, files metadata and automation rules all become unreadable at once. |
+| `relay_token` | The bearer token relay clients present on `relay_auth`. It is the only thing standing between an off-LAN peer and the relay's routing table. |
+| `relay_route_key` | The desktop's *own* route key — the key it signs its own relayed frames with. It has no pairing with itself, so unlike every other device's key it cannot be derived and has to be generated once and stored. |
+
+`x25519_private_key` and `sqlite_key` are declared at `encryption.rs:56-58` and
+governed by `load_or_create_secret` → `resolve_secret`
+(`encryption.rs:264-406`). That is the whole policy, and it exists because the
 previous inline version discarded the result of `set_password` and minted a new
 key on every launch on a host without a running Secret Service — see
 `SECURITY.md` §3.3.
+
+`relay_token` and `relay_route_key` are declared at `relay.rs:48, 54` and go
+through the same keyring and the same 0600 fallback file, for exactly the same
+reason. They are credentials rather than settings — a token in the settings
+table would be readable by anything that can read the database, and would be
+eligible for sync and backup. `relay_enabled`, `relay_port`,
+`relay_health_port` and `relay_hostname` *are* settings, because none of them is
+a secret. The legacy `relay_url` setting is likewise not a secret and is not
+dialled: the desktop joins its own relay over a loopback-only plaintext listener
+instead (`DEFAULT_RELAY_LOCAL_PORT`, 9531).
 
 The rule the implementation enforces:
 
@@ -722,7 +763,7 @@ against a remote, because the repository has none.
 | To add… | Touch | Watch out for |
 |---|---|---|
 | a new message type | `types.rs` struct + `schema.json` + regenerate + `security::validate_msg_type` + the dispatch `match` in `server/mod.rs:736` | the auth gate exempts only `pairing`/`ping`/`pong`; the per-type rate limiter falls back to 100/60s for unknown types; `settings_gate` matches on `msg_type`, so a new `file` action is automatically covered by `sync_files` |
-| a new binary frame version | `types.rs` constants + `services/relay/src/main.rs:handle_binary_frame` | v2 rejects v1 outright; the MAC input is `from_device_id ‖ 0x1F ‖ header ‖ payload`, so changing the header changes the MAC |
+| a new binary frame version | `types.rs` constants + `services/relay/src/route.rs:handle_binary_frame` | v2 rejects v1 outright; the MAC input is `from_device_id ‖ 0x1F ‖ header ‖ payload`, so changing the header changes the MAC |
 | a new SQLCipher migration | `migrations/NNN_name.sql` | embedded list wins on filename collision; ordering is by `(version, filename)` |
 | a new setting | `ConduitSettings` (`commands/settings.rs:29`) **and** `Storage::get_settings`/`save_settings` **and** `settingsTypes.ts` | three places, and the two Rust ones have a test (`test_save_settings_writes_every_settings_key`) that will fail if you miss one. `allowed_commands` is deliberately *not* a `ConduitSettings` field; see the comment at `commands/settings.rs:181-189` |
 | a new inbound command | `#[tauri::command]` + `main.rs:219-263` | anything the frontend can call needs a capability only if it is a plugin API, not a command |

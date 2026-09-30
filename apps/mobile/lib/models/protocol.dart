@@ -20,6 +20,10 @@ class Protocol {
     final String? action;
     final String? apnsToken;
     final int? battery;
+    
+    ///The devices.id the desktop assigned to the peer. The peer stores it and sends it as
+    ///source_device on every encrypted envelope; without it the receiver cannot resolve the
+    ///shared secret. Absent when the sender predates assigned ids.
     final String? deviceId;
     final String? deviceName;
     final DeviceTypeEnum? deviceType;
@@ -34,6 +38,11 @@ class Protocol {
     ///X25519 public key, hex-encoded
     final String? publicKey;
     final String? token;
+    
+    ///The desktop's own device_id. A relayed v2 frame is verified under the sender's route key,
+    ///and the sender's id is bound into that key's derivation, so a peer that does not know
+    ///this cannot verify a relayed frame and must drop it. Absent when the sender predates it.
+    final String? hubDeviceId;
     final String? reason;
     final String? content;
     final String? mime;
@@ -129,6 +138,7 @@ class Protocol {
         this.deviceInfo,
         this.publicKey,
         this.token,
+        this.hubDeviceId,
         this.reason,
         this.content,
         this.mime,
@@ -205,6 +215,7 @@ class Protocol {
         deviceInfo: json["device_info"] == null ? null : DeviceInfo.fromJson(json["device_info"]),
         publicKey: json["public_key"],
         token: json["token"],
+        hubDeviceId: json["hub_device_id"],
         reason: json["reason"],
         content: json["content"],
         mime: json["mime"],
@@ -281,6 +292,7 @@ class Protocol {
         "device_info": deviceInfo?.toJson(),
         "public_key": publicKey,
         "token": token,
+        "hub_device_id": hubDeviceId,
         "reason": reason,
         "content": content,
         "mime": mime,

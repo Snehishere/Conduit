@@ -30,7 +30,22 @@ const { baseInvoke } = vi.hoisted(() => {
         default_download_folder: '',
         auto_accept_files: true,
         notifications_enabled: true,
-        relay_url: 'ws://127.0.0.1:9528',
+        relay_url: 'ws://127.0.0.1:9531',
+        relay_enabled: true,
+        relay_port: 9529,
+        relay_health_port: 9530,
+        relay_hostname: '',
+      });
+    }
+    if (cmd === 'get_relay_status') {
+      return Promise.resolve({
+        running: true,
+        error: null,
+        port: 9529,
+        local_port: 9531,
+        tls_pin: 'sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=',
+        active_connections: 1,
+        registered_devices: 2,
       });
     }
     if (cmd === 'get_current_version') {
@@ -86,6 +101,7 @@ describe('Settings', () => {
     expect(screen.getAllByText('Appearance').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Notifications').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('File Transfers').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Other Networks').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('Advanced').length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText('About').length).toBeGreaterThanOrEqual(1);
   });
@@ -174,7 +190,7 @@ describe('Settings', () => {
       'Slack',
       'Discord',
     ]);
-    expect(payload.relay_url).toBe('ws://127.0.0.1:9528');
+    expect(payload.relay_url).toBe('ws://127.0.0.1:9531');
     await waitFor(() => {
       expect(screen.getByText('Saved')).toBeInTheDocument();
     });
@@ -248,7 +264,99 @@ describe('Settings', () => {
     renderSettings();
     await openCategory('Advanced');
     expect(screen.getByText('Relay endpoint')).toBeInTheDocument();
-    expect(screen.getByText('ws://127.0.0.1:9528')).toBeInTheDocument();
+    expect(screen.getByText('ws://127.0.0.1:9531')).toBeInTheDocument();
+  });
+
+  /**
+   * The "Other Networks" panel. The point of these is that a user can tell
+   * whether the feature is working *without* reading a log file — a relay that
+   * silently failed to bind is the failure mode this whole feature is most
+   * likely to hit on a real machine.
+   */
+  describe('relay panel', () => {
+    const openRelay = async () => {
+      renderSettings();
+      await waitFor(() => {
+        expect(screen.getByText('Settings')).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getAllByText('Other Networks')[0]);
+    };
+
+    it('shows the live status rather than claiming success on faith', async () => {
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText('Running')).toBeInTheDocument();
+      });
+      expect(screen.getByText(/1 device connected/)).toBeInTheDocument();
+      expect(screen.getByText(/Listening on port 9529/)).toBeInTheDocument();
+    });
+
+    it('says why it is not running instead of showing a green dot', async () => {
+      invokeMock.mockImplementation((cmd: string) => {
+        if (cmd === 'get_relay_status') {
+          return Promise.resolve({
+            running: false,
+            error: 'port 9529 could not be bound: address already in use',
+            port: null,
+            local_port: null,
+            tls_pin: null,
+            active_connections: 0,
+            registered_devices: 0,
+          });
+        }
+        return baseInvoke(cmd);
+      });
+
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText(/Not running/)).toBeInTheDocument();
+      });
+      expect(screen.getByText(/address already in use/)).toBeInTheDocument();
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    });
+
+    it('tells the user the port still has to be opened on their router', async () => {
+      // The app hosts the relay but cannot reach the router. Without this the
+      // panel would imply a phone on mobile data just works.
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText(/open in your router/)).toBeInTheDocument();
+      });
+    });
+
+    it('explains that there is nothing else to install', async () => {
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText(/nothing else to install/)).toBeInTheDocument();
+      });
+    });
+
+    it('survives a failing status read instead of rendering a lie', async () => {
+      invokeMock.mockImplementation((cmd: string) => {
+        if (cmd === 'get_relay_status') return Promise.reject(new Error('no such command'));
+        return baseInvoke(cmd);
+      });
+
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText('Checking…')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Running')).not.toBeInTheDocument();
+    });
+
+    it('lets the relay be turned off, which is the point of the default', async () => {
+      await openRelay();
+      await waitFor(() => {
+        expect(screen.getByText('Running')).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByRole('switch'));
+      // With the relay off there is no status, port or router note to show —
+      // showing them would imply it is still doing something.
+      await waitFor(() => {
+        expect(screen.queryByText('Running')).not.toBeInTheDocument();
+      });
+      expect(screen.queryByText(/Listening on port/)).not.toBeInTheDocument();
+    });
   });
 });
 
@@ -275,7 +383,7 @@ describe('settingsTypes conformance', () => {
     expect(DEFAULT_SETTINGS.theme).toBe('dark');
     expect(DEFAULT_SETTINGS.accent_color).toBe('#00f0ff');
     expect(DEFAULT_SETTINGS.max_devices).toBe(5);
-    expect(DEFAULT_SETTINGS.relay_url).toBe('ws://127.0.0.1:9528');
+    expect(DEFAULT_SETTINGS.relay_url).toBe('ws://127.0.0.1:9531');
     expect(DEFAULT_SETTINGS.notification_apps).toEqual([
       'WhatsApp',
       'Telegram',
@@ -285,5 +393,9 @@ describe('settingsTypes conformance', () => {
     expect(DEFAULT_SETTINGS.minimize_to_tray).toBe(true);
     expect(DEFAULT_SETTINGS.auto_accept_files).toBe(true);
     expect(DEFAULT_SETTINGS.notifications_enabled).toBe(true);
+    // The relay is a background part of the app, not something to deploy, so a
+    // fresh install has it running. `the_relay_is_on_by_default` pins the Rust
+    // side; this keeps the two defaults from drifting apart.
+    expect(DEFAULT_SETTINGS.relay_enabled).toBe(true);
   });
 });

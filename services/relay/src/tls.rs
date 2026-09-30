@@ -17,20 +17,105 @@ pub enum TlsSource {
 
 /// Everything the relay needs to serve TLS, plus the values it must publish.
 pub struct TlsContext {
+    /// The TLS 1.3 server configuration, ready to hand to a `TlsAcceptor`.
     pub acceptor: TlsAcceptor,
     /// Certificate pin in `sha256/<base64>` form, computed over the
     /// SubjectPublicKeyInfo (SPKI) DER — see [`spki_sha256_pin`].
     ///
-    /// This is the value `GET /pin` serves and the value
-    /// `scripts/generate-cert-pin.sh` prints. Clients MUST pin this, not
+    /// This is the value `GET /pin` serves. Clients MUST pin this, not
     /// `sha256(cert-DER)`: the SPKI survives certificate renewal as long as the
     /// key pair is reused, whereas a whole-certificate pin breaks on renewal.
     pub spki_pin: String,
+    /// Where `cert.pem` was read from, or written to.
     pub cert_path: PathBuf,
+    /// Where `key.pem` was read from, or written to.
     pub key_path: PathBuf,
     /// SANs embedded in (or expected of) the served certificate.
     pub subject_alt_names: Vec<String>,
+    /// Whether the material was generated here or supplied by the operator.
     pub source: TlsSource,
+}
+
+/// How a relay should present TLS.
+///
+/// Passed in rather than read from the environment inside this module, so that a
+/// host embedding the relay can say what the certificate should look like
+/// without mutating process-global state. [`TlsParams::from_env`] reproduces the
+/// environment behaviour exactly, and is what the no-argument entry point uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsParams {
+    /// Directory holding `cert.pem` and `key.pem`, or where they are created.
+    pub cert_dir: PathBuf,
+    /// The name the relay is actually reached by.
+    ///
+    /// Without this every client fails hostname verification against anything
+    /// but localhost, which is the most common cause of a relay that works on
+    /// the developer's machine and nowhere else.
+    pub hostname: String,
+    /// Further names to add to the certificate, e.g. a LAN address.
+    pub extra_sans: Vec<String>,
+}
+
+impl TlsParams {
+    /// Read the TLS settings from the environment, with the current defaults.
+    ///
+    /// `RELAY_CERT_DIR`, `RELAY_TLS_HOSTNAME` and `RELAY_TLS_EXTRA_SANS`.
+    pub fn from_env() -> Self {
+        Self {
+            cert_dir: std::env::var("RELAY_CERT_DIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("./certs")),
+            hostname: std::env::var("RELAY_TLS_HOSTNAME")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .unwrap_or_else(|| "localhost".to_string()),
+            extra_sans: std::env::var("RELAY_TLS_EXTRA_SANS")
+                .ok()
+                .map(|extra| {
+                    extra
+                        .split([',', ' ', ';'])
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The full SAN list, with the loopback names always present.
+    ///
+    /// `localhost`, `127.0.0.1` and `::1` are unconditional so a relay started
+    /// without configuration still works for local development. Duplicates are
+    /// dropped — a certificate listing the same name twice is rejected outright
+    /// by some TLS stacks.
+    pub fn subject_alt_names(&self) -> Vec<String> {
+        let mut sans = vec![
+            self.hostname.clone(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        for san in &self.extra_sans {
+            let san = san.trim();
+            if !san.is_empty() && !sans.iter().any(|s| s == san) {
+                sans.push(san.to_string());
+            }
+        }
+        sans
+    }
+}
+
+impl Default for TlsParams {
+    /// A localhost-only relay under the working directory.
+    fn default() -> Self {
+        Self {
+            cert_dir: PathBuf::from("./certs"),
+            hostname: "localhost".to_string(),
+            extra_sans: Vec::new(),
+        }
+    }
 }
 
 /// Certificate directory, overridable with `RELAY_CERT_DIR`.
@@ -38,46 +123,27 @@ pub struct TlsContext {
 /// The default is CWD-relative, which only works because the Dockerfile sets
 /// `WORKDIR /data`. Setting this explicitly removes that hidden dependency.
 pub fn cert_dir() -> PathBuf {
-    std::env::var("RELAY_CERT_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("./certs"))
+    TlsParams::from_env().cert_dir
 }
 
-/// SANs to embed in a generated self-signed certificate.
+/// SANs to embed in a generated self-signed certificate, from the environment.
 ///
 /// `RELAY_TLS_HOSTNAME` is the name the relay is actually reached by — without
 /// it every client fails hostname verification against anything but localhost.
 /// `RELAY_TLS_EXTRA_SANS` adds further names (comma/space separated), e.g. the
 /// LAN address or an alternate public name.
-///
-/// `localhost`, `127.0.0.1` and `::1` are always included so a relay started
-/// without configuration still works for local development.
 pub fn configured_subject_alt_names() -> Vec<String> {
-    let hostname = std::env::var("RELAY_TLS_HOSTNAME")
-        .ok()
-        .map(|h| h.trim().to_string())
-        .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| "localhost".to_string());
-
-    let mut sans = vec![hostname, "127.0.0.1".to_string(), "::1".to_string()];
-
-    if let Ok(extra) = std::env::var("RELAY_TLS_EXTRA_SANS") {
-        for san in extra.split([',', ' ', ';']) {
-            let san = san.trim();
-            if !san.is_empty() && !sans.iter().any(|s| s == san) {
-                sans.push(san.to_string());
-            }
-        }
-    }
-
-    sans
+    TlsParams::from_env().subject_alt_names()
 }
 
-/// Load (or generate) the relay's TLS material and build a TLS 1.3 acceptor.
+/// Load (or generate) the relay's TLS material from the environment.
 pub fn load_tls_context() -> Result<TlsContext, String> {
-    let certs_dir = cert_dir();
+    load_tls_context_with(&TlsParams::from_env())
+}
+
+/// Load (or generate) the relay's TLS material, honouring `params`.
+pub fn load_tls_context_with(params: &TlsParams) -> Result<TlsContext, String> {
+    let certs_dir = params.cert_dir.clone();
     if !certs_dir.exists() {
         std::fs::create_dir_all(&certs_dir).map_err(|e| {
             format!(
@@ -104,7 +170,7 @@ pub fn load_tls_context() -> Result<TlsContext, String> {
             .map_err(|e| format!("Failed to read {}: {e}", key_path.display()))?;
         (cert, key, TlsSource::Provided)
     } else {
-        let subject_alt_names = configured_subject_alt_names();
+        let subject_alt_names = params.subject_alt_names();
         info!(
             "Generating new self-signed TLS certificate in {} with SANs {:?}",
             certs_dir.display(),
@@ -458,7 +524,11 @@ pub fn warn_if_sans_may_not_match(context: &TlsContext) {
     );
 }
 
+// Opts back into `unsafe` for exactly one reason: `std::env::set_var` and
+// `remove_var` are unsafe in edition 2024, and several tests here exist to pin
+// the environment's effect on the certificate.
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};

@@ -53,7 +53,6 @@ pubspec_overrides.yaml
 # ---- Secrets / env ----
 .env
 .env.*
-!.env.example
 *.pem
 *.key
 *.p12
@@ -61,8 +60,12 @@ pubspec_overrides.yaml
 *.keystore
 /secrets/
 
-# ---- Relay runtime state ----
-/services/relay/secrets/
+# The relay is a library hosted by the desktop app, and it writes its HMAC
+# secret, nonce cache and certificate directory under the OS app-data dir
+# (pinned in `apps/desktop/src-tauri/src/relay.rs`). These entries only exist to
+# catch the case where that pinning is missing and the library's own
+# CWD-relative default wins instead.
+**/secrets/hmac_secret
 /services/relay/data/
 /services/relay/certs/
 

@@ -108,6 +108,11 @@ void main() async {
   // Initialize pairing service (loads shared secret from secure storage)
   await pairingService.initialize();
 
+  // Restore the device id the desktop assigned at pairing. Must happen before
+  // anything can send: it is the value stamped into `source_device` on every
+  // `encrypted` envelope, and the hub resolves the shared secret by it.
+  await websocketService.restoreDeviceId();
+
   // Reconnect to the endpoint the last successful connection used.
   websocketService.autoConnect();
 

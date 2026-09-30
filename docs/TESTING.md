@@ -24,20 +24,20 @@ common source of "command not found" / "no such package" in this project.
 
 ```bash
 # repository root
-cargo test -p conduit-protocol     # 266 passed, 0 failed
-cargo test -p relay                # 189 passed, 0 failed
-cargo test -p conduit              # 696 passed, 0 failed
+cargo test -p conduit-protocol     # 275 passed, 0 failed
+cargo test -p conduit-relay        # 187 passed, 0 failed, plus 2 doctests
+cargo test -p conduit              # 724 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
-| `packages/protocol` | `conduit-protocol` | repository root | 266 passed, 0 failed |
-| `services/relay` | `relay` | repository root | 189 passed, 0 failed |
-| `apps/desktop/src-tauri` | `conduit` | repository root | 696 passed, 0 failed |
+| `packages/protocol` | `conduit-protocol` | repository root | 275 passed, 0 failed |
+| `services/relay` | `conduit-relay` | repository root | 187 passed, 0 failed |
+| `apps/desktop/src-tauri` | `conduit` | repository root | 724 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
-[DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem). `relay` and
-`conduit-protocol` do not.
+[DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem).
+`conduit-relay` and `conduit-protocol` do not.
 
 Single test, by name:
 
@@ -57,7 +57,7 @@ Note the crate directory and the `-p` name do not match (`apps/desktop/src-tauri
 ```bash
 # apps/desktop
 npx tsc --noEmit      # typecheck, no emit        -> exit 0
-npm test              # vitest run                -> 216 passed (20 files)
+npm test              # vitest run                -> 222 passed (20 files)
 npm run test:watch    # vitest, interactive
 npm run test:e2e      # playwright test           -> browser shell only
 npm run lint          # eslint src/
@@ -73,7 +73,7 @@ and a typecheck disagree.
 
 ```bash
 # apps/mobile
-flutter test                        # 43 passed
+flutter test                        # 87 passed
 dart analyze                       # 0 errors, 0 warnings (362 infos)
 dart format --output=none --set-exit-if-changed lib test integration_test
 flutter test integration_test       # needs a device or running emulator
@@ -90,13 +90,13 @@ files are currently unformatted.
 .\scripts\lint-all.ps1
 ```
 
-Clippy for all three crates (`conduit`, `relay`, `conduit-protocol`), the three
-Rust test suites, `flutter analyze`, `npx eslint src/` and `vitest`. To run one
-crate's lint on its own:
+Clippy for all three crates (`conduit`, `conduit-relay`, `conduit-protocol`),
+the three Rust test suites, `flutter analyze`, `npx eslint src/` and `vitest`.
+To run one crate's lint on its own:
 
 ```bash
-cargo clippy -p relay            -- -D warnings
-cargo clippy -p conduit-protocol -- -D warnings
+cargo clippy -p conduit-relay     -- -D warnings
+cargo clippy -p conduit-protocol  -- -D warnings
 ```
 
 ### Everything at once
@@ -115,12 +115,12 @@ until the failure in §5 is fixed.
 
 ## 2. What each suite covers
 
-### `conduit-protocol` — 266 tests
+### `conduit-protocol` — 275 tests
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/types.rs` | 211 | Serde round-trips for every message type; optional `protocol_version`; `const` tag serialisation; snake_case vs camelCase field naming; the port constants; the binary frame layout constants; **the 5 schema-sync invariants**; `PROTOCOL.md` content assertions; the mobile port mirror |
-| `src/lib.rs` | 55 | HMAC signing and verification, key derivation with a domain-separated KDF, the replay-protection nonce cache (including cross-restart behaviour) |
+| `src/types.rs` | 215 | Serde round-trips for every message type; optional `protocol_version`; `const` tag serialisation; snake_case vs camelCase field naming; the port constants; the binary frame layout constants; **the 5 schema-sync invariants**; `PROTOCOL.md` content assertions; the mobile port mirror |
+| `src/lib.rs` (`mod hmac`) | 60 | HMAC signing and verification, key derivation with a domain-separated KDF, per-device route-key derivation and the `RouteKeyring` (including a key id that disagrees with the sender, a key belonging to another device, and forgetting an unpaired device), and the replay-protection nonce cache (including cross-restart behaviour) |
 
 The schema-sync tests are the load-bearing ones:
 
@@ -146,31 +146,49 @@ example advertises `"wss_port": 9531`, and that
 `kLanWssPort = 9531` / `kLanWsPort = 9527` and hard-codes neither number in any
 call site.
 
-### `relay` — 189 tests
+### `conduit-relay` — 187 tests, plus 2 doctests
+
+The crate is a library with no `src/main.rs` and no `[[bin]]`. Its tests live in
+two places: `src/suite.rs` is the whole in-crate suite, and `src/tls.rs` keeps
+its own `mod tests` beside the code it exercises. The other modules
+(`config.rs`, `connection.rs`, `route.rs`, `state.rs`, `health.rs`,
+`metrics.rs`, `limits.rs`) are covered through the suite rather than in place.
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/main.rs` | 154 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification and the key-rotation window; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and their bearer tokens; the config parser and its fail-closed defaults |
-| `src/tls.rs` | 35 | Self-signed certificate generation and SAN handling; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening |
-| `src/hmac.rs` | 0 | Thin wrapper; covered through `main.rs` |
+| `src/suite.rs` | 152 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; and an end-to-end WebSocket lifecycle against a real listener |
+| `src/tls.rs` | 35 | Self-signed certificate generation and SAN handling; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening; SPKI extraction cross-checked against `openssl` |
 
-### `conduit` (desktop Rust) — 696 tests, all passing
+One of the 36 `#[test]` functions in `tls.rs` is `#[cfg(unix)]`, so a Windows run
+reports 35. There are 2 doctests in `lib.rs`'s module docs.
+
+The suite lives in one file because it is written against the relay as a whole
+rather than module by module; the doc comment at the top of `suite.rs` says so.
+`tls.rs` is the exception. The desktop crate is `conduit-relay`'s only consumer,
+and it hosts the relay in-process — `src/relay.rs` has its own 16 tests for the
+`Overrides` it builds and the `RouteKeys` it implements — but those live in the
+`conduit` crate, not here, so nothing in `conduit-relay`'s own suite exercises
+the crate the way that consumer does. See §3.
+
+### `conduit` (desktop Rust) — 724 tests, all passing
 
 Test count per module, as reported by `cargo test -p conduit -- --list`
-(696 total):
+(724 total):
 
 | Module | Tests | What it protects |
 |---|---|---|
-| `src/server/` | 184 | 143 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 41 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
-| `src/commands/` | 122 | Every Tauri command, via `tauri::test::mock_builder` |
+| `src/server/` | 192 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 47 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
+| `src/commands/` | 123 | Every Tauri command, via `tauri::test::mock_builder` |
 | `src/automation.rs` | 102 | Rule evaluation, the shell allowlist gate, `trusted_source_only`, trigger dispatch |
 | `src/encryption.rs` | 86 | Key resolution across keyring and 0600 key file, secret reuse, migration back into a recovered keyring |
 | `src/storage.rs` | 70 | SQLCipher persistence, migrations, settings round-trips, the keyring-loss data path |
 | `src/file_transfer.rs` | 53 | Chunking, path-traversal rejection, download-path validation |
 | `src/security.rs` | 46 | Rate limiters, file-request validation, `allowed_commands` parsing (fail-closed) |
+| `src/relay.rs` | 16 | The `RelayHost`: building `conduit_relay::Overrides` from the desktop settings, resolving the keyring-backed relay token and the desktop's own route key, and the `RouteKeys` implementation |
 | `src/main.rs` → `mod integration_tests` | 13 | Bind address / port invariants |
 | `src/discovery.rs` | 9 | mDNS advertisement contents |
 | `src/sync.rs` | 6 | Sync engine state |
+| `src/audio.rs` | 3 | Audio stream and playback state |
 | `src/error.rs` | 3 | Error mapping |
 | `src/tray.rs` | 2 | Tray setup |
 
@@ -180,14 +198,19 @@ Test count per module, as reported by `cargo test -p conduit -- --list`
 > the crate's public API surface and runs in the same binary. Nothing in this
 > repository is a real Cargo integration test.
 
-### Desktop frontend — vitest, 216 tests in 20 files
+### Desktop frontend — vitest, 222 tests in 20 files
 
 | Location | Files | Covers |
 |---|---|---|
-| `src/components/__tests__/` | 11 | `ContextMenu`, `EmptyState`, `FileCard`, `Onboarding`, `SearchBar`, `ShortcutsOverlay`, `Skeleton`, `StatusBadge`, `UnifiedSurfaces`, `WhatsNewDialog` |
+| `src/components/__tests__/` | 10 | `ContextMenu`, `EmptyState`, `FileCard`, `Onboarding`, `SearchBar`, `ShortcutsOverlay`, `Skeleton`, `StatusBadge`, `UnifiedSurfaces`, `WhatsNewDialog` |
 | `src/components/settings/__tests__/` | 1 | `Settings` |
 | `src/lib/__tests__/` | 2 | `toast`, `utils` |
-| `src/__tests__/hooks/` | 6 | `useAutomation`, `useClipboard`, `useDevices`, `useDiscovery`, `useEncryption`, `useSearch` |
+| `src/__tests__/hooks/` | 7 | `useAutomation`, `useClipboard`, `useDevices`, `useDiscovery`, `useEncryption`, `useSearch`, `useWebSocket` |
+
+The per-file split of the 222 is not recorded here: it is a `vitest` reporter
+figure and it moves every time a `it()` block is added, so a hand-maintained
+table of it would be wrong within a week. The file counts above are the useful
+part and they are the ones that describe where coverage lives.
 
 Config: `apps/desktop/vitest.config.ts` — `jsdom`, `globals: true`,
 `setupFiles: ./src/__tests__/setup.ts` (one line: imports
@@ -219,20 +242,24 @@ project, `chromium`. Its own header comment states the constraint:
 > Tauri IPC calls are not available in the browser environment, so the app
 > must gracefully degrade when `invoke()` fails.
 
-### Mobile — `flutter test`, 43 tests in 19 files
+### Mobile — `flutter test`, 87 tests in 20 files
 
-All under `apps/mobile/test/`, all widget or theme tests:
+All under `apps/mobile/test/`:
 
 | Location | Files |
 |---|---|
 | `test/screens/` | 13 — one per screen (`automation_rules`, `calls`, `clipboard`, `discovery`, `files`, `home`, `messages`, `notifications`, `pairing`, `remote_input`, `screen_mirror`, `search`, `settings`) |
 | `test/widgets/` | 5 — `ContextMenu`, `EmptyState`, `SearchBar`, `Skeleton`, `StatusBadge` |
+| `test/services/` | 1 — `relay_route` |
 | `test/theme/` | 1 — `theme_provider` |
 
-**No test in `test/` touches `lib/services/` or `lib/models/`.** The service
-layer — the layer that actually talks to the WebSocket, the database, the
-keyring, the camera and the OS — is untested at the unit level. Those paths are
-only reached by the integration suite, which needs a device.
+Most of what `flutter test` runs is still widget and theme tests. One service is
+covered — `test/services/relay_route_test.dart`, covering the per-device
+route-key derivation and the binary frame v2 codec — but the rest of the service
+layer is not: the services that actually talk to the WebSocket, the database,
+the keyring, the camera and the OS are still untested at the unit level, as is
+all of `lib/models/`. Those paths are only reached by the integration suite,
+which needs a device.
 
 ---
 
@@ -246,7 +273,7 @@ Stated without softening:
 | "The frontend is tested against the backend" | **No test exercises real Tauri IPC.** `__mocks__/tauri.ts` is a 3-line stub whose `invoke` is a bare `vi.fn()` returning `undefined`. Any test that depends on a command's real return value is either asserting on `undefined` or mocking the return itself. |
 | "End-to-end tested" | **The Playwright suite runs in a plain browser and cannot reach Tauri at all.** It exercises layout, navigation, keyboard handling and the app's behaviour when `invoke()` rejects. It proves the shell renders and degrades. It does not prove a single Rust command works. |
 | "The protocol is consistent across languages" | **There is no cross-language conformance test.** Nothing verifies that `types.rs`, `websocket.ts` and `protocol.dart` agree. The `conduit-protocol` tests link `types.rs` to `schema.json` and check a handful of *textual* invariants in the Dart source (two port constants, no hard-coded port literals). Beyond that, the only link between the three languages is two codegen invocations and a developer's discipline. |
-| "The relay is tested against a real client" | **No.** The relay's tests use `tokio-test` and synthetic frames. There is no round-trip of a real binary frame produced by a real client. |
+| "The relay is tested against a real client" | **No.** The relay's tests build their frames by hand — synthetic input, against a real listener the suite starts itself. There is no round-trip of a frame produced by the real desktop encoder or the real mobile encoder. `tokio-test` is not a dependency of this crate. |
 | "Certificate pinning is tested" | **No.** No test covers the SPKI pin computation on either client. And `docs/relay-tls.md` records that the mobile client still hashes the whole DER certificate while the documented pin is over the SPKI — so mobile pinning does not work as specified. |
 | "`dart format` is clean" | **No.** 63 of 74 Dart files are unformatted. `scripts/lint-all.ps1` and the CI `flutter` job both run the check, but non-blocking (`-Optional` / `continue-on-error: true`), so nothing fails on it. |
 
@@ -261,7 +288,7 @@ tests stop.
 
 It is worth being precise about this, because the coverage above is not uniform.
 
-### Every `server/handlers/*.rs` has a populated test module — 143 tests
+### Every `server/handlers/*.rs` has a populated test module — 145 tests
 
 All eight files under `apps/desktop/src-tauri/src/server/handlers/` carry a
 `mod tests` with real tests:
@@ -272,7 +299,7 @@ All eight files under `apps/desktop/src-tauri/src/server/handlers/` carry a
 | `remote_input.rs` | 32 |
 | `auto_rules.rs` | 18 |
 | `files.rs` | 18 |
-| `pairing.rs` | 17 |
+| `pairing.rs` | 19 |
 | `mod.rs` | 11 |
 | `notifications.rs` | 9 |
 | `audio.rs` | 7 |
@@ -445,12 +472,12 @@ Ordered by the risk each one leaves uncovered. All are also tracked in
 
 | # | Gap | Why it ranks here |
 |---|---|---|
-| 1 | **`src/hooks/useWebSocket.tsx` and `useMessageHandlers.ts` have no tests** | These are the desktop's client protocol dispatcher — the direct counterpart to the Rust `server/handlers/*` modules that now have 143 tests. The Rust side is gated by the dispatcher; the TypeScript side of the same dispatch path is entirely untested. A malformed or mistyped message handler fails silently in the UI. |
+| 1 | **`src/hooks/useMessageHandlers.ts` has no tests** | This is the desktop's client protocol dispatcher — the direct counterpart to the Rust `server/handlers/*` modules that now have 145 tests. `useWebSocket.tsx` is covered by `src/__tests__/hooks/useWebSocket.test.tsx`, but the handler module next to it is not, so a malformed or mistyped message handler can still fail silently in the UI. |
 | 2 | **No cross-language conformance test** (`types.rs` ↔ `websocket.ts` ↔ `protocol.dart`) | The only guarantee is codegen discipline. The `codegen` CI job regenerates and runs `git diff --exit-code`, which catches a stale artifact; a real conformance suite that validates the runtime behaviour of both generated clients is still missing. |
-| 3 | **No test exercises real Tauri IPC** | `__mocks__/tauri.ts` returns `undefined` for every command. A richer mock — or a Tauri-driver-based test against a built app — would cover the 122 command tests' actual return shapes. |
-| 4 | **No tests for mobile `lib/services/` (14 files) or `lib/models/` (5 files)** | Zero unit tests. `flutter test` covers 13 screens, 14 widgets and the theme — presentation only. |
+| 3 | **No test exercises real Tauri IPC** | `__mocks__/tauri.ts` returns `undefined` for every command. A richer mock — or a Tauri-driver-based test against a built app — would cover the 123 command tests' actual return shapes. |
+| 4 | **Almost no tests for mobile `lib/services/` (14 files) or `lib/models/` (5 files)** | `test/services/relay_route_test.dart` covers one service; the other 13 and all 5 models have no unit tests. The bulk of `flutter test` is still 13 screens, 5 widget suites and the theme — presentation only. |
 | 5 | **No relay binary-frame round-trip against a real client** | The relay's frame tests use synthetic input. A frame produced by the real desktop encoder, or by the real mobile encoder, and relayed end to end is untested. |
 | 6 | **No certificate-pinning tests** | The SPKI pin is not computed or checked by any test, and `docs/relay-tls.md` records that the mobile client hashes the wrong thing. A test pinning the SPKI computation would have caught it. |
-| 7 | **No Rust integration tests** (no `tests/` directory) | Every Rust test is an in-crate unit test. Crate-level behaviour — the public API as a consumer sees it, and the `conduit-protocol` → `conduit` / `relay` boundary — has no coverage. |
+| 7 | **No Rust integration tests** (no `tests/` directory) | Every Rust test is an in-crate unit test. Crate-level behaviour — the public API as a consumer sees it, and the `conduit-protocol` → `conduit` / `conduit-relay` boundary — has no coverage. |
 | 8 | **Playwright cannot reach Tauri** | Structural, not fixable without a Tauri-aware harness. Documented so nobody reads a green Playwright run as backend coverage. |
 | 9 | **`dart format` is checked but non-blocking; 63 of 74 files unformatted** | Both `scripts/lint-all.ps1` and the CI `flutter` job run the check and neither fails on it. Mechanical to fix, but until one does, every Dart diff carries unrelated churn. |

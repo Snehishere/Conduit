@@ -2,7 +2,7 @@ mod clipboard;
 mod file;
 mod notifications;
 mod pairing;
-mod settings;
+pub mod settings;
 mod system;
 
 // Re-export all types and functions at the `commands` level so
@@ -50,6 +50,9 @@ pub(crate) mod test_helpers {
             .expect("failed to set WAL");
         crate::storage::run_migrations(&mut db).expect("failed to run migrations");
         let storage = Arc::new(crate::storage::Storage::from_connection(db));
+        // Shared with the relay host, which needs the same registry to resolve
+        // route keys, so clone before the handle is moved into `AppState`.
+        let relay_storage = storage.clone();
 
         Arc::new(AppState {
             file_engine: Arc::new(
@@ -70,6 +73,10 @@ pub(crate) mod test_helpers {
                 crate::automation::AutomationEngine::new(),
             )),
             audio_stream: Arc::new(crate::audio::AudioStream::new()),
+            relay_host: Arc::new(crate::relay::RelayHost::new(
+                relay_storage,
+                "test-hub-device".to_string(),
+            )),
         })
     }
 
@@ -85,6 +92,9 @@ pub(crate) mod test_helpers {
             .expect("failed to set WAL");
         crate::storage::run_migrations(&mut db).expect("failed to run migrations");
         let storage = Arc::new(crate::storage::Storage::from_connection(db));
+        // Shared with the relay host, which needs the same registry to resolve
+        // route keys, so clone before the handle is moved into `AppState`.
+        let relay_storage = storage.clone();
 
         Arc::new(AppState {
             file_engine: Arc::new(
@@ -106,6 +116,10 @@ pub(crate) mod test_helpers {
                 crate::automation::AutomationEngine::new(),
             )),
             audio_stream: Arc::new(crate::audio::AudioStream::new()),
+            relay_host: Arc::new(crate::relay::RelayHost::new(
+                relay_storage,
+                "test-hub-device".to_string(),
+            )),
         })
     }
 

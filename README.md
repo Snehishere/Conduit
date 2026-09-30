@@ -5,10 +5,10 @@ clipboard between them, transfers files in both directions, relays SMS threads
 and notifications, forwards calls, mirrors the phone's screen onto the
 desktop, acts as a remote trackpad and keyboard, and runs trigger-to-action
 automation. Transport is a local WebSocket hub on the desktop with mDNS
-discovery, so a phone on the same network finds the desktop on its own. An
-optional relay is included that you can host yourself, for when the two devices
-are not on the same network. There is no account system, no hosted service and
-no telemetry.
+discovery, so a phone on the same network finds the desktop on its own. A
+relay is built into the desktop app and is on by default, for when the two
+devices are not on the same network. There is no account system, no hosted
+service and no telemetry.
 
 ## Status
 
@@ -33,29 +33,19 @@ package for any of them, so building from source is the only supported path.
   the viewer.
 - Trigger-to-action automation rules, held on the desktop, with a
   deny-by-default shell command allowlist.
-- The relay server itself, which builds, runs and passes its tests. It is
-  reachable and its routing logic is implemented; see the two items below for
-  why a client cannot use it yet.
+- The relay, which runs inside the desktop app as a background task. It is on
+  by default, both clients sign their routes with a per-device key, and it
+  forwards opaque envelopes without ever seeing plaintext.
+- The relay certificate, generated into the app data directory from the
+  `relay_hostname` setting, with the SPKI pin published on a loopback-only
+  health port.
 
 ### What is not finished
 
-- **The optional relay client is compiled but not enabled.** The desktop's
-  relay client exists in
-  `apps/desktop/src-tauri/src/server/mod.rs` (`WsServer::spawn_relay_client`),
-  but its only call site is commented out in
-  `apps/desktop/src-tauri/src/main.rs`, with the note "Disabled cloud relay
-  client to keep the app strictly local". The `relay_url` setting is persisted
-  but never dialled, so enabling relay routing from the desktop is a code
-  change rather than a configuration change.
-- **The mobile client is not yet updated for the current relay wire format.**
-  The relay accepts only binary frame version `0x02`
-  (`BINARY_FRAME_VERSION` in `packages/protocol/src/types.rs`), but
-  `apps/mobile/lib/services/websocket_service.dart` still emits the superseded
-  `0x01` prefix. A phone therefore cannot complete a relayed connection, and
-  relay routing does not work from the phone either.
 - **Mobile certificate pinning does not work as specified.** The mobile client
   hashes the whole DER certificate while the relay publishes an SPKI pin, so
-  the two can never match. The desktop has no pin configuration target. See
+  the two can never match. The desktop has no pin configuration target. This is
+  now live rather than hypothetical, because the relay runs by default. See
   [`docs/relay-tls.md`](docs/relay-tls.md).
 - **A fresh clone cannot build the desktop app.** See
   [The vendored OpenSSL requirement](#the-vendored-openssl-requirement).
@@ -175,8 +165,12 @@ device or a running emulator.
   and dispatches the inner payload, and a relay verifies signatures on messages
   and routes them. Traffic is protected from a passive observer on your local
   network and from tampering in transit. It is not protected from the desktop
-  itself, nor from an operator who controls a relay. The status bar reports
-  this as "Not E2E". See [`SECURITY.md`](SECURITY.md) and
+  itself, and the desktop is the only place the key exists — there is no
+  third-party relay operator to worry about, because the relay runs inside the
+  desktop process. The cost of that arrangement is that the relay shares a
+  process with the hub rather than being isolated from it: a bug or a
+  compromise in the relay path is a bug or a compromise in the desktop app. The
+  status bar reports this as "Not E2E". See [`SECURITY.md`](SECURITY.md) and
   [ADR-0007](docs/decisions/0007-refuse-to-ship-end-to-end-encryption-claims.md).
 - Desktop data is held in a SQLCipher-encrypted SQLite database. The database
   key is stored in the OS keyring under service `conduit_app` and account
@@ -187,20 +181,21 @@ device or a running emulator.
   database and the configuration; the threat model says so in
   [`SECURITY.md`](SECURITY.md).
 
-### Optional relay
+### The relay
 
-- A self-hostable relay, crate `relay`, shipped with a `Dockerfile` and a
-  compose file. Conduit works on a local network without it.
-- An authentication handshake, `relay_route` HMAC verification with a
-  domain-separated key and a key rotation window, and a replay-protection
-  nonce cache.
+- The relay, crate `conduit-relay`, is a library the desktop app runs in-process
+  as a background task. There is nothing to deploy and no separate service; it
+  is on by default and Conduit works on a local network without it.
+- An authentication handshake, and `relay_route` HMAC verification under a
+  per-device key derived from that device's pairing secret, so a device can sign
+  for itself and for nothing else. A re-pair rotates the key automatically, so
+  there is no key rotation window. A replay-protection nonce cache guards the
+  rest.
 - Binary frame version 2 with a versioned prefix. The relay rejects the
   superseded version 1 prefix rather than guessing.
-- Health, metrics and certificate-pin HTTP endpoints, behind bearer tokens.
-- *Not yet working from a client.* Both the desktop and the mobile relay
-  clients are incomplete for the reasons given under
-  [Status](#status). Nothing in this list should be read as a working
-  end-to-end path today.
+- Health, metrics and certificate-pin HTTP endpoints on a loopback-only port,
+  `/health` and `/` behind a bearer token.
+- The relay forwards opaque envelopes only. It never sees plaintext.
 
 ## Getting started
 
@@ -208,10 +203,9 @@ device or a running emulator.
 
 | Tool | Version | Needed for | Notes |
 |---|---|---|---|
-| Rust | 1.98, pinned by `rust-toolchain.toml` | `conduit`, `relay` | Both are edition 2024. `conduit-protocol` is edition 2021. |
+| Rust | 1.98, pinned by `rust-toolchain.toml` | `conduit`, `conduit-relay` | Both are edition 2024. `conduit-protocol` is edition 2021. |
 | Node.js | 24, pinned by `.nvmrc` | desktop frontend, code generation | npm 11 or newer. `apps/desktop/.npmrc` sets `legacy-peer-deps=true`, so use `npm ci`. |
 | Flutter | 3.47 | `apps/mobile` | With Dart 3.13. `pubspec.yaml` declares `sdk: '>=3.12.0 <4.0.0'`. |
-| Docker | any recent release | the relay container only | Not needed for the protocol crate, the relay binary, the desktop app or the mobile app. |
 | **Vendored OpenSSL** | **3.5.8, win64** | **the desktop crate only** | **Blocking. See below.** |
 
 ### The vendored OpenSSL requirement
@@ -259,8 +253,8 @@ point at a Windows-only layout and the desktop crate has no working build
 path. For that reason the CI workflow runs the desktop crate's clippy, test
 and build steps as non-blocking and emits a warning instead.
 
-`conduit-protocol` and `relay` do not need any of this. Neither depends on
-`rusqlite` or SQLCipher, and both build with no vendored dependencies.
+`conduit-protocol` and `conduit-relay` do not need any of this. Neither depends
+on `rusqlite` or SQLCipher, and both build with no vendored dependencies.
 
 ### Build and run
 
@@ -276,7 +270,7 @@ the second most common source of build friction:
 |---|---|
 | `packages/protocol` | `conduit-protocol` |
 | `apps/desktop/src-tauri` | `conduit` |
-| `services/relay` | `relay` |
+| `services/relay` | `conduit-relay` |
 
 Always pass `-p`. `cargo test -p src-tauri` will not resolve, and neither will
 `cargo test -p desktop`.
@@ -289,19 +283,18 @@ cargo build -p conduit-protocol
 cargo test  -p conduit-protocol
 ```
 
-**Relay** (optional):
+**Relay library** (no binary):
 
 ```bash
 # repository root
-cargo build -p relay
-cargo test  -p relay
-cargo run   -p relay
+cargo build -p conduit-relay
+cargo test  -p conduit-relay
 ```
 
-The relay reads its configuration from process environment variables only. A
-bare `cargo run -p relay` does not read `.env`; that is `docker compose`'s
-job. For a local run, export the variables yourself, or use compose.
-[`.env.example`](.env.example) is the annotated list of all of them.
+There is no `cargo run` for the relay: it is a library, and the desktop app
+hosts it as a background task in
+`apps/desktop/src-tauri/src/relay.rs`. The desktop configures it from its own
+Settings, not from environment variables.
 
 **Desktop app** (requires the vendored OpenSSL above):
 
@@ -350,11 +343,10 @@ never be hand-edited. See [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 | `packages/protocol` | `conduit-protocol` (Rust, edition 2021) | The shared wire-format source of truth. `src/types.rs` holds the message types, the port constants and the binary frame constants; `src/lib.rs` holds HMAC signing, key derivation and the replay nonce cache; `schema.json` is hand-maintained and held in sync with the types by five tests; `PROTOCOL.md` is the normative prose specification. Library only. |
 | `apps/desktop` | `conduit-desktop` (npm) and `conduit` (Rust, in `src-tauri/`) | The Tauri v2 desktop app. `src/` is React 19, TypeScript, Vite 8 and Tailwind 4. `src-tauri/` is the Rust backend and owns the local WebSocket hub, SQLCipher storage, mDNS advertisement, automation, file transfer, screen mirroring, remote input and audio. |
 | `apps/mobile` | `conduit` (Flutter) | The Flutter app for Android and iOS. Owns mDNS browsing, the WebSocket client, secure storage, on-device QR scanning, screen capture and the SMS, notification and call bridges. |
-| `services/relay` | `relay` (Rust, edition 2024) | The optional self-hostable relay: the router, the authentication handshake, `relay_route` verification, binary frame v2, TLS certificate generation, and the health, metrics and pin endpoints. Ships with a `Dockerfile`. |
+| `services/relay` | `conduit-relay` (Rust, edition 2024) | The relay, as a library: the router, the authentication handshake, `relay_route` verification under per-device keys, binary frame v2, TLS certificate generation, and the health, metrics and pin endpoints. No binary target; the desktop app hosts it in-process as a background task (`apps/desktop/src-tauri/src/relay.rs`). |
 | `scripts` | — | PowerShell build and lint wrappers, the JavaScript code generators, the certificate pin helper, and `scripts/icons/`, the Python brand-asset generator. |
 | `assets/brand` | — | The brand source of truth. `conduit.mark.json` is rendered into every icon, the logo component and the Dart logo widget. |
 | `docs` | — | `ARCHITECTURE.md`, `DEVELOPMENT.md`, `TESTING.md`, `relay-tls.md` and `decisions/`. |
-| `docker-compose.yml`, `.env.example` | — | Relay deployment and its annotated configuration. |
 | `Cargo.lock` | — | The only lockfile. Nested ones are forbidden by `.gitignore` (`**/Cargo.lock` with `!/Cargo.lock`). |
 
 Both Rust clients bind to the wire format by path dependency, and both
@@ -372,9 +364,10 @@ The port constants live in `packages/protocol/src/types.rs` (`LAN_WS_PORT`,
 |---|---|---|---|
 | **9527** | `ws://`, plaintext | desktop | The local hub, and the desktop's own diagnostic path. |
 | **9531** | `wss://`, TLS | desktop | **The only port a LAN client dials.** |
-| 9528 | `ws://`, plaintext | relay | Off by default (`RELAY_ENABLE_PLAIN_WS=false`). Local testing. |
-| 9529 | `wss://`, TLS | relay | The relay's WebSocket listener. |
-| 9530 | HTTP | relay | `/healthz`, `/health`, `/metrics`, `/pin`. Bound to loopback in the compose file. |
+| 9528 | — | — | Nothing listens here. It was the relay's plaintext listener and is now an unused library default (`RELAY_WS_PORT`); the desktop deliberately does not open it. |
+| **9531** | `ws://`, plaintext | relay, loopback only | The relay's plaintext listener. It is how the desktop joins the relay it hosts, so the desktop appears in the routing table without a certificate check (`DEFAULT_RELAY_LOCAL_PORT`). Nothing off the machine can reach it. |
+| 9529 | `wss://`, TLS | relay | The relay's WebSocket listener. The port a phone on another network dials, via `relay_port`. |
+| 9530 | HTTP | relay | `/healthz`, `/health`, `/metrics`, `/pin`. Loopback-only by construction, so the unauthenticated `/pin` and `/healthz` are not exposed to the network. |
 
 **Rule: never dial `wss://` on 9527, and never silently downgrade a LAN peer to
 `ws://`.**
@@ -387,42 +380,33 @@ hard-codes either number. The desktop binds `0.0.0.0:9527` and serves TLS
 separately on 9531, with a test pinning the bind address to the plaintext
 port.
 
-## Self-hosting the relay
+## The relay
 
-The relay is optional. Conduit works on a local network without it.
+The relay runs inside the desktop app as a background task
+(`apps/desktop/src-tauri/src/relay.rs`). It is **on by default**, it is not a
+deployment, and there is nothing to install: no container, no compose file, no
+service to keep alive. It carries traffic between two devices that are not on
+the same network, and it forwards only opaque envelopes, so it never sees
+plaintext. A desktop on a local network works perfectly well without it, which
+is why the toggle is there.
 
-```bash
-cp .env.example .env          # then set RELAY_TOKEN
-mkdir -p secrets
-openssl rand -hex 32 > secrets/hmac_secret
-chmod 600 secrets/hmac_secret
-docker compose up -d --build
-```
+- **Turning it off** is Settings → **Other Networks**. The other settings there
+  are `relay_port` (9529), `relay_health_port` (9530) and `relay_hostname`.
+- **The bearer token is not a setting.** It is generated once and kept in the OS
+  keyring under account `relay_token`, beside the database key and the X25519
+  identity. Never type it anywhere; a phone is told the relay's details by
+  pairing, not by copying a token out of a file.
+- **The port has to be reachable.** A phone on another network cannot reach
+  9529 on your desktop's LAN address. You need a router port-forward, a VPN, or
+  a tunnel — and **Conduit does not configure any of that for you.** It is the
+  one part of the relay path that is your problem.
+- **A relay restart is a desktop restart**, because the relay is a task inside
+  the app.
+- **The relay never sees plaintext.** It routes already-encrypted envelopes
+  between two peer connections.
 
-`RELAY_TOKEN` is required, and the relay refuses to start without it. The
-relay fails closed on a missing master secret rather than generating a
-throwaway one, and it refuses to start if the certificate and key do not
-belong together.
-
-**Persist the volumes.** `docker-compose.yml` mounts three, because every path
-the relay writes to is state that would otherwise be destroyed on the next
-`up`, `pull` or image rebuild.
-
-| Mount | What it holds | What is lost without it |
-|---|---|---|
-| `./secrets:/data/secrets` | the master HMAC secret | A fresh secret invalidates every deployed key and certificate pin. |
-| `relay-nonces:/data` | the replay-protection nonce cache at `/data/nonces.json`, flushed every 30 seconds | The cross-restart replay guarantee does not hold, so a message captured inside the 30-second freshness window can be replayed once after every restart. |
-| `relay-certs:/data/certs` | `cert.pem` and `key.pem` | The relay regenerates a self-signed certificate, which changes the SPKI pin every client has to verify. |
-
-Self-signed certificates default to SANs of `localhost`, `127.0.0.1` and
-`::1`. That is the most common cause of a relay that works locally and fails
-everywhere else: set `RELAY_TLS_HOSTNAME` to the name clients actually use
-(and `RELAY_TLS_EXTRA_SANS` for alternates) and restart the relay to
-regenerate the certificate.
-
-[`docs/relay-tls.md`](docs/relay-tls.md) is the full runbook: the pin
-algorithm, bringing your own certificate, ACME, renewal, and distributing the
-pin to clients.
+See [`docs/relay-tls.md`](docs/relay-tls.md) for how the certificate and the
+pin work.
 
 ## Cost and hosting
 
@@ -453,13 +437,13 @@ and `flutter` commands from their own component directory.
 
 | Suite | Working directory | Command | Current result |
 |---|---|---|---|
-| Relay | repository root | `cargo test -p relay` | 189 passed, 0 failed |
-| Protocol | repository root | `cargo test -p conduit-protocol` | 266 passed, 0 failed |
-| Desktop Rust | repository root | `cargo test -p conduit` | 696 passed, 0 failed. Needs the vendored OpenSSL. |
+| Relay | repository root | `cargo test -p conduit-relay` | 187 passed, 0 failed, plus 2 doctests |
+| Protocol | repository root | `cargo test -p conduit-protocol` | 275 passed, 0 failed |
+| Desktop Rust | repository root | `cargo test -p conduit` | 724 passed, 0 failed. Needs the vendored OpenSSL. |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
-| Desktop unit | `apps/desktop` | `npm test` | 216 passed, 20 files |
+| Desktop unit | `apps/desktop` | `npm test` | 222 passed, 20 files |
 | Desktop e2e | `apps/desktop` | `npm run test:e2e` | Playwright against a plain browser. Tauri IPC is unavailable, so it covers the shell and nothing behind it. |
-| Mobile unit | `apps/mobile` | `flutter test` | 43 passed |
+| Mobile unit | `apps/mobile` | `flutter test` | 87 passed |
 | Mobile analyze | `apps/mobile` | `dart analyze --fatal-infos` | 362 lint infos, 0 errors, 0 warnings. Exits non-zero because `--fatal-infos` treats infos as fatal, which is why the CI step is non-blocking. Plain `dart analyze` exits 0. |
 | Rust format | repository root | `cargo fmt --all -- --check` | clean |
 | Mobile integration | `apps/mobile` | `flutter test integration_test` | needs a connected device or a running emulator |
@@ -518,5 +502,6 @@ large ones.
 Conduit is released under the MIT licence. The full text is in
 [`LICENSE`](LICENSE).
 
-Only `conduit-protocol` declares `license = "MIT"` in its crate manifest so
-far; the `conduit` and `relay` manifests do not yet carry a `license` field.
+Only `conduit-protocol` and `conduit-relay` declare `license = "MIT"` in their
+crate manifests so far; the `conduit` manifest does not yet carry a `license`
+field.

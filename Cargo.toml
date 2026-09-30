@@ -14,6 +14,17 @@ members = [
 # conduit-protocol path dependency.
 # .gitignore enforces this: `**/Cargo.lock` with `!/Cargo.lock`.
 # See docs/decisions/0001-single-cargo-lockfile-and-workspace-dependencies.md
+#
+# The three crates are two products, not three services:
+#
+#   conduit-protocol  the wire format, shared by both sides
+#   conduit           the desktop app (bin), and the hub
+#   conduit-relay     a LIBRARY the desktop app runs in-process
+#
+# `conduit-relay` has no binary target and no deployment story: the relay is a
+# background task inside the desktop app, so there is no second way to run it
+# and no way to end up with two deployments disagreeing about ports, secrets or
+# certificates. See `services/relay/src/lib.rs` and `service::RelayService`.
 
 [workspace.dependencies]
 # Shared across all three crates
@@ -42,3 +53,15 @@ tokio-rustls = "0.26"
 #   rcgen                           : relay 0.13  vs desktop 0.14
 #   sha2                            : proto 0.10  vs desktop 0.11
 #   thiserror                       : proto 1     vs desktop 2
+#
+# That list is incomplete. The lockfile also duplicates `hmac` (0.12 + 0.13),
+# `digest`, `block-buffer`, `crypto-common`, `sha1`, `rand_core`, `getrandom`
+# (three copies), `base64` (three copies), `dirs` 6 + 7, `pem`, `nom` and
+# `bitflags` — and it carries BOTH `ring` and `aws-lc-rs` even though only
+# `ring` is used. `hmac`, `sha2` and `rand` produce Conduit's wire signatures, so
+# the crypto skew is arguably more consequential than the WebSocket skew above.
+#
+# NOTE: now that `conduit-relay` is a library inside the desktop app rather
+# than a separate process, the tungstenite skew is an internal duplication in one
+# binary rather than an interop risk between two programs. It still needs
+# converging; the reason changed, not the work.
