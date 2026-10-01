@@ -41,6 +41,19 @@ pub use types::*;
 ///
 /// Single implementation used by the relay and the desktop app so signing
 /// and verification can never drift between binaries.
+///
+/// Replay protection lives on [`NonceCache`], which is scoped per
+/// *authenticated* device id. There is deliberately no unscoped
+/// `check_replay(map)` free function: it took one shared map under one global
+/// cap, so a single client reaching the cap evicted every other client's
+/// replay protection. That API is gone, and this compile-fail example keeps
+/// it from coming back:
+///
+/// ```compile_fail
+/// use conduit_protocol::hmac::check_replay;
+/// let mut shared = std::collections::HashMap::new();
+/// let _ = check_replay(0, "nonce", &mut shared);
+/// ```
 pub mod hmac {
     use hmac::{Hmac, Mac};
     use serde_json::Value;
@@ -51,7 +64,15 @@ pub mod hmac {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    /// Maximum nonces retained in the replay cache (process-wide ceiling).
+    /// Best-effort process-wide ceiling on retained nonces.
+    ///
+    /// The ceiling is enforced only against devices that have filled their
+    /// own [`MAX_NONCES_PER_DEVICE`] quota. A device still under quota has no
+    /// slack to give: evicting its in-window nonces would destroy exactly the
+    /// replay protection the per-device quota exists to guarantee, so when
+    /// every device is under quota this ceiling yields. The hard bound that
+    /// remains is one quota per registered device — a count the relay's own
+    /// device registry keeps small — not [`MAX_NONCES`].
     pub const MAX_NONCES: usize = 10_000;
 
     /// Maximum nonces retained for a **single** authenticated device.
@@ -338,52 +359,6 @@ pub mod hmac {
     //  Replay protection
     // =====================================================================
 
-    /// Accept a fresh timestamp+nonce (within clock-skew window) exactly once.
-    ///
-    /// Unscoped single-map form retained for callers that keep one map per
-    /// device. Prefer [`NonceCache`], which scopes by device id and never
-    /// clears wholesale.
-    pub fn check_replay(
-        timestamp: i64,
-        nonce: &str,
-        nonces: &mut std::collections::HashMap<String, i64>,
-    ) -> bool {
-        let now = now_millis();
-        let age = now - timestamp;
-        if !(-5_000..=30_000).contains(&age) {
-            return false;
-        }
-
-        let nonce_key = nonce.to_string();
-        if nonces.contains_key(&nonce_key) {
-            return false;
-        }
-
-        if nonces.len() >= MAX_NONCES {
-            // Prune what the freshness cutoff allows...
-            let cutoff = now - 60_000;
-            nonces.retain(|_, ts| *ts > cutoff);
-            // ...then evict oldest-first until back under the cap. A full
-            // `clear()` here would let any client that can reach the cap
-            // instantly re-enable replay for every nonce ever accepted.
-            while nonces.len() >= MAX_NONCES {
-                let oldest = nonces
-                    .iter()
-                    .min_by_key(|(_, ts)| **ts)
-                    .map(|(k, _)| k.clone());
-                match oldest {
-                    Some(k) => {
-                        nonces.remove(&k);
-                    }
-                    None => break,
-                }
-            }
-        }
-
-        nonces.insert(nonce_key, now);
-        true
-    }
-
     /// Per-device nonce state: insertion order plus a membership set.
     #[derive(Debug, Default)]
     struct DeviceNonces {
@@ -426,6 +401,9 @@ pub mod hmac {
     /// 2. **Per-device quotas.** Each device gets its own
     ///    [`MAX_NONCES_PER_DEVICE`] budget, so one legitimate high-volume
     ///    client cannot push another client's recent nonces out of the cache.
+    ///    The process-wide [`MAX_NONCES`] ceiling never overrides this: it
+    ///    sheds only from devices that have filled their own quota, so a
+    ///    device cannot lose an in-window nonce while it is under quota.
     #[derive(Debug, Default)]
     pub struct NonceCache {
         devices: HashMap<String, DeviceNonces>,
@@ -520,8 +498,8 @@ pub mod hmac {
             true
         }
 
-        /// Enforce the per-device quota then the process-wide ceiling, always by
-        /// evicting the oldest remembered nonce. Never clears.
+        /// Enforce the per-device quota, then the process-wide ceiling —
+        /// always by evicting the oldest remembered nonce. Never clears.
         fn enforce_quota(&mut self, device_id: &str) {
             let cutoff = now_millis() - 60_000;
             if let Some(state) = self.devices.get_mut(device_id) {
@@ -533,11 +511,17 @@ pub mod hmac {
                 }
             }
 
-            // Process-wide ceiling. Reached only when the sum of per-device
-            // quotas exceeds MAX_NONCES; evict the globally oldest entry.
+            // Process-wide ceiling, enforced only against devices that have
+            // filled their own quota. A device under quota has no headroom:
+            // taking its in-window nonces would silently destroy replay
+            // protection the per-device quota guarantees it may keep (W6.13),
+            // so it is never a victim here. When every device is under quota
+            // the loop stops and the ceiling yields — the bound that remains
+            // is one MAX_NONCES_PER_DEVICE quota per registered device, which
+            // the relay's device registry keeps small.
             let mut guard = 0usize;
             while self.total_len() >= MAX_NONCES {
-                let Some(victim) = self.oldest_device() else {
+                let Some(victim) = self.oldest_device_at_quota() else {
                     break;
                 };
                 let Some(state) = self.devices.get_mut(&victim) else {
@@ -554,10 +538,17 @@ pub mod hmac {
             self.devices.retain(|_, state| state.len() > 0);
         }
 
-        /// The device whose oldest remembered nonce is the globally oldest.
-        fn oldest_device(&self) -> Option<String> {
+        /// The device whose oldest remembered nonce is the globally oldest,
+        /// counting only devices that have filled their own quota.
+        ///
+        /// Restricting the candidate set is what keeps the ceiling from
+        /// touching a device that still has quota headroom — a device under
+        /// quota must never lose an in-window nonce to another device's
+        /// traffic volume.
+        fn oldest_device_at_quota(&self) -> Option<String> {
             self.devices
                 .iter()
+                .filter(|(_, state)| state.len() >= MAX_NONCES_PER_DEVICE)
                 .filter_map(|(device, state)| state.order.front().map(|(_, ts)| (device, *ts)))
                 .min_by_key(|(_, ts)| *ts)
                 .map(|(device, _)| device.clone())
@@ -613,46 +604,95 @@ pub mod hmac {
 
     /// Load the persisted nonce replay cache from `path`.
     ///
-    /// - Missing file → empty cache (first start).
-    /// - Unreadable file → empty cache, silently. A permissions error is
-    ///   indistinguishable from "first start" here, so a relay whose nonce file
-    ///   cannot be read loses replay protection across restarts without a log
-    ///   line. Only a *parse* failure is logged.
-    /// - Corrupt file → empty cache + warn. Fail-open here is acceptable: the
-    ///   worst case is one replayed message inside the 30s window being accepted
-    ///   once after a corrupt-state restart — losing every nonce would be worse.
-    /// - Entries older than 60s are pruned on load (matches `check_replay` cutoff).
-    /// - If more than [`MAX_NONCES`] entries survive the prune, only the most
-    ///   recent are kept.
+    /// - Missing file → empty cache (first start). This is the **only** way
+    ///   this function returns an empty map.
+    /// - Unreadable file (permissions, I/O errors) or unparseable content →
+    ///   **fail closed**: the failure is logged at error level and the
+    ///   process panics instead of receiving an empty map. Handing back
+    ///   "no nonces seen" for a store that exists but cannot be read is how a
+    ///   relay silently loses replay protection across restarts (W6.12); the
+    ///   relay's startup call site treats this function as infallible, so a
+    ///   returned `Err` would be ignored — a panic is the only fail-closed
+    ///   signal an infallible signature can carry, and refusing to start is
+    ///   the right answer when the record of past nonces is unreadable.
+    /// - Entries older than 60s are pruned on load (matches
+    ///   [`NonceCache::check_replay`]'s cutoff).
+    /// - More than [`MAX_NONCES_PER_DEVICE`] persisted entries for one device
+    ///   → only that device's most recent are kept. There is deliberately no
+    ///   *global* truncation: dropping the globally oldest entries would
+    ///   strip in-window nonces from devices that are under their own quota —
+    ///   the same cross-device eviction [`MAX_NONCES`] refuses to do at
+    ///   runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file exists but cannot be read or parsed, after
+    /// logging the path and the underlying error — see above.
     pub fn load_nonces(path: &std::path::Path) -> std::collections::HashMap<String, i64> {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(_) => return std::collections::HashMap::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Genuinely absent: a first start has no nonces to restore.
+                return std::collections::HashMap::new();
+            }
+            Err(e) => {
+                log::error!(
+                    "Nonce cache at {} cannot be read ({}); refusing to run \
+                     without replay protection",
+                    path.display(),
+                    e
+                );
+                panic!(
+                    "nonce store at {} is unreadable; failing closed",
+                    path.display()
+                );
+            }
         };
         let map: std::collections::HashMap<String, i64> = match serde_json::from_str(&content) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!(
-                    "Nonce cache at {} is corrupt ({}); starting empty",
+                log::error!(
+                    "Nonce cache at {} is corrupt ({}); refusing to run \
+                     without replay protection",
                     path.display(),
                     e
                 );
-                return std::collections::HashMap::new();
+                panic!(
+                    "nonce store at {} is corrupt; failing closed",
+                    path.display()
+                );
             }
         };
 
         let now = now_millis();
         let cutoff = now - 60_000;
-        let mut fresh: Vec<(String, i64)> =
-            map.into_iter().filter(|(_, ts)| *ts > cutoff).collect();
+        let fresh: Vec<(String, i64)> = map.into_iter().filter(|(_, ts)| *ts > cutoff).collect();
 
-        // Enforce the same cap as check_replay: keep the most recent entries.
-        if fresh.len() > MAX_NONCES {
-            fresh.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
-            fresh.truncate(MAX_NONCES);
+        // Group by device and apply the per-device quota, keeping each
+        // device's most recent entries. Only done when some device is over
+        // quota — the overwhelmingly common case walks straight through.
+        let mut grouped: std::collections::HashMap<String, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        for (key, ts) in fresh {
+            let device = key
+                .split_once(SCOPE_SEPARATOR)
+                .map_or_else(|| LEGACY_SCOPE.to_string(), |(d, _)| d.to_string());
+            grouped.entry(device).or_default().push((key, ts));
         }
 
-        fresh.into_iter().collect()
+        let mut out: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for (device, mut entries) in grouped {
+            if entries.len() > MAX_NONCES_PER_DEVICE {
+                entries.sort_by_key(|(_, ts)| std::cmp::Reverse(*ts));
+                entries.truncate(MAX_NONCES_PER_DEVICE);
+                log::warn!(
+                    "Nonce cache held more than {MAX_NONCES_PER_DEVICE} entries \
+                     for device {device}; kept only the most recent"
+                );
+            }
+            out.extend(entries);
+        }
+        out
     }
 
     /// Persist the nonce replay cache atomically (tmp + rename), pruning entries
@@ -1265,20 +1305,103 @@ pub mod hmac {
         }
 
         #[test]
-        fn nonce_cache_global_ceiling_is_respected() {
+        fn global_ceiling_never_evicts_a_device_under_its_quota() {
+            // W6.13 regression: with the total over the process-wide ceiling,
+            // the global loop used to evict the *globally oldest* entry —
+            // here the victim's, which were inserted first — even though the
+            // victim is one entry short of its own quota. A device under
+            // quota must never lose an in-window nonce to ceiling pressure.
+            let now = now_millis();
+            let mut map = std::collections::HashMap::new();
+
+            // Victim: under quota, but holding the globally oldest nonces.
+            for i in 0..(MAX_NONCES_PER_DEVICE - 1) {
+                map.insert(format!("victim{SCOPE_SEPARATOR}v{i}"), now - 55_000);
+            }
+            // Two devices AT quota with newer nonces: together they push the
+            // total well past MAX_NONCES, and they are the only devices the
+            // ceiling may shed from.
+            for d in 0..2 {
+                for i in 0..MAX_NONCES_PER_DEVICE {
+                    map.insert(format!("heavy-{d}{SCOPE_SEPARATOR}h{i}"), now - 45_000);
+                }
+            }
+            assert!(map.len() > MAX_NONCES, "setup must exceed the ceiling");
+            let mut cache = NonceCache::from_map(&map);
+
+            // A fresh insert triggers quota enforcement under ceiling pressure.
+            assert!(cache.check_replay("flooder", now, "trigger"));
+
+            assert_eq!(
+                cache.len_for("victim"),
+                MAX_NONCES_PER_DEVICE - 1,
+                "a device under its own quota must not lose in-window nonces \
+                 to the process-wide ceiling"
+            );
+            assert!(cache.contains("victim", "v0"));
+            // The ceiling still engages — it just sheds from the devices that
+            // have filled their own quota.
+            assert!(
+                cache.len_for("heavy-0") < MAX_NONCES_PER_DEVICE,
+                "an at-quota device must shed under ceiling pressure"
+            );
+            assert!(
+                cache.len_for("heavy-1") < MAX_NONCES_PER_DEVICE,
+                "an at-quota device must shed under ceiling pressure"
+            );
+        }
+
+        #[test]
+        fn nonce_cache_global_ceiling_yields_to_isolation_but_stays_bounded() {
+            // Four devices, each pushed past its own quota. The process-wide
+            // ceiling may shed only from devices *at* quota; once every
+            // device has quota headroom it yields, so the hard bound is one
+            // quota per registered device — four here — rather than
+            // MAX_NONCES. Both halves matter: isolation without a bound would
+            // be unbounded growth, a bound without isolation is W6.13.
             let now = now_millis();
             let mut cache = NonceCache::new();
-            // Enough devices to blow past the process-wide ceiling.
             for d in 0..4 {
                 for i in 0..(MAX_NONCES_PER_DEVICE + 100) {
                     cache.check_replay(&format!("dev-{d}"), now, &format!("n{d}-{i}"));
                 }
             }
+            for d in 0..4 {
+                assert!(
+                    cache.len_for(&format!("dev-{d}")) <= MAX_NONCES_PER_DEVICE,
+                    "per-device quota must hold for every device"
+                );
+            }
             assert!(
-                cache.total_len() <= MAX_NONCES,
-                "global cap {} must hold, got {}",
-                MAX_NONCES,
+                cache.total_len() <= 4 * MAX_NONCES_PER_DEVICE,
+                "one quota per registered device is the hard bound, got {}",
                 cache.total_len()
+            );
+        }
+
+        #[test]
+        fn nonce_cache_evicts_its_own_oldest_first_at_the_per_device_quota() {
+            // Keeps the coverage the removed unscoped `check_replay` cap test
+            // held, on the canonical API: at the per-device quota the cache
+            // displaces exactly the oldest nonce — never a clear().
+            let now = now_millis();
+            let mut cache = NonceCache::new();
+            let inserted = MAX_NONCES_PER_DEVICE + 100;
+            for i in 0..inserted {
+                assert!(cache.check_replay("alice", now, &format!("n{i}")));
+            }
+            assert_eq!(cache.len_for("alice"), MAX_NONCES_PER_DEVICE);
+
+            // n0..n99 fell off the front of the queue, n{inserted - 1} did not.
+            assert!(!cache.contains("alice", "n0"));
+            assert!(cache.contains("alice", &format!("n{}", inserted - 1)));
+            assert!(
+                cache.check_replay("alice", now, "n0"),
+                "the evicted oldest nonce is no longer replay-protected"
+            );
+            assert!(
+                !cache.check_replay("alice", now, &format!("n{}", inserted - 1)),
+                "a retained nonce must still be rejected as a replay"
             );
         }
 
@@ -1343,133 +1466,6 @@ pub mod hmac {
         }
 
         // ---------------------------------------------------------------
-        //  check_replay tests
-        // ---------------------------------------------------------------
-
-        #[test]
-        fn check_replay_accepts_fresh_nonce() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            assert!(check_replay(now, "n1", &mut nonces));
-            assert_eq!(nonces.len(), 1);
-        }
-
-        #[test]
-        fn check_replay_rejects_duplicate_nonce() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            assert!(check_replay(now, "n1", &mut nonces));
-            assert!(!check_replay(now, "n1", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_rejects_expired_timestamp() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            // 31 seconds in the past → age > 30_000
-            assert!(!check_replay(now - 31_000, "old-nonce", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_rejects_timestamp_too_far_future() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            // 6 seconds in the future → age < -5_000
-            assert!(!check_replay(now + 6_000, "future-nonce", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_accepts_within_clock_skew_window() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            // 4 seconds in the future (within -5s tolerance)
-            assert!(check_replay(now + 4_000, "skew-ok", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_accepts_timestamp_29s_old() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            // 29 seconds old – within 30s window
-            assert!(check_replay(now - 29_000, "n29", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_accepts_timestamp_near_window_edge() {
-            let mut nonces = std::collections::HashMap::new();
-            // check_replay re-reads the clock internally, so an exact 30_000 age is
-            // racy (1ms drift → rejected). 29_000 is deterministically inside the
-            // 30s window; the exact-30_000 edge is covered by the reject tests.
-            let ts = now_millis() - 29_000;
-            assert!(check_replay(ts, "n-near-edge", &mut nonces));
-        }
-
-        #[test]
-        fn check_replay_nonce_dedup_evicts_old_entries_at_cap() {
-            // Rewritten from the version that documented a full `clear()` at the
-            // cap. A wholesale clear let any client that could reach MAX_NONCES
-            // re-enable replay for every nonce ever accepted; the cache must now
-            // evict oldest-first and stay exactly at the cap.
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-
-            // Fill to MAX_NONCES with *distinct* timestamps so "oldest" is
-            // deterministic: n0 is newest, n{MAX-1} is oldest.
-            for i in 0..MAX_NONCES {
-                nonces.insert(format!("n{i}"), now - i as i64);
-            }
-            assert_eq!(nonces.len(), MAX_NONCES);
-
-            // A fresh nonce at the cap must be accepted, and must displace
-            // exactly one entry — not the whole cache.
-            assert!(check_replay(now, "overflow-nonce", &mut nonces));
-            assert_eq!(
-                nonces.len(),
-                MAX_NONCES,
-                "eviction must keep the cache at the cap, never shrink it to 1"
-            );
-            assert!(nonces.contains_key("overflow-nonce"));
-            assert!(
-                !nonces.contains_key(&format!("n{}", MAX_NONCES - 1)),
-                "the OLDEST entry must be the one evicted"
-            );
-
-            // The newest previously-accepted nonce is still remembered.
-            assert!(
-                !check_replay(now, "n0", &mut nonces),
-                "recently accepted nonces must stay protected at the cap"
-            );
-            // The evicted oldest nonce is no longer remembered (accepted again).
-            assert!(
-                check_replay(now, &format!("n{}", MAX_NONCES - 1), &mut nonces),
-                "the evicted oldest nonce is no longer replay-protected"
-            );
-        }
-
-        #[test]
-        fn check_replay_evicts_stale_entries_then_keeps_fresh() {
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-
-            // Insert MAX_NONCES entries with timestamps 70s ago (stale)
-            let stale_ts = now - 70_000;
-            for i in 0..MAX_NONCES {
-                let nonce = format!("stale-{}", i);
-                // These pass the initial timestamp check because check_replay
-                // is called with stale_ts, and age = now - stale_ts = 70000 > 30000,
-                // so they would be rejected. We need to insert them manually
-                // to set up the scenario.
-                nonces.insert(nonce, stale_ts);
-            }
-            assert_eq!(nonces.len(), MAX_NONCES);
-
-            // Now a fresh nonce comes in. The stale entries (>60s old) should be evicted.
-            assert!(check_replay(now, "fresh-nonce", &mut nonces));
-            assert_eq!(nonces.len(), 1);
-            assert!(nonces.contains_key("fresh-nonce"));
-        }
-
-        // ---------------------------------------------------------------
         //  now_millis basic sanity
         // ---------------------------------------------------------------
 
@@ -1522,13 +1518,76 @@ pub mod hmac {
         }
 
         #[test]
-        fn load_nonces_corrupt_file_returns_empty() {
+        #[should_panic(expected = "failing closed")]
+        fn load_nonces_corrupt_store_fails_closed() {
+            // Unparseable content is not "no nonces seen": starting empty
+            // would silently drop every restored replay protection. Fail
+            // closed instead (W6.12).
             let path = std::env::temp_dir()
                 .join(format!("relay-nonce-corrupt-{}.json", std::process::id()));
             std::fs::write(&path, "not valid json {{{").expect("write corrupt file");
 
+            let _ = load_nonces(&path);
+
+            let _ = std::fs::remove_file(&path);
+        }
+
+        #[test]
+        #[should_panic(expected = "failing closed")]
+        fn load_nonces_unreadable_store_fails_closed() {
+            // A directory standing where the nonce file should be is a read
+            // error on every platform (Windows: ERROR_ACCESS_DENIED,
+            // POSIX: EISDIR) and does not depend on flipping permissions,
+            // which Windows ACLs make unreliable inside a test. Before W6.12
+            // this returned an empty map with no log — silently handing the
+            // relay a cache with no replay protection.
+            let dir =
+                std::env::temp_dir().join(format!("relay-nonce-dirplace-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create dir");
+
+            let _ = load_nonces(&dir);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn load_nonces_truncates_per_device_not_across_devices() {
+            // A global "keep the MAX_NONCES most recent entries" truncation
+            // would drop the quiet device's older-but-in-window nonces on
+            // load — the very cross-device eviction the runtime ceiling
+            // refuses to commit (W6.13). Each device is truncated against
+            // its own quota instead.
+            let path = std::env::temp_dir()
+                .join(format!("relay-nonce-perdevice-{}.json", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+
+            let now = now_millis();
+            let mut nonces = std::collections::HashMap::new();
+            // One device far over its own quota (hostile or stale file)…
+            for i in 0..(MAX_NONCES + 300) {
+                nonces.insert(format!("flood{SCOPE_SEPARATOR}f{i}"), now - 5_000);
+            }
+            // …and one device at a normal count whose entries are older,
+            // though still inside the 60 s retention window.
+            for i in 0..300 {
+                nonces.insert(format!("quiet{SCOPE_SEPARATOR}q{i}"), now - 50_000);
+            }
+            save_nonces(&path, &nonces).expect("save should succeed");
+
             let loaded = load_nonces(&path);
-            assert!(loaded.is_empty(), "corrupt file should yield empty cache");
+            let quiet = loaded.keys().filter(|k| k.starts_with("quiet")).count();
+            let flood = loaded.keys().filter(|k| k.starts_with("flood")).count();
+            assert_eq!(
+                quiet, 300,
+                "a device under its own quota must keep every in-window nonce \
+                 across a load"
+            );
+            assert!(
+                flood <= MAX_NONCES_PER_DEVICE,
+                "an over-quota device must be cut back to its own quota, got \
+                 {flood}"
+            );
 
             let _ = std::fs::remove_file(&path);
         }
@@ -1548,27 +1607,28 @@ pub mod hmac {
         }
 
         #[test]
-        fn check_replay_rejects_nonce_restored_from_persisted_cache() {
-            // A device disconnects, its nonces are persisted, then a reconnect
-            // (or restart) loads them — a previously-accepted nonce must still
-            // be rejected. This is the cross-restart replay protection guarantee.
+        fn persisted_nonces_still_reject_replays_after_a_restart() {
+            // The cross-restart replay guarantee, on the canonical API (the
+            // unscoped `check_replay` free function that used to drive this
+            // test has been removed). A device's nonces are persisted, then a
+            // reconnect or restart loads them — a previously-accepted nonce
+            // must still be rejected.
             let path = std::env::temp_dir()
                 .join(format!("relay-nonce-restored-{}.json", std::process::id()));
             let _ = std::fs::remove_file(&path);
 
-            let now = now_millis();
-            let mut nonces = std::collections::HashMap::new();
-            assert!(check_replay(now, "persisted-nonce", &mut nonces));
-            save_nonces(&path, &nonces).expect("save should succeed");
+            let mut cache = NonceCache::new();
+            assert!(cache.check_replay("alice", now_millis(), "persisted-nonce"));
+            save_nonces(&path, &cache.to_map()).expect("save should succeed");
 
-            // Simulate restart: load into a fresh cache.
-            let mut restored = load_nonces(&path);
+            // Simulate restart: rebuild a fresh cache from disk.
+            let mut restored = NonceCache::from_map(&load_nonces(&path));
             assert!(
-                restored.contains_key("persisted-nonce"),
+                restored.contains("alice", "persisted-nonce"),
                 "fresh nonce must survive the persistence roundtrip"
             );
             assert!(
-                !check_replay(now, "persisted-nonce", &mut restored),
+                !restored.check_replay("alice", now_millis(), "persisted-nonce"),
                 "nonce restored from disk must still be rejected as a replay"
             );
 

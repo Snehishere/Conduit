@@ -1205,20 +1205,34 @@ they describe is gone and there is nothing to action).
   `packages/protocol/PROTOCOL.md` §2.5 documented the old behaviour — including
   the claim that the relay passes no `WebSocketConfig` — and is updated.
 
-- [ ] **W6.6 (HIGH)** A read lock is held across `await`.
-  `services/relay/src/route.rs:331` and `:387` take `state.clients.read().await`
-  and then hold the guard for the full `FORWARD_TIMEOUT_SECS` while
-  `target_tx` is borrowed from it. Every writer blocks meanwhile — registration,
-  deregistration (`connection.rs:560`) and the 30 s sweep
-  (`service.rs:spawn_housekeeping`). tokio's `RwLock` is write-preferring, so one
-  slow target stalls the whole routing table.
-  *Left to do:* clone the `Sender` out and drop the guard before awaiting.
+- [x] **W6.6 (RESOLVED)** A read lock is held across `await`. **Fixed.**
+  `forward_text_with_timeout` and `forward_binary` took
+  `state.clients.read().await`, borrowed the target out of it and then held the
+  guard for the full `FORWARD_TIMEOUT_SECS` while the send was in flight. Every
+  writer blocked meanwhile — registration, deregistration and the 30 s sweep —
+  and tokio's `RwLock` is write-preferring, so one slow target stalled the whole
+  routing table.
 
-- [ ] **W6.4 (HIGH)** A stale disconnect deregisters the live device.
-  `connection.rs:560` removes by key with no check that the stored sender is
-  still *this* connection's. A device that reconnected keeps its connection but
-  is permanently unroutable, and `reconcile_clients` cannot repair it.
-  *Left to do:* store `(tx, connection_id)` and remove only on a match.
+  Both now clone the `Queue` out of a short-lived guard (`route.rs:346`,
+  `route.rs:412`) and await the send after it is dropped. The clone shares the
+  `Arc<Semaphore>` underneath, so W6.1's byte budget is unaffected: reservation
+  and release still meet on the same semaphore however long the guard lived.
+  `a_slow_forward_does_not_hold_the_routing_table_lock` proves writers proceed
+  while a forward is parked on a stalled target.
+
+- [x] **W6.4 (RESOLVED)** A stale disconnect deregisters the live device.
+  **Fixed.** Registration stored only the `Queue` and teardown removed by key,
+  so a connection that lost the race with its own replacement deleted the *new*
+  connection's entry: the device stayed connected and became permanently
+  unroutable, and `reconcile_clients` could not repair it because the entry it
+  would prune looked perfectly healthy.
+
+  Every `Queue` now carries a `connection_id` minted from a process-wide atomic
+  (`state.rs:139`), and teardown goes through `deregister_if_current`
+  (`state.rs:280`), which removes only when the stored id still matches. A
+  superseded connection's late teardown is a no-op rather than a hijacking.
+  Two tests drive the exact interleaving (old disconnect lands after new
+  registration).
 
 - [ ] **W6.5 (HIGH)** Binary frames have no cross-connection replay protection.
   `connection.rs:264` holds `last_binary_seq` as a per-connection in-memory
@@ -1229,75 +1243,134 @@ they describe is gone and there is nothing to action).
   connection, which is correct for the receiver's own guard and is still not a
   durable replay bound.
   *Left to do:* add a timestamp and nonce (a frame-version bump), or persist a
-  per-device high-water sequence number alongside the nonce cache.
+  per-device high-water sequence number alongside the nonce cache. This needs a
+  wire-format decision and is deliberately untouched.
 
-- [ ] **W6.2 (HIGH)** The `/health` bearer token still defaults to the master
-  HMAC secret (`config.rs:54`, `with_health_token_fallback`). The master secret
-  is no longer a signing-key input — W6.2's original consequence was **removed**
-  by per-device keys — but it remains a credential shared by two roles, and
-  anyone holding the health token reads the secret the nonce cache is keyed from.
-  *Left to do:* require `RELAY_HEALTH_TOKEN` explicitly, or derive a separate
-  purpose-bound token.
+- [x] **W6.2 (RESOLVED)** The `/health` bearer token defaulted to the master
+  HMAC secret. **Fixed.** `with_health_token_fallback` copied `hmac_secret` into
+  `health_token`, so the credential gating the health endpoint *was* the secret
+  the nonce cache is keyed from — one credential, two roles.
 
-- [ ] **W6.7 (HIGH)** Handshakes are untimed and uncounted.
-  `service.rs::admit` runs **after** `acceptor.accept(stream).await`, which has
-  no timeout, and the relay's own source says so: a client that opens TCP and
-  sends no ClientHello holds a task and an fd forever and is never counted. The
-  WebSocket upgrade is likewise untimed and holds an `active_connections` slot,
-  and the per-IP rate limit is applied *after* the upgrade, so it protects
-  neither path.
+  Resolution no longer copies anything. An explicit `RELAY_HEALTH_TOKEN` wins;
+  otherwise `derive_health_token` (`config.rs:589`) produces a token as
+  `hex(derive_key(secret, "conduit-relay/v1/health-token"))` — stable across
+  restarts, non-invertible, and domain-separated from every other key derived
+  from the same secret. `with_derived_health_token` (`config.rs:601`) fills the
+  default in one place and `effective_health_token` still yields a never-empty
+  value for hand-built `Config`s. `docs/PROTOCOL.md`'s env table and both ADRs
+  that described the old default are updated.
 
-- [ ] **W6.8 (HIGH)** The auth deadline is per-message, not total.
-  `connection.rs:97` re-arms `auth_timeout` on every frame. A client sending one
-  junk frame every 9 s holds an unauthenticated connection and a slot
-  indefinitely.
+- [x] **W6.7 (RESOLVED)** Handshakes were untimed and uncounted. **Fixed.**
+  Admission ran *after* the TLS handshake, so a client that completed TCP and
+  never sent a `ClientHello` held a task and an fd indefinitely; the WebSocket
+  upgrade was untimed; and the per-IP rate limit sat after the upgrade and so
+  bounded neither path.
 
-- [ ] **W6.15 (MEDIUM)** Self-signed certificates are valid for ~2000 years.
-  `tls.rs` never sets a validity window, so rcgen applies its defaults. No
-  `key_usages` or `extended_key_usages` are asserted, so stricter clients may
-  reject the server certificate, and `load_tls_context` never validates a
-  supplied certificate's validity window at all.
+  - `accept_tls` (`service.rs:917`) wraps the handshake in a
+    `TLS_HANDSHAKE_TIMEOUT_SECS` (10 s) budget.
+  - `UpgradeDeadline<S>` (`service.rs:691`) gives the upgrade its own
+    `WS_UPGRADE_TIMEOUT_SECS` (10 s) budget, disarmed on the first completed
+    write so an established connection is never judged by it.
+  - `admit` (`service.rs:953`) now runs **before** either, in the order
+    rate-limit → guard → cap, and returns `Option<ConnectionGuard>` to the
+    caller. Because the guard is the caller's to hold, every early return drops
+    the slot by construction.
+
+  Two corrections to the audit's description while doing this: the old `admit`
+  created its guard locally and dropped it at function end, so `active_connections`
+  netted zero and `MAX_CONNECTIONS` never actually engaged — the upgrade was
+  *not* holding a slot, there was no slot to hold. And the per-IP limit was
+  applied twice (pre- and post-upgrade), halving the effective rate for any
+  client that finished the handshake.
+
+- [x] **W6.8 (RESOLVED)** The auth deadline was per-message, not total.
+  **Fixed.** `auth_timeout` was re-armed on every frame, so one junk frame every
+  9 s held an unauthenticated connection and a slot indefinitely. There is now a
+  single `auth_deadline` (`connection.rs:149`) set once when the socket is
+  admitted, driven through `timeout_at` rather than `timeout`. The explicit
+  top-of-loop check exists because `tokio::time::Timeout` polls the read first
+  and would let a frame arriving exactly on the deadline be processed anyway.
+
+- [x] **W6.15 (RESOLVED)** Self-signed certificates were valid for ~2000 years.
+  **Fixed, all three halves.**
+  - rcgen's default window is 1975-01-01 → 4096-01-01. Generated certs now get
+    an explicit window: 7 days of backdate (client clock skew) and
+    `GENERATED_CERT_LIFETIME_DAYS` = 3653 days, i.e. a finite, checkable ten
+    years rather than a span in which nothing can ever be expired. Regeneration
+    is deliberately operator-triggered — silently rotating the cert would
+    silently rotate the SPKI pin clients hold at `GET /pin`.
+  - `key_usages`/`extended_key_usages` are now asserted (`DigitalSignature` +
+    `ServerAuth`). The acceptor is TLS 1.3-only, so `keyEncipherment` is
+    deliberately *not* claimed — it would advertise key transport TLS 1.3
+    removed.
+  - `load_tls_context` validates a supplied certificate's window through
+    `check_validity_window` (`tls.rs:774`) and refuses rather than warns: rustls
+    never checks the window of the cert it serves, so without this the relay
+    starts "healthy" and fails every client. That matches how a mismatched
+    cert/key pair is already refused.
+
+  Hand-rolled UTCTime/GeneralizedTime parsing reuses the file's existing DER
+  walk, so no date dependency was added.
 
 - [ ] **W6.12 (MEDIUM)** Cross-restart replay protection depends on a 30 s flush
   against a 35 s freshness window, so a crash loses up to 30 s of accepted
-  nonces. `packages/protocol/src/lib.rs` also returns an empty nonce map on
-  **any** read error, including `PermissionDenied`, with no log — a relay whose
-  nonce file becomes unreadable silently loses replay protection.
+  nonces. **Half fixed:** `load_nonces` no longer returns an empty map on *any*
+  read error. A missing file (first start) is still empty; every other read
+  failure and every parse failure now logs with the path and cause and refuses
+  to start, rather than silently handing the relay an empty cache.
+  *Left to do:* the flush-versus-freshness window itself, which is a policy
+  decision between write amplification and crash exposure. Untouched.
 
-- [ ] **W6.13 (MEDIUM)** The global `MAX_NONCES` ceiling can evict another
-  device's in-window nonces. Per-device quota is 4096 and the process-wide cap is
-  10 000 (`lib.rs:55`, `:62`); three devices at quota exceeds the global cap, at
-  which point the global loop evicts the globally oldest entry, which may belong
-  to a different device.
-  *Left to do:* raise the ceiling, or make the global loop skip devices still
-  under quota; correct the docs.
+- [x] **W6.13 (RESOLVED)** The global `MAX_NONCES` ceiling could evict another
+  device's in-window nonces. **Fixed.** Per-device quota is 4096 and the
+  process-wide cap was 10 000, so three devices at quota exceeded it and the
+  eviction loop then removed the globally oldest entry — possibly belonging to a
+  device still under its own quota, silently destroying *its* replay protection.
 
-- [ ] **W6.19 (MEDIUM)** `bearer_token_authorized` (`config.rs:451`) still has no
-  empty-expected-token guard: `bearer_token_authorized("Bearer ", "")` returns
-  `true`, because both sides are zero-length and the length check passes. Not
-  reachable today only because `effective_health_token()` falls back to a
-  never-empty secret.
+  The global loop now picks its victim through `oldest_device_at_quota`
+  (`lib.rs:548`), which considers only devices already at quota, and stops when
+  none qualifies: the isolation invariant wins and the ceiling yields. The hard
+  bound becomes one quota per registered device rather than 10 000 entries.
+  `load_nonces` had the mirror-image bug — it truncated to the globally most
+  recent 10 000 on load, which would have stripped an under-quota device's
+  in-window nonces on *every* restart — and now truncates per device.
 
-- [ ] **W6.21 (MEDIUM)** No minimum entropy on secrets. `RELAY_TOKEN="   "` and a
-  one-character token are both accepted, and a 1-byte `HMAC_SECRET` yields a
-  1-byte-strength secret. Port parse failures silently fall back to the default
-  (`config::env_port`), so `RELAY_WSS_PORT=95x9` silently binds 9529.
+- [x] **W6.19 (RESOLVED)** `bearer_token_authorized` had no empty-expected-token
+  guard. **Fixed:** an empty expected token is refused before any comparison
+  (`config.rs:630`). This was never reachable only because
+  `effective_health_token()` fell back to a never-empty value — which is exactly
+  the accidental backstop W6.2 removed, so the guard is what actually closes it.
 
-- [ ] **W6.22 (MEDIUM)** `Config` still derives `Debug` while holding
-  `hmac_secret` and `relay_token` (`config.rs:26`). Any `{:?}` — including
-  inside a `panic!`/`expect` — prints both.
-  *Left to do:* implement `Debug` manually with redaction.
+- [x] **W6.21 (RESOLVED)** No minimum entropy on secrets, and silent port
+  fallback. **Fixed.** `MIN_SECRET_LEN = 8` bytes after trimming
+  (`config.rs:323`) now applies to the relay token, the HMAC secret and explicit
+  health/metrics tokens; a whitespace-only value counts as unset rather than
+  as a one-glyph credential. Error messages state the required length and never
+  echo the value. `env_port` (`config.rs:543`) returns `Result` and a
+  set-but-unparseable port is now a hard fail-closed error naming the variable
+  and the bad value — `RELAY_WSS_PORT=95x9` used to bind 9529 without a word.
+
+- [x] **W6.22 (RESOLVED)** `Config` derived `Debug` while holding
+  `hmac_secret` and `relay_token`. **Fixed:** `#[derive(Debug)]` is gone and a
+  manual impl (`config.rs:147`) prints both as `[REDACTED n bytes]`, keeping the
+  shape of the output useful. A repo-wide grep found no `{:?}` of a `Config`
+  today, so the exposure was latent rather than live — but `panic!`/`expect`
+  formatting is not where you want to discover it.
 
 - [ ] **W6.23 (MEDIUM)** Operational constants are hardcoded in `limits.rs` and
   are not configurable: `MAX_TEXT_SIZE`, `MAX_CONNECTIONS`, message rate and
   burst, forward timeout, queue depth, ping and idle-read intervals. Only
   `RELAY_AUTH_TIMEOUT_SECS` is tunable. The 10/60 s connect rate breaks any
   NAT'd deployment with more than 10 devices.
+  *Left to do:* deliberately untouched this pass — making these configurable is
+  a wide surface (env, `Overrides`, host settings, docs) rather than a bug fix.
 
-- [ ] **W6.27 (LOW)** `packages/protocol/src/lib.rs:346` — the unscoped free
-  function `check_replay` is superseded by `NonceCache::check_replay` and used
-  only in its own tests. It is a footgun: unscoped, a single cap, no per-device
-  isolation.
+- [x] **W6.27 (RESOLVED)** The unscoped free function `check_replay` is gone.
+  It was superseded by `NonceCache::check_replay`, used only by its own tests,
+  and was a footgun: unscoped, a single cap, no per-device isolation. A
+  repo-wide grep confirmed the only callers were its own tests. A
+  `compile_fail` doctest on the `hmac` module now pins the old path as a
+  compile error, so the deletion is itself regression-tested.
 
 #### SETTLED — re-checked against the current tree, no longer true
 
@@ -1327,21 +1400,33 @@ they describe is gone and there is nothing to action).
   generating a throwaway one" no longer appears in `README.md`; the behaviour
   (generate + persist) is documented correctly.
 
-- [ ] **W6.11 (MEDIUM)** Over-size text frames close the connection with only a
-  `warn!` (`connection.rs:108-112` during auth, `:324` afterwards), and the
-  documented `message_too_large` code is **never emitted anywhere in the crate** —
-  the only occurrence of the string is a comment in `limits.rs:15` and a
-  `PROTOCOL.md` reference. The sender learns nothing, so "my messages vanish" and
-  "the peer is gone" are indistinguishable.
-  *Left to do:* send `error_frame("message_too_large", …)` before closing, on both
-  the auth and post-auth paths.
+- [x] **W6.11 (RESOLVED)** Over-size frames now answer `message_too_large`.
+  **Fixed.** Both the auth-loop and post-auth checks logged a `warn!` and closed
+  without saying anything, and the documented `message_too_large` code appeared
+  nowhere in the crate but a comment and a `PROTOCOL.md` reference — so "my
+  messages vanish" and "the peer is gone" were indistinguishable.
 
-- [ ] **W6.10 (MEDIUM)** The relay never checks an inbound `protocol_version`, so
-  a newer client is silently accepted. `connection.rs:582` only *emits*
-  `PROTOCOL_VERSION` in its error frames; nothing reads one off the wire.
-  `PROTOCOL.md:50-51, 1671` documents the gap and there is still no code for it.
-  *Left to do:* reject a `protocol_version` above what the relay speaks, with
-  `unsupported_protocol_version`.
+  Every refusal site now sends `error_frame("message_too_large", …)` first, on
+  the text *and* the binary path (they are one ceiling now), and stays open for
+  `REFUSAL_LINGER` (500 ms) before closing. The linger is load-bearing rather
+  than defensive: tungstenite refuses an over-ceiling frame from the header
+  alone, so the payload is never read, and closing a socket with unread data
+  sends RST — which destroys the answer on the wire before the peer can read it.
+  That was observed as `10054` before the linger existed, and the negative test
+  (answer without linger) fails on 5 of 5 runs.
+
+- [x] **W6.10 (RESOLVED)** The relay now checks an inbound `protocol_version`.
+  **Fixed.** It previously only *emitted* the constant in its own error frames;
+  nothing read one off the wire, so a newer client was silently accepted.
+
+  The check reads `protocol_version` off the raw `Value` before the typed parse
+  (`connection.rs:867`) — necessary because neither `RelayAuth` nor `RelayRoute`
+  declares the field, so serde would drop it. A declared value above the relay's
+  own is answered `unsupported_protocol_version`; during auth that is followed
+  by closing the connection and counting `auth_attempts_failure`, while after
+  auth the frame alone is refused and the session continues, counted under
+  `messages_dropped_unknown_type`. A missing field and a value at or below the
+  relay's own are both accepted, per `PROTOCOL.md` §1.1.
 
 #### OBSOLETE — the artefact is gone
 
@@ -1629,9 +1714,9 @@ standalone service into a library hosted by the desktop app.
 
 | Suite | Working directory | Command | Measured |
 |---|---|---|---|
-| Relay | repo root | `cargo test -p conduit-relay` | **187** passed + 2 doctests |
-| Protocol | repo root | `cargo test -p conduit-protocol` | **275** passed |
-| Desktop Rust | repo root | `cargo test -p conduit` | **724** passed |
+| Relay | repo root | `cargo test -p conduit-relay` | **235** passed, 1 ignored + 2 doctests |
+| Protocol | repo root | `cargo test -p conduit-protocol` | **270** passed + 1 doctest |
+| Desktop Rust | repo root | `cargo test -p conduit` | **729** passed |
 | Clippy | repo root | `cargo clippy --workspace --all-targets` | exit 0, zero warnings |
 | Rust format | repo root | `cargo fmt --all -- --check` | exit 0 |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |

@@ -523,7 +523,7 @@ mod tests {
         // Whatever the environment says, the desktop never exposes the peer
         // count or the certificate pin to the LAN. See the audit's W6.20.
         unsafe { std::env::set_var("RELAY_HEALTH_BIND", "0.0.0.0") };
-        let config = build_config("token", &settings()).unwrap();
+        let config = build_config("test-relay-token", &settings()).unwrap();
         assert_eq!(
             config.health_bind,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -539,7 +539,7 @@ mod tests {
         // process working directory — which for a packaged app is a path the OS
         // chose. Left alone it produced a stray `secrets/` directory next to
         // whatever happened to launch the app.
-        let config = build_config("token", &settings()).unwrap();
+        let config = build_config("test-relay-token", &settings()).unwrap();
         let app_data = app_data_dir();
         for path in [
             config.nonce_file.as_path(),
@@ -560,7 +560,7 @@ mod tests {
         let mut s = settings();
         s.relay_port = 19529;
         s.relay_health_port = 19530;
-        let config = build_config("token", &s).unwrap();
+        let config = build_config("test-relay-token", &s).unwrap();
         assert_eq!(config.wss_port, 19529);
         assert_eq!(config.health_port, 19530);
     }

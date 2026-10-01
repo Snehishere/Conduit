@@ -189,7 +189,7 @@ depends on `rusqlite` or SQLCipher. Both build with no vendored dependencies.
 ```bash
 # repository root
 cargo build -p conduit-protocol
-cargo test  -p conduit-protocol      # 275 tests
+cargo test  -p conduit-protocol      # 270 tests
 cargo doc   -p conduit-protocol --no-deps
 ```
 
@@ -202,7 +202,7 @@ missing intra-doc links to `PROTOCOL_VERSION` / `LAN_WS_PORT`, those are
 ```bash
 # repository root
 cargo build  -p conduit-relay
-cargo test   -p conduit-relay         # 187 tests
+cargo test   -p conduit-relay         # 235 tests, 1 ignored
 cargo clippy -p conduit-relay --all-targets -- -D warnings
 ```
 
@@ -224,7 +224,7 @@ deliberately **not** inheritable from the environment.
 ```bash
 # repository root
 cargo build -p conduit
-cargo test  -p conduit               # 724 tests: all passing
+cargo test  -p conduit               # 729 tests: all passing
 cargo clippy -p conduit -- -D warnings
 ```
 
@@ -532,7 +532,7 @@ binary frame layout.
    # repository root
    cargo test -p conduit-protocol
    cargo test -p conduit-relay
-   cargo test -p conduit          # 724 tests, all passing
+   cargo test -p conduit          # 729 tests, all passing
    cd apps/desktop && npx tsc --noEmit && npm test
    cd apps/mobile && flutter test && dart analyze --fatal-infos
    ```

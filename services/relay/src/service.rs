@@ -39,11 +39,13 @@
 //! already has a lifecycle of its own and must not have one overwritten.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use conduit_protocol::hmac::NonceCache;
 use log::{error, info, warn};
@@ -51,11 +53,14 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{RwLock, watch};
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Sleep;
 
 use crate::config::Config;
 use crate::connection::{drain_connections, handle_connection};
 use crate::health::spawn_health_server;
-use crate::limits::{MAX_CONNECTIONS, RateLimiter};
+use crate::limits::{
+    MAX_CONNECTIONS, RateLimiter, TLS_HANDSHAKE_TIMEOUT_SECS, WS_UPGRADE_TIMEOUT_SECS,
+};
 use crate::metrics::Metrics;
 use crate::state::{AppState, ConnectionGuard};
 
@@ -436,6 +441,8 @@ impl RelayService {
                 state.clone(),
                 shutdown_rx.clone(),
                 acceptor,
+                Duration::from_secs(TLS_HANDSHAKE_TIMEOUT_SECS),
+                Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS),
             ));
         } else {
             warn!("Relay has no TLS context; the WSS listener was not started.");
@@ -463,6 +470,7 @@ impl RelayService {
                 listener,
                 state.clone(),
                 shutdown_rx.clone(),
+                Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS),
             ));
         }
 
@@ -663,6 +671,114 @@ impl AsyncWrite for Stream {
     }
 }
 
+/// A stream whose WebSocket-upgrade phase carries a deadline.
+///
+/// The upgrade — HTTP request in, `101` out — happens inside
+/// [`handle_connection`], and it is the phase a peer can stretch for free:
+/// open a socket, send half a request, trickle the rest, hold the counted
+/// connection slot indefinitely. The upgrade cannot be wrapped in
+/// [`tokio::time::timeout`] from out here without also putting a timer around
+/// the entire life of the connection, so the budget travels *inside* the
+/// stream instead: constructed immediately before the upgrade, armed until
+/// the server writes its handshake response, and inert from then on, so a
+/// healthy connection is never raced against a timer that has stopped meaning
+/// anything.
+///
+/// The budget is a real [`Sleep`], not a deadline checked on I/O: a peer that
+/// sends nothing produces no readiness event ever, so a bare timestamp would
+/// never be observed. The sleep's waker is registered on the first poll and
+/// wakes the task when the budget runs out even if the socket stays silent.
+pub(crate) struct UpgradeDeadline<S> {
+    inner: S,
+    budget: Pin<Box<Sleep>>,
+    timeout: Duration,
+    /// Cleared once the server has written its handshake response — from that
+    /// point the budget must never fire again.
+    armed: bool,
+}
+
+impl<S> UpgradeDeadline<S> {
+    pub(crate) fn new(inner: S, timeout: Duration) -> Self {
+        Self {
+            inner,
+            budget: Box::pin(tokio::time::sleep(timeout)),
+            timeout,
+            armed: true,
+        }
+    }
+
+    /// Whether the budget has run out while the upgrade is still pending.
+    fn budget_expired(&mut self, cx: &mut Context<'_>) -> bool {
+        if !self.armed {
+            return false;
+        }
+        self.budget.as_mut().poll(cx).is_ready()
+    }
+
+    /// The refusal a stalled upgrade gets: an I/O error, which is what the
+    /// WebSocket handshake already turns into the same rejection a malformed
+    /// request gets, and what `handle_connection` already knows how to log.
+    fn expired_error(&self) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("WebSocket upgrade exceeded its {:?} budget", self.timeout),
+        )
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for UpgradeDeadline<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.budget_expired(cx) {
+            return Poll::Ready(Err(this.expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeDeadline<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if this.budget_expired(cx) {
+            return Poll::Ready(Err(this.expired_error()));
+        }
+        match Pin::new(&mut this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(written)) => {
+                // The server writes only once the request is in — the `101`
+                // response, or a rejection of a request it will not complete.
+                // Either way the upgrade phase is over; disarming here is
+                // what keeps the budget from reaching the established
+                // connection.
+                this.armed = false;
+                Poll::Ready(Ok(written))
+            }
+            pending => pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.budget_expired(cx) {
+            return Poll::Ready(Err(this.expired_error()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // Never refused: shutting the stream down is how every path —
+        // including a budget that has just expired — releases the socket.
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// Bind a listener on `addr`.
 async fn bind(addr: std::net::IpAddr, port: u16) -> Result<TcpListener, StartError> {
     TcpListener::bind(SocketAddr::new(addr, port))
@@ -671,11 +787,17 @@ async fn bind(addr: std::net::IpAddr, port: u16) -> Result<TcpListener, StartErr
 }
 
 /// WSS accept loop.
+///
+/// The two handshake budgets are parameters rather than constants so a test
+/// can drive this loop — accept loop, admission, TLS, upgrade — with budgets
+/// it can wait out.
 fn spawn_wss_listener(
     listener: TcpListener,
     state: Arc<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
     acceptor: tokio_rustls::TlsAcceptor,
+    tls_budget: Duration,
+    upgrade_budget: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         accept_loop(
@@ -685,16 +807,17 @@ fn spawn_wss_listener(
             "WSS",
             move |stream, state, peer, sd| {
                 let acceptor = acceptor.clone();
-                let addr = peer;
                 async move {
-                    let Ok(tls) = acceptor.accept(stream).await else {
-                        error!("TLS handshake error from {addr}");
-                        return;
-                    };
-                    if !admit(&state, &addr) {
-                        return;
-                    }
-                    handle_connection(Stream::Tls(Box::new(tls)), state, addr, sd).await;
+                    run_wss_connection(
+                        acceptor,
+                        stream,
+                        state,
+                        peer,
+                        sd,
+                        tls_budget,
+                        upgrade_budget,
+                    )
+                    .await;
                 }
             },
         )
@@ -702,11 +825,13 @@ fn spawn_wss_listener(
     })
 }
 
-/// Plaintext WS accept loop.
+/// Plaintext WS accept loop. Budgets are parameters for the same reason as
+/// in [`spawn_wss_listener`].
 fn spawn_plain_ws_listener(
     listener: TcpListener,
     state: Arc<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
+    upgrade_budget: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         accept_loop(
@@ -714,36 +839,144 @@ fn spawn_plain_ws_listener(
             state,
             &mut shutdown_rx,
             "WS",
-            |stream, state, peer, sd| async move {
-                if !admit(&state, &peer) {
-                    return;
-                }
-                handle_connection(Stream::Plain(stream), state, peer, sd).await;
+            move |stream, state, peer, sd| async move {
+                run_plain_ws_connection(stream, state, peer, sd, upgrade_budget).await;
             },
         )
         .await;
     })
 }
 
-/// Apply the connection cap and account for one live connection.
+/// One WSS connection: admit, TLS handshake under a budget, upgrade under a
+/// budget, then serve.
 ///
-/// The guard must be created *before* the counter is incremented, so the reject
-/// path decrements a slot it never took. The TLS handshake happens before this
-/// is reached, which is a known gap: a peer that opens a socket and never sends
-/// a ClientHello holds a task until the handshake times out.
-fn admit(state: &Arc<AppState>, peer: &SocketAddr) -> bool {
-    let _guard = ConnectionGuard {
+/// Admission runs *first* — before the TLS handshake — so a peer that never
+/// sends a `ClientHello` is counted against the connection cap and bounded by
+/// the per-IP budget instead of holding an invisible task and fd forever.
+/// The guard returned by [`admit`] is bound in this future, so every early
+/// return below drops it and releases the slot; nothing else can outlive the
+/// task holding it.
+///
+/// The two budgets are parameters rather than constants so a test can
+/// exercise both give-up paths without waiting out the production values.
+async fn run_wss_connection(
+    acceptor: tokio_rustls::TlsAcceptor,
+    stream: TcpStream,
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    sd: watch::Receiver<bool>,
+    tls_budget: Duration,
+    upgrade_budget: Duration,
+) {
+    let Some(_guard) = admit(&state, &peer) else {
+        return;
+    };
+    let Some(tls) = accept_tls(&acceptor, stream, peer, tls_budget).await else {
+        return;
+    };
+    handle_connection(
+        UpgradeDeadline::new(Stream::Tls(Box::new(tls)), upgrade_budget),
+        state,
+        peer,
+        sd,
+    )
+    .await;
+}
+
+/// One plaintext WS connection: admit, upgrade under a budget, then serve.
+///
+/// Same shape as [`run_wss_connection`] without the TLS phase. The rate limit
+/// and the cap both run before the upgrade, so a peer over its budget is
+/// refused before any handshake work happens.
+async fn run_plain_ws_connection(
+    stream: TcpStream,
+    state: Arc<AppState>,
+    peer: SocketAddr,
+    sd: watch::Receiver<bool>,
+    upgrade_budget: Duration,
+) {
+    let Some(_guard) = admit(&state, &peer) else {
+        return;
+    };
+    handle_connection(
+        UpgradeDeadline::new(Stream::Plain(stream), upgrade_budget),
+        state,
+        peer,
+        sd,
+    )
+    .await;
+}
+
+/// Complete one TLS handshake, or give up when `timeout` elapses.
+///
+/// The budget is a parameter rather than the constant so a test can exercise
+/// the give-up path without waiting out the production value. A timeout
+/// yields the same verdict as a handshake that failed outright — `None`, the
+/// task ends, and the connection slot [`admit`] took is released by the
+/// guard's drop.
+async fn accept_tls<S>(
+    acceptor: &tokio_rustls::TlsAcceptor,
+    stream: S,
+    peer: SocketAddr,
+    timeout: Duration,
+) -> Option<tokio_rustls::server::TlsStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(timeout, acceptor.accept(stream)).await {
+        Ok(Ok(tls)) => Some(tls),
+        Ok(Err(e)) => {
+            error!("TLS handshake error from {peer}: {e}");
+            None
+        }
+        Err(_) => {
+            // The peer held a task, an fd and a counted slot without ever
+            // speaking TLS: silence gets the same verdict as a handshake
+            // that actually failed.
+            warn!("TLS handshake from {peer} timed out after {timeout:?}");
+            None
+        }
+    }
+}
+
+/// Apply the per-IP rate limit and the connection cap, and account for one
+/// live connection.
+///
+/// Returns the [`ConnectionGuard`] that holds the slot; the caller binds it
+/// for as long as the connection task runs, so every early return — a rate
+/// refusal, a full cap, a timed-out handshake, a rejected upgrade — drops it
+/// and gives the slot back. Admission runs before both handshakes precisely
+/// so those paths are the ones the guard covers.
+///
+/// The guard is created *before* the counter is incremented, so the reject
+/// path decrements a slot it never took.
+fn admit(state: &Arc<AppState>, peer: &SocketAddr) -> Option<ConnectionGuard> {
+    // The rate limit comes first: it is the cheapest check, and refusing
+    // here means an IP that spent its budget never touches the connection
+    // counter or a handshake at all. The connection handler applies the same
+    // check again after the upgrade, so a connection costs two window slots;
+    // that post-upgrade check lives in connection.rs and is out of scope
+    // here.
+    if !state.rate_limiter.allow(peer.ip()) {
+        warn!("Rate limit exceeded for {peer}");
+        state
+            .metrics
+            .messages_dropped_rate_limit
+            .fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let guard = ConnectionGuard {
         count: state.active_connections.clone(),
     };
     if state.active_connections.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
         warn!("Connection limit reached, rejecting {peer}");
-        return false;
+        return None;
     }
     state
         .metrics
         .connections_connected
         .fetch_add(1, Ordering::Relaxed);
-    true
+    Some(guard)
 }
 
 /// The accept loop, shared by both listeners.
@@ -835,4 +1068,466 @@ fn spawn_housekeeping(state: Arc<AppState>) -> JoinHandle<()> {
             }
         }
     })
+}
+
+// ================================================================
+//  W6.7 — handshakes are timed and counted
+//
+//  Admission runs before both handshakes, both handshakes carry a
+//  budget, and the guard that counts a connection is held by the task
+//  that owns it. Every test drives those seams with a budget it chose,
+//  so nothing here waits out a production timeout.
+// ================================================================
+
+#[cfg(test)]
+mod service_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use rustls::pki_types::ServerName;
+    use tokio_tungstenite::connect_async;
+    use tungstenite::Message;
+
+    /// The bearer token test connections present during `relay_auth`.
+    const TEST_TOKEN: &str = "test-secret-for-unit-tests!!!";
+
+    /// A peer address for admission tests. The rate limiter keys on the IP,
+    /// so the port only has to make the address well-formed.
+    fn peer(port: u16) -> SocketAddr {
+        format!("203.0.113.7:{port}").parse().expect("peer address")
+    }
+
+    /// Connections currently held, as admission maintains it.
+    fn active(state: &AppState) -> usize {
+        state.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// An [`AppState`] with nothing listening: only the fields admission and
+    /// the per-connection pipelines touch are meaningful here. `max_attempts`
+    /// is the per-IP connection budget.
+    fn test_state(max_attempts: usize) -> Arc<AppState> {
+        Arc::new(AppState {
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            active_connections: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(Metrics::new()),
+            rate_limiter: Arc::new(RateLimiter::new(max_attempts, 60)),
+            nonces: Arc::new(RwLock::new(NonceCache::new())),
+            tls_pin: None,
+            route_keys: Arc::new(crate::state::StaticRouteKeys::new()),
+            config: Config {
+                ws_port: 0,
+                ws_bind: "127.0.0.1".parse().expect("loopback"),
+                wss_port: 0,
+                health_port: 0,
+                health_bind: "127.0.0.1".parse().expect("loopback"),
+                hmac_secret: TEST_TOKEN.as_bytes().to_vec(),
+                hmac_secret_file: std::env::temp_dir().join("relay-service-test-hmac"),
+                health_token: TEST_TOKEN.into(),
+                metrics_token: None,
+                relay_token: TEST_TOKEN.into(),
+                tls: crate::tls::TlsParams::default(),
+                enable_plain_ws: true,
+                nonce_file: std::env::temp_dir()
+                    .join(format!("relay-service-tests-{}.json", std::process::id())),
+                auth_timeout_secs: 10,
+                relay_cert_pin: None,
+            },
+        })
+    }
+
+    /// Poll `check` until it holds or `budget` runs out.
+    async fn wait_for(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if check() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// A self-signed certificate and its key, in PEM.
+    fn self_signed_pair() -> (String, String) {
+        let key = rcgen::KeyPair::generate().expect("key gen");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params");
+        let cert = params.self_signed(&key).expect("self signed");
+        (cert.pem(), key.serialize_pem())
+    }
+
+    /// An acceptor serving exactly [`self_signed_pair`] material, built
+    /// through the real server-configuration path.
+    fn test_acceptor(cert_pem: &str, key_pem: &str) -> tokio_rustls::TlsAcceptor {
+        let config = crate::tls::build_tls_server_config(cert_pem, key_pem).expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// A client that trusts the test certificate, so a real handshake can be
+    /// driven against [`test_acceptor`].
+    fn trusting_client(cert_pem: &str) -> tokio_rustls::TlsConnector {
+        let mut roots = rustls::RootCertStore::empty();
+        let cert = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem.as_bytes()))
+            .next()
+            .expect("the test certificate parses to one entry")
+            .expect("readable certificate");
+        roots.add(cert).expect("trust the test certificate");
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    // ---------------------------------------------------------------
+    //  Admission: rate limit, cap, and the slot the guard holds
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn admit_holds_its_slot_until_the_guard_drops() {
+        let state = test_state(10);
+        let guard = admit(&state, &peer(40000)).expect("first connection admits");
+
+        // This is what makes an in-progress handshake countable at all: the
+        // slot is held for as long as the caller holds the guard, not for
+        // the duration of `admit` itself.
+        assert_eq!(active(&state), 1);
+        assert_eq!(
+            state.metrics.connections_connected.load(Ordering::Relaxed),
+            1
+        );
+
+        drop(guard);
+        assert_eq!(active(&state), 0);
+    }
+
+    #[test]
+    fn admit_rejects_at_the_cap_without_leaking_the_probe() {
+        // Saturate the counter directly: driving 10k admissions through the
+        // rate limiter would only re-prove the limiter's budget, not the cap.
+        let state = test_state(usize::MAX);
+        state
+            .active_connections
+            .fetch_add(MAX_CONNECTIONS, Ordering::Relaxed);
+
+        assert!(admit(&state, &peer(40001)).is_none(), "at the cap");
+        // The probe incremented before it was rejected and must have been
+        // given back — a reject path that leaks a slot would slowly deny the
+        // whole relay service.
+        assert_eq!(active(&state), MAX_CONNECTIONS);
+        // ...and a rejected connection was never counted as connected.
+        assert_eq!(
+            state.metrics.connections_connected.load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn admit_refuses_a_spent_ip_before_taking_a_slot() {
+        let state = test_state(1);
+        let first = admit(&state, &peer(40002)).expect("the budget allows the first");
+
+        assert!(
+            admit(&state, &peer(40003)).is_none(),
+            "the second connection from the same IP must be refused"
+        );
+        assert_eq!(
+            state
+                .metrics
+                .messages_dropped_rate_limit
+                .load(Ordering::Relaxed),
+            1
+        );
+        // Only the first connection holds a slot: the refusal never touched
+        // the counter.
+        assert_eq!(active(&state), 1);
+
+        drop(first);
+        assert_eq!(active(&state), 0);
+    }
+
+    // ---------------------------------------------------------------
+    //  The TLS handshake budget
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tls_handshake_gives_up_on_a_peer_that_never_speaks() {
+        let (cert_pem, key_pem) = self_signed_pair();
+        let acceptor = test_acceptor(&cert_pem, &key_pem);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // The client connects and then says nothing at all. Without the
+        // budget inside `accept_tls`, the future below would never resolve —
+        // which is the defect itself, so the outer timeout is only a safety
+        // net that turns "hangs forever" into a failure.
+        let _silent = TcpStream::connect(addr).await.expect("connect");
+        let (stream, _) = listener.accept().await.expect("accept");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            accept_tls(&acceptor, stream, addr, Duration::from_millis(100)),
+        )
+        .await;
+        let accepted = outcome.expect("accept_tls must give up on its own, not hang");
+        assert!(
+            accepted.is_none(),
+            "a silent peer must not complete a handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_completes_within_the_budget_for_a_real_client() {
+        let (cert_pem, key_pem) = self_signed_pair();
+        let acceptor = test_acceptor(&cert_pem, &key_pem);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let connector = trusting_client(&cert_pem);
+        let server_name = ServerName::try_from("localhost".to_string()).expect("server name");
+
+        let client = tokio::spawn(async move {
+            let tcp = TcpStream::connect(addr).await.expect("connect");
+            connector
+                .connect(server_name, tcp)
+                .await
+                .expect("client handshake");
+        });
+        let (stream, _) = listener.accept().await.expect("accept");
+        let server = accept_tls(&acceptor, stream, peer(40004), Duration::from_secs(5)).await;
+        assert!(
+            server.is_some(),
+            "a real handshake must survive the timeout wrapper"
+        );
+        tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client handshake must be bounded")
+            .expect("client task must not panic");
+    }
+
+    // ---------------------------------------------------------------
+    //  The upgrade budget, through the real accept loop
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn plain_accept_loop_drops_a_peer_that_never_sends_a_request() {
+        let state = test_state(1000);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_plain_ws_listener(
+            listener,
+            state.clone(),
+            shutdown_rx,
+            Duration::from_millis(100),
+        );
+
+        // TCP completes, the HTTP request never does.
+        let _silent = TcpStream::connect(addr).await.expect("connect");
+        assert!(
+            wait_for(Duration::from_secs(2), || active(&state) == 1).await,
+            "a peer waiting on the upgrade is counted while it waits"
+        );
+        assert!(
+            wait_for(Duration::from_secs(3), || active(&state) == 0).await,
+            "the upgrade budget must end the silent peer and release its slot \
+             (still {})",
+            active(&state)
+        );
+
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn upgrade_budget_is_released_once_the_upgrade_completes() {
+        let state = test_state(1000);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_plain_ws_listener(
+            listener,
+            state.clone(),
+            shutdown_rx,
+            Duration::from_millis(100),
+        );
+
+        let (mut ws, _) = connect_async(format!("ws://{addr}"))
+            .await
+            .expect("upgrade inside the budget");
+        assert!(
+            wait_for(Duration::from_secs(2), || active(&state) == 1).await,
+            "the upgraded connection holds a counted slot"
+        );
+
+        // Outlive the original budget. Everything after the handshake must
+        // pass through untouched, or a connection that took a little longer
+        // to authenticate would be killed by a timer that has stopped meaning
+        // anything.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let auth = serde_json::json!({
+            "type": "relay_auth",
+            "device_id": "f157",
+            "relay_token": TEST_TOKEN,
+        });
+        ws.send(Message::Text(auth.to_string()))
+            .await
+            .expect("send auth after the budget expired");
+        let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("auth must be answered")
+            .expect("connection must still be open")
+            .expect("readable");
+        match reply {
+            Message::Text(text) => assert!(
+                text.contains("relay_auth_ok"),
+                "auth sent after the budget expired must be served, got: {text}"
+            ),
+            other => panic!("expected relay_auth_ok, got {other:?}"),
+        }
+        assert!(state.clients.read().await.contains_key("f157"));
+
+        drop(ws);
+        assert!(
+            wait_for(Duration::from_secs(2), || active(&state) == 0).await,
+            "dropping the client must release the slot (still {})",
+            active(&state)
+        );
+
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn wss_accept_loop_counts_a_silent_peer_then_drops_it_on_the_handshake_budget() {
+        let (cert_pem, key_pem) = self_signed_pair();
+        let acceptor = test_acceptor(&cert_pem, &key_pem);
+        let state = test_state(1000);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_wss_listener(
+            listener,
+            state.clone(),
+            shutdown_rx,
+            acceptor,
+            Duration::from_millis(500),
+            Duration::from_secs(5),
+        );
+
+        // TCP completes; no ClientHello ever arrives — and the peer counts
+        // for every millisecond it stalls. Before admission moved ahead of
+        // the handshake, this slot never existed at all.
+        let _silent = TcpStream::connect(addr).await.expect("connect");
+        assert!(
+            wait_for(Duration::from_secs(2), || active(&state) == 1).await,
+            "a handshake in progress must hold a counted slot"
+        );
+        assert_eq!(
+            state.metrics.connections_connected.load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            wait_for(Duration::from_secs(3), || active(&state) == 0).await,
+            "the handshake budget must release the slot (still {})",
+            active(&state)
+        );
+
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn wss_accept_loop_drops_a_stalled_upgrade_and_releases_its_slot() {
+        let (cert_pem, key_pem) = self_signed_pair();
+        let acceptor = test_acceptor(&cert_pem, &key_pem);
+        let connector = trusting_client(&cert_pem);
+        let state = test_state(1000);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_wss_listener(
+            listener,
+            state.clone(),
+            shutdown_rx,
+            acceptor,
+            Duration::from_secs(5),
+            Duration::from_millis(100),
+        );
+
+        // A real TLS handshake, then silence: no HTTP request ever follows,
+        // so only the upgrade budget can end this task.
+        let server_name = ServerName::try_from("localhost".to_string()).expect("server name");
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let _tls = connector
+            .connect(server_name, tcp)
+            .await
+            .expect("client TLS handshake");
+        assert!(
+            wait_for(Duration::from_secs(2), || active(&state) == 1).await,
+            "the connection is counted across the stalled upgrade"
+        );
+        assert!(
+            wait_for(Duration::from_secs(3), || active(&state) == 0).await,
+            "the upgrade budget must release the slot (still {})",
+            active(&state)
+        );
+
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
+
+    // ---------------------------------------------------------------
+    //  Rate limit bounds the pre-upgrade path
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn over_budget_peer_is_refused_before_the_upgrade() {
+        // The production accept loop with the production budgets: the
+        // refusal happens before any handshake work, so nothing here waits
+        // one out.
+        let state = test_state(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = spawn_plain_ws_listener(
+            listener,
+            state.clone(),
+            shutdown_rx,
+            Duration::from_secs(WS_UPGRADE_TIMEOUT_SECS),
+        );
+
+        connect_async(format!("ws://{addr}"))
+            .await
+            .expect("the first connection spends the budget and upgrades");
+
+        // Same IP, budget spent. The upgrade must never happen, so there is
+        // no handshake response to read — the client sees the refusal as a
+        // failed upgrade, and it arrives promptly rather than by timeout.
+        let second = tokio::time::timeout(
+            Duration::from_secs(3),
+            connect_async(format!("ws://{addr}")),
+        )
+        .await;
+        assert!(
+            matches!(second, Ok(Err(_))),
+            "the over-budget peer must be refused before any upgrade, got {second:?}"
+        );
+        assert!(
+            wait_for(Duration::from_secs(2), || {
+                state
+                    .metrics
+                    .messages_dropped_rate_limit
+                    .load(Ordering::Relaxed)
+                    >= 1
+            })
+            .await,
+            "the refusal must be counted in messages_dropped_rate_limit"
+        );
+
+        let _ = shutdown_tx.send(true);
+        task.abort();
+    }
 }

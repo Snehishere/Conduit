@@ -58,6 +58,30 @@ pub(crate) const MSG_BURST: f64 = 50.0;
 /// wedged client and stalls that connection indefinitely.
 pub(crate) const FORWARD_TIMEOUT_SECS: u64 = 5;
 
+/// How long a peer gets to finish the TLS handshake after its TCP connection
+/// is accepted — from the accept (or the absence of any byte) to a completed
+/// handshake.
+///
+/// The handshake runs in a dedicated task that holds a task slot, a file
+/// descriptor, and a counted connection slot (admission happens before it),
+/// so without a bound a peer that completes TCP and never sends a
+/// `ClientHello`, or a slowloris that trickles bytes, holds all three
+/// forever. Ten seconds is far more than a real handshake needs — well under
+/// a second even on a high-latency mobile link — while making a stalled peer
+/// cost seconds rather than the lifetime of the process.
+pub(crate) const TLS_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
+/// How long a peer gets to complete the WebSocket upgrade once its transport
+/// (TLS or plain TCP) is established — the HTTP request in, the `101` out.
+///
+/// The same reasoning as [`TLS_HANDSHAKE_TIMEOUT_SECS`]: the upgrade runs
+/// inside the connection task while that task holds a counted connection
+/// slot, and an untimed upgrade is an untimed slot. The budget is armed when
+/// the stream is handed to the connection handler and disarmed the moment
+/// the upgrade response is written, so it never reaches an established
+/// connection's lifetime.
+pub(crate) const WS_UPGRADE_TIMEOUT_SECS: u64 = 10;
+
 /// A device id as documented in PROTOCOL.md §`device_id`: 1..=64 lowercase hex
 /// characters, optionally grouped by single hyphens.
 ///

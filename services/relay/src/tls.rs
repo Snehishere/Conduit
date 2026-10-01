@@ -136,6 +136,112 @@ pub fn configured_subject_alt_names() -> Vec<String> {
     TlsParams::from_env().subject_alt_names()
 }
 
+// ============================================================
+//  Generation of the relay's own certificate
+// ============================================================
+
+/// How far a generated certificate's `notBefore` sits behind the moment of
+/// generation, in days.
+///
+/// Clients verify the window against *their* clock, so a freshly minted
+/// certificate is only as trustworthy as the two clocks involved: a relay that
+/// has not run NTP since boot, or an operator who set a laptop's clock by
+/// hand, would otherwise fail verification against a certificate created
+/// seconds ago. A week absorbs that skew. It costs nothing here because trust
+/// comes from the SPKI pin, not from how wide the window is.
+const GENERATED_CERT_BACKDATE_DAYS: i64 = 7;
+
+/// Lifetime of a generated certificate, in days — ten years plus leap days.
+///
+/// rcgen's defaults are 1975-01-01 → 4096-01-01: a window of over two
+/// thousand years, outside of which nothing can ever fall, so "expired" and
+/// "not yet valid" are facts no expiry check can ever surface. At the other
+/// extreme, the 90-day window a public CA would issue is wrong for this relay:
+/// the certificate is generated once, persisted next to the relay, and nobody
+/// is watching the calendar, so a short window just means TLS dies one
+/// morning while the operator is away. Ten years was chosen because it is a
+/// full hardware-replacement cycle — expiry becomes a rare, deliberate
+/// renewal event rather than an operational surprise — while remaining a
+/// real, checkable bound. It is the same standard [`check_validity_window`]
+/// holds every loaded certificate to, generated or supplied.
+const GENERATED_CERT_LIFETIME_DAYS: i64 = 3653;
+
+/// Generate the relay's self-signed certificate and key, PEM-encoded.
+///
+/// Sets explicitly what rcgen would otherwise leave at its (meaningless)
+/// defaults:
+///
+/// * **Validity window** — backdated [`GENERATED_CERT_BACKDATE_DAYS`] days,
+///   [`GENERATED_CERT_LIFETIME_DAYS`] days long. Reasoning on both constants
+///   above; the short version is that a window must be finite to be checkable
+///   but long enough that nobody's relay dies in the night.
+/// * **`keyUsage: digitalSignature`** — every TLS 1.3 handshake authenticates
+///   the server with a `CertificateVerify` signature, which is exactly bit 0
+///   of KeyUsage, so this is the one usage the acceptor actually exercises.
+///   `keyEncipherment` is deliberately not claimed: it advertises the RSA key
+///   transport TLS 1.3 removed, and [`build_tls_server_config`] speaks TLS
+///   1.3 only.
+/// * **`extendedKeyUsage: serverAuth`** — the purpose strict verifiers look
+///   for in a TLS server certificate. An EKU extension that is present but
+///   omits serverAuth is rejected outright by such verifiers; asserting it
+///   turns "extension absent, tolerated" into "extension present and
+///   correctly scoped".
+fn generate_tls_material(subject_alt_names: Vec<String>) -> Result<(String, String), String> {
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("rcgen key error: {e}"))?;
+    let mut cert_params = rcgen::CertificateParams::new(subject_alt_names)
+        .map_err(|e| format!("rcgen params error: {e}"))?;
+
+    let today = unix_days_now();
+    let (year, month, day) = civil_from_unix_days(today - GENERATED_CERT_BACKDATE_DAYS);
+    cert_params.not_before = rcgen::date_time_ymd(year, month, day);
+    let (year, month, day) = civil_from_unix_days(today + GENERATED_CERT_LIFETIME_DAYS);
+    cert_params.not_after = rcgen::date_time_ymd(year, month, day);
+    cert_params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+    cert_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+
+    let cert = cert_params
+        .self_signed(&key_pair)
+        .map_err(|e| format!("rcgen sign error: {e}"))?;
+    Ok((cert.pem(), key_pair.serialize_pem()))
+}
+
+/// Seconds elapsed since the Unix epoch, or 0 on a clock set before 1970
+/// (a clock that wrong is itself reported by [`check_validity_window`], and
+/// must not panic certificate generation on the way).
+fn unix_secs_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Days elapsed since 1970-01-01 in the current UTC calendar.
+fn unix_days_now() -> i64 {
+    unix_secs_now().div_euclid(86_400)
+}
+
+/// The UTC calendar date `days` after 1970-01-01, as `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, inlined so this crate does not take a
+/// dependency on a date/time library: rcgen needs a civil date for
+/// `date_time_ymd` but re-exports no way to compute one.
+fn civil_from_unix_days(days: i64) -> (i32, u8, u8) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // day of era, [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // year of era, [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index with 0 = March, [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (
+        (if month <= 2 { y + 1 } else { y }) as i32,
+        month as u8,
+        day as u8,
+    )
+}
+
 /// Load (or generate) the relay's TLS material from the environment.
 pub fn load_tls_context() -> Result<TlsContext, String> {
     load_tls_context_with(&TlsParams::from_env())
@@ -168,6 +274,11 @@ pub fn load_tls_context_with(params: &TlsParams) -> Result<TlsContext, String> {
             .map_err(|e| format!("Failed to read {}: {e}", cert_path.display()))?;
         let key = std::fs::read_to_string(&key_path)
             .map_err(|e| format!("Failed to read {}: {e}", key_path.display()))?;
+        // Fail closed on a certificate that is not valid right now — see
+        // check_validity_window for why this refuses instead of warning, and
+        // why a previously *generated* pair is judged by exactly the same
+        // rule (once persisted, it is just two files on disk).
+        check_validity_window(&cert, &cert_path, utc_stamp_now())?;
         (cert, key, TlsSource::Provided)
     } else {
         let subject_alt_names = params.subject_alt_names();
@@ -176,15 +287,7 @@ pub fn load_tls_context_with(params: &TlsParams) -> Result<TlsContext, String> {
             certs_dir.display(),
             subject_alt_names
         );
-        let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("rcgen key error: {e}"))?;
-        let cert_params = rcgen::CertificateParams::new(subject_alt_names.clone())
-            .map_err(|e| format!("rcgen params error: {e}"))?;
-        let cert = cert_params
-            .self_signed(&key_pair)
-            .map_err(|e| format!("rcgen sign error: {e}"))?;
-
-        let cert_pem = cert.pem();
-        let key_pem = key_pair.serialize_pem();
+        let (cert_pem, key_pem) = generate_tls_material(subject_alt_names.clone())?;
 
         std::fs::write(&cert_path, &cert_pem)
             .map_err(|e| format!("Failed to write {}: {e}", cert_path.display()))?;
@@ -462,6 +565,242 @@ pub fn spki_sha256_pin(cert_pem: &str) -> Result<String, String> {
     ))
 }
 
+// ============================================================
+//  Validity window of a certificate read off disk
+// ============================================================
+
+/// A UTC timestamp as `(year, month, day, hour, minute, second)`.
+///
+/// Deliberately plain integers: this crate depends on no date/time library
+/// (rcgen re-exports none), and comparing validity windows needs nothing more
+/// than lexicographic ordering on civil time — exactly what a tuple of these
+/// fields gives for every date an X.509 certificate can carry.
+type ValidityStamp = (i32, u8, u8, u8, u8, u8);
+
+/// Render a [`ValidityStamp`] as `YYYY-MM-DDTHH:MM:SSZ`, for error messages
+/// an operator will read next to a `date` on the same box.
+fn format_validity_stamp(stamp: &ValidityStamp) -> String {
+    let (year, month, day, hour, minute, second) = *stamp;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// The certificate's `validity` field: `(notBefore, notAfter)` in UTC.
+///
+/// Walks the DER with the same [`read_tlv`] primitive the SPKI pin uses —
+/// `validity` sits a fixed position ahead of the SubjectPublicKeyInfo that
+/// [`spki_der_from_certificate`] slices out — so this check needs no X.509
+/// library for a question that amounts to two timestamps.
+fn validity_window_from_pem(cert_pem: &str) -> Result<(ValidityStamp, ValidityStamp), String> {
+    let mut reader = std::io::BufReader::new(cert_pem.as_bytes());
+    let der: CertificateDer<'static> = certs(&mut reader)
+        .next()
+        .ok_or_else(|| "no certificate block found in PEM".to_string())?
+        .map_err(|e| format!("failed to parse certificate PEM: {e}"))?;
+    validity_window_from_der(der.as_ref())
+}
+
+/// [`validity_window_from_pem`] for already-parsed DER bytes.
+fn validity_window_from_der(der: &[u8]) -> Result<(ValidityStamp, ValidityStamp), String> {
+    let cert_tlv = read_tlv(der, 0).ok_or_else(|| "certificate is not valid DER".to_string())?;
+    if cert_tlv.tag != TAG_SEQUENCE {
+        return Err("certificate is not a DER SEQUENCE".to_string());
+    }
+    let tbs = read_tlv(der, cert_tlv.contents.start)
+        .ok_or_else(|| "certificate TBSCertificate is truncated or malformed".to_string())?;
+    if tbs.tag != TAG_SEQUENCE {
+        return Err("TBSCertificate is not a DER SEQUENCE".to_string());
+    }
+
+    let mut pos = tbs.contents.start;
+    // version is [0] EXPLICIT and optional; skip it when present.
+    let first = read_tlv(der, pos).ok_or_else(|| "TBSCertificate is empty".to_string())?;
+    if first.tag == TAG_CONTEXT_0 {
+        pos = first.full.end;
+    }
+    // serialNumber, signature, issuer — validity is the next element.
+    for field in ["serialNumber", "signature", "issuer"] {
+        let tlv = read_tlv(der, pos)
+            .ok_or_else(|| format!("TBSCertificate is truncated before {field}"))?;
+        pos = tlv.full.end;
+    }
+    let validity =
+        read_tlv(der, pos).ok_or_else(|| "TBSCertificate has no validity field".to_string())?;
+    if validity.tag != TAG_SEQUENCE {
+        return Err("validity is not a DER SEQUENCE".to_string());
+    }
+    let not_before = read_tlv(der, validity.contents.start)
+        .ok_or_else(|| "validity is missing notBefore".to_string())?;
+    let not_after = read_tlv(der, not_before.full.end)
+        .ok_or_else(|| "validity is missing notAfter".to_string())?;
+    Ok((
+        parse_certificate_time(der, &not_before, "notBefore")?,
+        parse_certificate_time(der, &not_after, "notAfter")?,
+    ))
+}
+
+/// Decode one X.509 `Time` element (RFC 5280 §4.1.2.5): `UTCTime` or
+/// `GeneralizedTime`, both required to be `Z`-suffixed in DER.
+fn parse_certificate_time(der: &[u8], tlv: &Tlv, label: &str) -> Result<ValidityStamp, String> {
+    const TAG_UTC_TIME: u8 = 0x17;
+    const TAG_GENERALIZED_TIME: u8 = 0x18;
+    let raw = &der[tlv.contents.clone()];
+    let text =
+        std::str::from_utf8(raw).map_err(|_| format!("{label} is not an ASCII timestamp"))?;
+    if !text.is_ascii() {
+        return Err(format!("{label} is not an ASCII timestamp: {text:?}"));
+    }
+    // Both encodings reduce to `MMDDHHMMSS` once the year prefix is split off;
+    // slicing at fixed byte offsets is only safe because the bytes are ASCII.
+    let (year, rest): (i32, &str) = match tlv.tag {
+        TAG_UTC_TIME => {
+            // RFC 5280 §4.1.2.5.1: YY 50..=99 → 19YY, YY 00..=49 → 20YY.
+            if text.len() != 13 || !text.ends_with('Z') {
+                return Err(format!(
+                    "{label} is not a DER UTCTime (YYMMDDHHMMSSZ): {text:?}"
+                ));
+            }
+            let yy: i32 = text[0..2]
+                .parse()
+                .map_err(|_| format!("{label} has a non-numeric year: {text:?}"))?;
+            // Drop the year prefix and the trailing 'Z', leaving MMDDHHMMSS.
+            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &text[2..12])
+        }
+        TAG_GENERALIZED_TIME => {
+            if text.len() != 15 || !text.ends_with('Z') {
+                return Err(format!(
+                    "{label} is not a DER GeneralizedTime (YYYYMMDDHHMMSSZ): {text:?}"
+                ));
+            }
+            let yyyy: i32 = text[0..4]
+                .parse()
+                .map_err(|_| format!("{label} has a non-numeric year: {text:?}"))?;
+            (yyyy, &text[4..14])
+        }
+        tag => {
+            return Err(format!(
+                "{label} has Time tag 0x{tag:02x}; expected UTCTime (0x17) or \
+                 GeneralizedTime (0x18)"
+            ));
+        }
+    };
+    if rest.len() != 10 {
+        return Err(format!("{label} is truncated: {text:?}"));
+    }
+    let field = |range: std::ops::Range<usize>| {
+        ascii_two_digit(&rest[range]).ok_or_else(|| format!("{label} is not numeric: {text:?}"))
+    };
+    let month = field(0..2)?;
+    let day = field(2..4)?;
+    let hour = field(4..6)?;
+    let minute = field(6..8)?;
+    let second = field(8..10)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return Err(format!("{label} is out of range: {text:?}"));
+    }
+    Ok((year, month, day, hour, minute, second))
+}
+
+/// Parse exactly two ASCII digits.
+fn ascii_two_digit(text: &str) -> Option<u8> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+        return None;
+    }
+    Some((bytes[0] - b'0') * 10 + (bytes[1] - b'0'))
+}
+
+/// The current UTC time as a [`ValidityStamp`].
+fn utc_stamp_now() -> ValidityStamp {
+    let secs = unix_secs_now();
+    let (year, month, day) = civil_from_unix_days(secs.div_euclid(86_400));
+    let time_of_day = secs.rem_euclid(86_400);
+    (
+        year,
+        month,
+        day,
+        (time_of_day / 3_600) as u8,
+        ((time_of_day % 3_600) / 60) as u8,
+        (time_of_day % 60) as u8,
+    )
+}
+
+/// Refuse certificate material whose validity window does not contain `now`.
+///
+/// [`load_tls_context_with`] applies this to every certificate read from disk
+/// — operator-supplied or previously generated alike, because after the first
+/// startup the two are literally the same pair of files and must be judged by
+/// the same rule.
+///
+/// # Refuse, not warn
+///
+/// rustls never inspects the validity window of the certificate *it* serves.
+/// Without this check the relay would start looking perfectly healthy and then
+/// fail every client handshake with `CertificateExpired` or
+/// `CertificateNotYetValid`, a failure visible only in the client's logs —
+/// precisely the trap a cert/key mismatch would set if it were not already
+/// refused at load time (see
+/// `build_tls_server_config_rejects_mismatched_cert_and_key`). Unusable
+/// material is rejected where an operator is watching, not by clients
+/// afterwards. A loud warning would be barely better: nothing streams relay
+/// logs to anyone by default, and unlike a questionable SAN — where the
+/// operator may know a reason to keep the certificate — an out-of-window
+/// certificate cannot work for any client, so there is nothing to warn *about*
+/// and still start.
+///
+/// # Clock skew
+///
+/// A wrong system clock can make a good certificate look out of window. That
+/// is why generated certificates are backdated a week, why the error text
+/// names the clock explicitly (skew is the likeliest cause of a not-yet-valid
+/// refusal, and "fix the clock" and "supply a valid certificate" both resolve
+/// it), and why the refusal is scoped to TLS rather than to the process:
+/// `service.rs` treats a failed context as "relay runs, WSS unavailable" —
+/// and as a hard startup error when the operator has pinned a certificate —
+/// so no clock problem can take the relay down entirely, while a relay whose
+/// certificate is silently dead is never allowed to look alive.
+///
+/// # Regeneration is deliberately operator-triggered
+///
+/// An out-of-window certificate is never replaced automatically: the SPKI pin
+/// published at `GET /pin` is the value clients hold, and silently rotating
+/// it would break every pinned client while the relay logs stayed green. The
+/// error therefore says how to regenerate (delete `cert.pem` and `key.pem`)
+/// and what that costs (the pin changes).
+fn check_validity_window(
+    cert_pem: &str,
+    cert_path: &Path,
+    now: ValidityStamp,
+) -> Result<(), String> {
+    let (not_before, not_after) = validity_window_from_pem(cert_pem)?;
+    if now < not_before {
+        return Err(format!(
+            "supplied certificate {} is not valid until {} (system clock says \
+             {}); check the system clock, or supply a certificate whose \
+             validity window contains the present",
+            cert_path.display(),
+            format_validity_stamp(&not_before),
+            format_validity_stamp(&now),
+        ));
+    }
+    if now > not_after {
+        return Err(format!(
+            "supplied certificate {} expired at {} (system clock says {}); \
+             delete it and its key to have the relay generate a fresh pair \
+             (the SPKI pin changes — pinned clients must be updated), or \
+             supply a certificate still inside its validity window",
+            cert_path.display(),
+            format_validity_stamp(&not_after),
+            format_validity_stamp(&now),
+        ));
+    }
+    Ok(())
+}
+
 fn write_key_restricted(path: &Path, contents: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -545,10 +884,9 @@ mod tests {
     }
 
     fn generate_self_signed_pair_with_sans(sans: &[String]) -> (String, String) {
-        let key_pair = rcgen::KeyPair::generate().expect("key gen failed");
-        let params = rcgen::CertificateParams::new(sans.to_vec()).expect("params failed");
-        let cert = params.self_signed(&key_pair).expect("self_signed failed");
-        (cert.pem(), key_pair.serialize_pem())
+        // The production generator, so every test below exercises the exact
+        // certificate the relay serves: validity window, key usages, SANs.
+        generate_tls_material(sans.to_vec()).expect("production generation failed")
     }
 
     /// Parse PEM cert and key into rustls types (mirrors load_tls_context internals).
@@ -1123,6 +1461,216 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
+    //  Validity window + key usages of generated certificates (W6.15)
+    // ---------------------------------------------------------------
+
+    /// DER bytes of the first certificate in a PEM block.
+    fn cert_der(cert_pem: &str) -> Vec<u8> {
+        let mut cr = std::io::BufReader::new(cert_pem.as_bytes());
+        certs(&mut cr)
+            .next()
+            .expect("certificate block present")
+            .expect("certificate parses")
+            .as_ref()
+            .to_vec()
+    }
+
+    /// The `extnValue` OCTET STRING of the extension whose OID is `oid`, if
+    /// the certificate carries it. Walks TBSCertificate's optional tail
+    /// (`version` … `subjectPublicKeyInfo`, then `[3] EXPLICIT extensions`).
+    fn extension_value<'a>(der: &'a [u8], oid: &[u8]) -> Option<&'a [u8]> {
+        const TAG_OID: u8 = 0x06;
+        const TAG_BOOLEAN: u8 = 0x01;
+        const TAG_OCTET_STRING: u8 = 0x04;
+        const TAG_EXTENSIONS: u8 = 0xa3; // [3] EXPLICIT
+
+        let cert_tlv = read_tlv(der, 0)?;
+        if cert_tlv.tag != TAG_SEQUENCE {
+            return None;
+        }
+        let tbs = read_tlv(der, cert_tlv.contents.start)?;
+        if tbs.tag != TAG_SEQUENCE {
+            return None;
+        }
+        let mut pos = tbs.contents.start;
+        let first = read_tlv(der, pos)?;
+        if first.tag == TAG_CONTEXT_0 {
+            pos = first.full.end;
+        }
+        while pos < tbs.contents.end {
+            let tlv = read_tlv(der, pos)?;
+            if tlv.tag == TAG_EXTENSIONS {
+                let seq = read_tlv(der, tlv.contents.start)?;
+                if seq.tag != TAG_SEQUENCE {
+                    return None;
+                }
+                let mut ext_pos = seq.contents.start;
+                while ext_pos < seq.contents.end {
+                    let ext = read_tlv(der, ext_pos)?;
+                    if ext.tag != TAG_SEQUENCE {
+                        return None;
+                    }
+                    let extn_id = read_tlv(der, ext.contents.start)?;
+                    if extn_id.tag == TAG_OID && &der[extn_id.contents.clone()] == oid {
+                        // extnValue follows extnID, preceded by an optional
+                        // `critical BOOLEAN DEFAULT FALSE`.
+                        let next = read_tlv(der, extn_id.full.end)?;
+                        let value = if next.tag == TAG_BOOLEAN {
+                            read_tlv(der, next.full.end)?
+                        } else {
+                            next
+                        };
+                        return (value.tag == TAG_OCTET_STRING)
+                            .then(|| &der[value.contents.clone()]);
+                    }
+                    ext_pos = ext.full.end;
+                }
+                return None;
+            }
+            pos = tlv.full.end;
+        }
+        None
+    }
+
+    /// Whether the concatenated OID elements of an EKU extension (its
+    /// SEQUENCE OF contents) list `oid`.
+    fn oid_sequence_contains(list_der: &[u8], oid: &[u8]) -> bool {
+        const TAG_OID: u8 = 0x06;
+        let mut pos = 0;
+        while pos < list_der.len() {
+            let Some(tlv) = read_tlv(list_der, pos) else {
+                return false;
+            };
+            if tlv.tag == TAG_OID && &list_der[tlv.contents.clone()] == oid {
+                return true;
+            }
+            pos = tlv.full.end;
+        }
+        false
+    }
+
+    /// id-at 2.5.29.15 (keyUsage), encoded as DER OID contents.
+    const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+    /// id-at 2.5.29.37 (extKeyUsage), encoded as DER OID contents.
+    const OID_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+    /// id-kp-serverAuth 1.3.6.1.5.5.7.3.1, encoded as DER OID contents.
+    const OID_SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+
+    #[test]
+    fn generated_certificate_sits_inside_a_bounded_validity_window() {
+        // The regression this pins: rcgen's defaults (1975-01-01 → 4096-01-01)
+        // make the certificate valid for over two thousand years, so no expiry
+        // check can ever observe an expired or not-yet-valid certificate.
+        let (cert_pem, _) = generate_self_signed_pair();
+        let (not_before, not_after) =
+            validity_window_from_pem(&cert_pem).expect("generated cert has a validity window");
+
+        let today = unix_days_now();
+        let now = utc_stamp_now();
+        let midnight = |(y, m, d): (i32, u8, u8)| (y, m, d, 0, 0, 0);
+
+        // Backdated — but by days, not decades. The -1 slack absorbs a test
+        // that runs across UTC midnight.
+        let earliest_not_before = midnight(civil_from_unix_days(
+            today - GENERATED_CERT_BACKDATE_DAYS - 1,
+        ));
+        assert!(
+            not_before >= earliest_not_before && not_before <= now,
+            "notBefore {} must sit within {} days behind now, before defaults \
+             (1975-01-01) or a wrongly future date",
+            format_validity_stamp(&not_before),
+            GENERATED_CERT_BACKDATE_DAYS + 1
+        );
+
+        // Expiring roughly ten years out: the default 4096-01-01 is far
+        // beyond the upper bound, and a short window is below the lower one.
+        let lifetime_min = midnight(civil_from_unix_days(
+            today + GENERATED_CERT_LIFETIME_DAYS - 1,
+        ));
+        let lifetime_max = midnight(civil_from_unix_days(
+            today + GENERATED_CERT_LIFETIME_DAYS + 1,
+        ));
+        assert!(
+            not_after >= lifetime_min && not_after <= lifetime_max,
+            "notAfter {} must fall near {} days from now (window [{}, {}])",
+            format_validity_stamp(&not_after),
+            GENERATED_CERT_LIFETIME_DAYS,
+            format_validity_stamp(&lifetime_min),
+            format_validity_stamp(&lifetime_max)
+        );
+    }
+
+    #[test]
+    fn generated_certificate_asserts_server_key_usages() {
+        // The regression this pins: no keyUsage / extendedKeyUsage extension
+        // was emitted at all, so a strict client — one that requires serverAuth
+        // in EKU, or digitalSignature in KeyUsage — rejects the certificate the
+        // relay serves even though rustls itself accepts it.
+        let (cert_pem, _) = generate_self_signed_pair();
+        let der = cert_der(&cert_pem);
+
+        // An extension's extnValue is an OCTET STRING *wrapping* its DER
+        // value, so unwrap twice: extension → KeyUsage BIT STRING.
+        const TAG_BIT_STRING: u8 = 0x03;
+        let key_usage_ext = extension_value(&der, OID_KEY_USAGE)
+            .expect("keyUsage extension must be present on a server certificate");
+        let bit_string = read_tlv(key_usage_ext, 0).expect("extnValue must hold a BIT STRING");
+        assert_eq!(
+            bit_string.tag, TAG_BIT_STRING,
+            "keyUsage extnValue must be a BIT STRING"
+        );
+        let bits = &key_usage_ext[bit_string.contents.clone()];
+        // BIT STRING contents: first octet counts unused bits (rcgen writes
+        // 9 significant bits → 7 unused), then the usage bits MSB-first —
+        // digitalSignature is bit 0.
+        assert!(
+            bits.len() >= 2,
+            "keyUsage BIT STRING is too short: {bits:?}"
+        );
+        assert!(
+            bits[0] <= 7,
+            "keyUsage unused-bit count must be 0..=7, got {}",
+            bits[0]
+        );
+        assert!(
+            bits[1] & 0x80 != 0,
+            "digitalSignature (bit 0 of keyUsage) must be set, got {bits:?}"
+        );
+
+        let eku_ext = extension_value(&der, OID_EXTENDED_KEY_USAGE)
+            .expect("extendedKeyUsage extension must be present on a server certificate");
+        let seq = read_tlv(eku_ext, 0).expect("extnValue must hold a SEQUENCE");
+        assert_eq!(
+            seq.tag, TAG_SEQUENCE,
+            "extendedKeyUsage extnValue must be a SEQUENCE OF OID"
+        );
+        assert!(
+            oid_sequence_contains(&eku_ext[seq.contents.clone()], OID_SERVER_AUTH),
+            "extendedKeyUsage must list id-kp-serverAuth (1.3.6.1.5.5.7.3.1)"
+        );
+    }
+
+    #[test]
+    fn validity_window_parser_matches_the_openssl_fixture() {
+        // Third-party encoder on purpose: parsing rcgen's own output alone
+        // would only prove the walk round-trips our writer. The fixture's
+        // window (`-days 3` from the documented openssl command) is fixed, so
+        // this stays deterministic regardless of when it runs.
+        let (not_before, not_after) =
+            validity_window_from_pem(OPENSSL_EC_CERT_PEM).expect("parse openssl fixture window");
+        assert_eq!(
+            format_validity_stamp(&not_before),
+            "2026-09-28T12:42:13Z",
+            "notBefore decoded from the openssl fixture"
+        );
+        assert_eq!(
+            format_validity_stamp(&not_after),
+            "2026-10-01T12:42:13Z",
+            "notAfter decoded from the openssl fixture"
+        );
+    }
+
+    // ---------------------------------------------------------------
     //  Full TLS handshake over real TCP
     // ---------------------------------------------------------------
 
@@ -1407,6 +1955,112 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("RELAY_CERT_DIR", v) },
             None => unsafe { std::env::remove_var("RELAY_CERT_DIR") },
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------------------------
+    //  load_tls_context: validity window of a supplied certificate (W6.15)
+    // ---------------------------------------------------------------
+
+    /// A self-signed pair with an explicit validity window (midnight UTC on
+    /// the given dates, as rcgen takes them).
+    fn pair_with_window(not_before: (i32, u8, u8), not_after: (i32, u8, u8)) -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate().expect("key gen failed");
+        let mut params =
+            rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("params failed");
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
+        let cert = params.self_signed(&key_pair).expect("self_signed failed");
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
+    /// Materialise `cert_pem`/`key_pem` as an on-disk pair under `dir`.
+    fn write_supplied_pair(dir: &Path, cert_pem: &str, key_pem: &str) {
+        std::fs::create_dir_all(dir).expect("create certs dir");
+        std::fs::write(dir.join("cert.pem"), cert_pem).expect("write cert.pem");
+        std::fs::write(dir.join("key.pem"), key_pem).expect("write key.pem");
+    }
+
+    fn params_for(dir: &Path) -> TlsParams {
+        TlsParams {
+            cert_dir: dir.to_path_buf(),
+            hostname: "localhost".to_string(),
+            extra_sans: Vec::new(),
+        }
+    }
+
+    /// Unique per-test directory under the system temp dir.
+    fn temp_certs_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("relay-tls-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn load_tls_context_refuses_an_expired_supplied_certificate() {
+        // The regression this pins: a certificate that expired years ago was
+        // loaded without complaint; rustls never checks the window of the
+        // certificate it serves, so the relay came up "healthy" and then
+        // failed every client handshake with CertificateExpired.
+        let dir = temp_certs_dir("expired");
+        let (cert_pem, key_pem) = pair_with_window((2020, 1, 1), (2021, 1, 1));
+        write_supplied_pair(&dir, &cert_pem, &key_pem);
+
+        let err = load_tls_context_with(&params_for(&dir))
+            .err()
+            .expect("an expired certificate must be refused");
+        assert!(
+            err.contains("expired"),
+            "error must state that the certificate expired, got: {err}"
+        );
+        assert!(
+            err.contains("delete"),
+            "error must say how to regenerate, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_tls_context_refuses_a_not_yet_valid_supplied_certificate() {
+        // Same failure in the other direction: a certificate minted on a box
+        // whose clock was ahead (or delivered early) must not be served.
+        let dir = temp_certs_dir("not-yet-valid");
+        let (cert_pem, key_pem) = pair_with_window((2100, 1, 1), (2101, 1, 1));
+        write_supplied_pair(&dir, &cert_pem, &key_pem);
+
+        let err = load_tls_context_with(&params_for(&dir))
+            .err()
+            .expect("a not-yet-valid certificate must be refused");
+        assert!(
+            err.contains("not valid until"),
+            "error must state when the certificate becomes valid, got: {err}"
+        );
+        assert!(
+            err.contains("clock"),
+            "error must point at the system clock as a possible cause, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_tls_context_accepts_a_supplied_certificate_inside_its_window() {
+        // The check must not be over-eager: a certificate inside its window
+        // (here, one the relay generated itself and persisted) still loads,
+        // and the pin stays stable across restarts.
+        let dir = temp_certs_dir("in-window");
+        let (cert_pem, key_pem) = generate_self_signed_pair();
+        write_supplied_pair(&dir, &cert_pem, &key_pem);
+
+        let ctx = load_tls_context_with(&params_for(&dir)).expect("in-window certificate loads");
+        assert_eq!(ctx.source, TlsSource::Provided);
+        assert_eq!(
+            ctx.spki_pin,
+            spki_sha256_pin(&cert_pem).expect("pin"),
+            "the pin must follow the certificate on disk"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
     /// Certificate produced by

@@ -328,17 +328,35 @@ pub(crate) async fn forward_text_with_timeout(
     payload: Value,
     timeout: std::time::Duration,
 ) {
-    let clients = state.clients.read().await;
-    let Some(target_queue) = clients.get(to_device_id) else {
-        warn!(
-            "Relay drop: target {} not connected (from {})",
-            to_device_id, from_device_id
-        );
-        state
-            .metrics
-            .messages_dropped_not_found
-            .fetch_add(1, Ordering::Relaxed);
-        return;
+    // Look the target up, clone its queue, and drop the guard *before* the
+    // send below. Holding the read guard across the timeout await meant a
+    // single wedged target held the routing table's read lock for the whole
+    // `FORWARD_TIMEOUT_SECS`, and tokio's `RwLock` is write-preferring, so
+    // registration, deregistration and the 30 s sweep all queued behind it.
+    //
+    // The clone is what makes this safe to do: `Queue` pairs its sender with
+    // an `Arc<Semaphore>` byte budget, and a clone shares that same `Arc`, so
+    // a message reserved through this clone draws down the budget the table's
+    // entry still points at — the accounting in `state::Queue` is unaffected
+    // by how many clones exist. What changes is only the lock: the entry may
+    // now be replaced or removed while this send waits, which is exactly the
+    // race the guard used to hide, and it resolves the same way it does for
+    // any forward that outlives its target — `SendOutcome::Closed` counted as
+    // `not_found`.
+    let target_queue = {
+        let clients = state.clients.read().await;
+        let Some(target_queue) = clients.get(to_device_id) else {
+            warn!(
+                "Relay drop: target {} not connected (from {})",
+                to_device_id, from_device_id
+            );
+            state
+                .metrics
+                .messages_dropped_not_found
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        target_queue.clone()
     };
 
     // Bounded wait: without this a target that stops reading (its outbound
@@ -386,17 +404,25 @@ pub(crate) async fn forward_binary(
     to_device_id: &str,
     payload: &[u8],
 ) {
-    let clients = state.clients.read().await;
-    let Some(target_queue) = clients.get(to_device_id) else {
-        warn!(
-            "Binary relay drop: target {} not connected (from {})",
-            to_device_id, from_device_id
-        );
-        state
-            .metrics
-            .messages_dropped_not_found
-            .fetch_add(1, Ordering::Relaxed);
-        return;
+    // Clone the queue out and drop the read guard before awaiting, for the
+    // same reason as `forward_text_with_timeout`: a slow target must not
+    // hold the routing table's write-preferring lock hostage. The clone
+    // shares the target's byte budget, so the reservation still counts
+    // against `QUEUE_BYTE_BUDGET`.
+    let target_queue = {
+        let clients = state.clients.read().await;
+        let Some(target_queue) = clients.get(to_device_id) else {
+            warn!(
+                "Binary relay drop: target {} not connected (from {})",
+                to_device_id, from_device_id
+            );
+            state
+                .metrics
+                .messages_dropped_not_found
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        target_queue.clone()
     };
 
     // Budget reserved and released inside `Queue::send`; see `forward_text`.

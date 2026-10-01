@@ -177,8 +177,10 @@ Everything below describes the relay **as it is not**. None of it is in the code
    the relay's master secret; the current scheme derives each device's key from
    that device's own pairing secret
    (`conduit_protocol::hmac::derive_route_key`, `packages/protocol/src/lib.rs:136`).
-   The master secret no longer sits in the route-verification path at all — it
-   only backs the `/health` bearer-token default.
+   The master secret no longer sits in the route-verification path at all, and
+   it backs no credential an operator presents either: the `/health` bearer
+   token is *derived* from it through a domain-separated label rather than
+   copied out of it.
 4. **`key_id` is still mandatory, but it is no longer a rotation id.** It must
    equal `from_device_id`. That is what closes the "rewrite the signature onto
    another device" hole without a second, separate id to remember.

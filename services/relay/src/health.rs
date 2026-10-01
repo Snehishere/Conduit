@@ -55,7 +55,7 @@ pub(crate) async fn spawn_health_server(
                                                 .map(|h| {
                                                     bearer_token_authorized(
                                                         h,
-                                                        state.config.effective_health_token(),
+                                                        &state.config.effective_health_token(),
                                                     )
                                                 })
                                                 .unwrap_or(false);

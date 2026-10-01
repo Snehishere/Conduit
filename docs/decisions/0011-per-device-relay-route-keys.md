@@ -98,8 +98,10 @@ nothing to overlap and the ring is complexity in search of a problem.
    is kept "for a while" in case a peer is slow to update, because there is
    nothing to coordinate: both sides read the one key that exists.
 6. **No `RELAY_SIGNING_KEY*` variables exist.** Nor does `HMAC_SECRET` have any
-   route-signing role left: the master secret now backs only the `/health`
-   bearer-token default (`config.rs:382-404`).
+   route-signing role left: the master secret backs no credential directly
+   either — the `/health` bearer token is derived from it through a
+   domain-separated label (`derive_health_token` in `services/relay/src/config.rs`)
+   rather than copied out of it, so holding the health token reveals nothing.
 
 ## Consequences
 

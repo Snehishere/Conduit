@@ -130,14 +130,36 @@ pub(crate) enum SendOutcome {
 pub(crate) struct Queue {
     tx: mpsc::Sender<Message>,
     budget: Arc<Semaphore>,
+    /// Which connection this queue belongs to.
+    ///
+    /// One [`Queue::new`] per connection, and every clone carries the same id
+    /// — that is what lets deregistration tell "my own entry" apart from "an
+    /// entry a later connection for the same device wrote". See
+    /// [`deregister_if_current`].
+    connection_id: u64,
 }
+
+/// Process-wide counter that makes each [`Queue`] unique.
+///
+/// Deliberately monotonic rather than random: the id is only ever compared
+/// for equality within one process, and a counter makes "a clone of my queue
+/// is still my queue" and "some other connection's queue is not" follow from
+/// one shared fact.
+static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Queue {
     pub(crate) fn new(tx: mpsc::Sender<Message>) -> Self {
         Self {
             tx,
             budget: Arc::new(Semaphore::new(QUEUE_BYTE_BUDGET)),
+            connection_id: NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
+    }
+
+    /// The connection this queue serves. Stable across clones; distinct for
+    /// every [`Queue::new`].
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     /// True once the connection's reader has gone away.
@@ -238,4 +260,34 @@ pub(crate) async fn reconcile_clients(clients: &Clients) -> usize {
     let before = map.len();
     map.retain(|_, tx| !tx.is_closed());
     before - map.len()
+}
+
+/// Remove `device_id`'s routing entry, but only if it is still
+/// `connection_id`'s.
+///
+/// The clean-disconnect path used to remove by key alone. A device that
+/// reconnects while its previous connection is still winding down *overwrites*
+/// its own entry, so the older connection's late cleanup then evicts the newer
+/// connection's registration: the socket stays up, the device looks connected
+/// to itself, and every route to it is dropped as `not_found` forever —
+/// `reconcile_clients` cannot repair it, because the live entry's sender is
+/// open and healthy.
+///
+/// Matching on [`Queue::connection_id`] closes that window: the older
+/// connection finds an entry it does not own and leaves it alone. Returns
+/// whether an entry was actually removed, so callers and tests can tell "I
+/// deregistered" from "I was already superseded".
+pub(crate) async fn deregister_if_current(
+    clients: &Clients,
+    device_id: &str,
+    connection_id: u64,
+) -> bool {
+    let mut map = clients.write().await;
+    let owned = map
+        .get(device_id)
+        .is_some_and(|queue| queue.connection_id() == connection_id);
+    if owned {
+        map.remove(device_id);
+    }
+    owned
 }

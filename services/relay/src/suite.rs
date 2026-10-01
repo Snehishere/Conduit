@@ -173,29 +173,35 @@ fn config_health_token_env_override_and_fallback() {
         &["RELAY_TOKEN", "HMAC_SECRET", "RELAY_HEALTH_TOKEN"],
         || {
             unsafe {
-                std::env::set_var("RELAY_TOKEN", "tok");
-                std::env::set_var("HMAC_SECRET", "sec");
+                std::env::set_var("RELAY_TOKEN", "config-test-token");
+                std::env::set_var("HMAC_SECRET", "config-test-secret");
                 std::env::set_var("RELAY_HEALTH_TOKEN", "custom-health");
             }
             let cfg = Config::resolve(None).unwrap();
             assert_eq!(cfg.health_token, "custom-health");
 
+            // Empty and unset both mean "derive one". Neither may fall back to
+            // the master secret: anyone holding the health token would then
+            // hold the key the nonce cache is keyed from, which is a
+            // credential shared between two roles for no reason.
             unsafe {
                 std::env::set_var("RELAY_HEALTH_TOKEN", "");
             }
             let cfg = Config::resolve(None).unwrap();
-            assert_eq!(
-                cfg.health_token, "sec",
-                "empty RELAY_HEALTH_TOKEN must fall back to hmac secret"
+            assert_ne!(
+                cfg.health_token, "config-test-secret",
+                "an empty RELAY_HEALTH_TOKEN must not fall back to the master secret"
             );
+            let derived = cfg.health_token.clone();
+            assert!(!derived.is_empty(), "a token must be derived");
 
             unsafe {
                 std::env::remove_var("RELAY_HEALTH_TOKEN");
             }
             let cfg = Config::resolve(None).unwrap();
             assert_eq!(
-                cfg.health_token, "sec",
-                "unset RELAY_HEALTH_TOKEN must fall back to hmac secret"
+                cfg.health_token, derived,
+                "the derived health token must be stable across restarts"
             );
         },
     );
@@ -1070,15 +1076,24 @@ async fn release_returns_exactly_what_the_producer_reserved() {
 // ---------------------------------------------------------------
 
 /// Snapshot the env vars we touch, then restore them after the closure.
+///
+/// The restore also runs when `f` panics. A leaked variable outlives the test
+/// that set it — this suite runs in one process — so the failure surfaces in
+/// some unrelated test later and reads as a bug in the wrong place. That
+/// actually happened: `config_invalid_port_ignores_and_uses_default` left
+/// `RELAY_WS_PORT` behind and failed `the_plaintext_listener_defaults_to_loopback`.
 fn with_env_snapshot<F: FnOnce()>(keys: &[&str], f: F) {
     let saved: Vec<(&str, Option<String>)> =
         keys.iter().map(|&k| (k, std::env::var(k).ok())).collect();
-    f();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     for (k, v) in saved {
         match v {
             Some(val) => unsafe { std::env::set_var(k, val) },
             None => unsafe { std::env::remove_var(k) },
         }
+    }
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -1166,8 +1181,8 @@ fn config_custom_ports() {
         ],
         || {
             unsafe {
-                std::env::set_var("RELAY_TOKEN", "tok");
-                std::env::set_var("HMAC_SECRET", "sec");
+                std::env::set_var("RELAY_TOKEN", "config-test-token");
+                std::env::set_var("HMAC_SECRET", "config-test-secret");
                 std::env::set_var("RELAY_WS_PORT", "8080");
                 std::env::set_var("RELAY_WSS_PORT", "8443");
                 std::env::set_var("RELAY_HEALTH_PORT", "9090");
@@ -1188,7 +1203,7 @@ fn config_custom_ports() {
 fn config_generates_random_hmac_when_not_set() {
     with_env_snapshot(&["RELAY_TOKEN", "HMAC_SECRET", "HMAC_SECRET_FILE"], || {
         unsafe {
-            std::env::set_var("RELAY_TOKEN", "tok");
+            std::env::set_var("RELAY_TOKEN", "config-test-token");
             std::env::remove_var("HMAC_SECRET");
             // Point at an isolated temp file so tests never touch ./secrets.
             let dir = std::env::temp_dir().join(format!("relay-hmac-test-{}", std::process::id()));
@@ -1227,7 +1242,7 @@ fn config_generates_random_hmac_when_not_set() {
 fn config_fails_closed_when_secret_file_empty() {
     with_env_snapshot(&["RELAY_TOKEN", "HMAC_SECRET", "HMAC_SECRET_FILE"], || {
         unsafe {
-            std::env::set_var("RELAY_TOKEN", "tok");
+            std::env::set_var("RELAY_TOKEN", "config-test-token");
             std::env::remove_var("HMAC_SECRET");
             let dir = std::env::temp_dir().join(format!("relay-hmac-empty-{}", std::process::id()));
             std::fs::create_dir_all(&dir).ok();
@@ -1252,18 +1267,23 @@ fn config_fails_closed_when_secret_file_empty() {
 
 #[test]
 #[serial_test::serial]
-fn config_invalid_port_ignores_and_uses_default() {
+fn config_invalid_port_is_an_error_not_a_silent_default() {
     with_env_snapshot(&["RELAY_TOKEN", "HMAC_SECRET", "RELAY_WS_PORT"], || {
         unsafe {
-            std::env::set_var("RELAY_TOKEN", "tok");
-            std::env::set_var("HMAC_SECRET", "sec");
+            std::env::set_var("RELAY_TOKEN", "config-test-token");
+            std::env::set_var("HMAC_SECRET", "config-test-secret");
             std::env::set_var("RELAY_WS_PORT", "not-a-number");
         }
 
-        let cfg = Config::resolve(None).unwrap();
-        assert_eq!(
-            cfg.ws_port, 9528,
-            "invalid port should fall back to default"
+        // A typo'd port used to bind the default silently, so an operator who
+        // meant to move off a busy port kept serving the busy one and never
+        // heard about it. Fail-closed is the only outcome that is reported.
+        let result = Config::resolve(None);
+        let err = result.expect_err("an unparseable port must be refused");
+        assert!(
+            err.contains("RELAY_WS_PORT") && err.contains("not-a-number"),
+            "the error must name the variable and the bad value: {}",
+            err
         );
     });
 }
@@ -1872,7 +1892,7 @@ fn config_enable_plain_ws_true_values() {
             &["RELAY_TOKEN", "HMAC_SECRET", "RELAY_ENABLE_PLAIN_WS"],
             || {
                 unsafe {
-                    std::env::set_var("RELAY_TOKEN", "tok");
+                    std::env::set_var("RELAY_TOKEN", "config-test-token");
                     std::env::set_var("HMAC_SECRET", "test-secret");
                     std::env::set_var("RELAY_ENABLE_PLAIN_WS", *val);
                 }
@@ -1895,7 +1915,7 @@ fn config_enable_plain_ws_false_values() {
             &["RELAY_TOKEN", "HMAC_SECRET", "RELAY_ENABLE_PLAIN_WS"],
             || {
                 unsafe {
-                    std::env::set_var("RELAY_TOKEN", "tok");
+                    std::env::set_var("RELAY_TOKEN", "config-test-token");
                     std::env::set_var("HMAC_SECRET", "test-secret");
                     std::env::set_var("RELAY_ENABLE_PLAIN_WS", *val);
                 }
@@ -1916,11 +1936,18 @@ fn config_rejects_whitespace_only_relay_token() {
     with_env_snapshot(&["RELAY_TOKEN", "HMAC_SECRET"], || {
         unsafe {
             std::env::set_var("RELAY_TOKEN", "   ");
-            std::env::set_var("HMAC_SECRET", "secret");
+            std::env::set_var("HMAC_SECRET", "config-test-secret");
         }
-        // Whitespace-only is NOT empty, so it should be accepted
+        // Trimming is what makes this fail: without it a token nobody would
+        // ever type is a valid credential, and `"   "` is exactly the kind of
+        // placeholder a hurried deployment leaves behind.
         let result = Config::resolve(None);
-        assert!(result.is_ok(), "whitespace-only token should be accepted");
+        let err = result.expect_err("a whitespace-only token must be refused");
+        assert!(
+            err.contains("no relay token"),
+            "whitespace-only must count as unset, not as short: {}",
+            err
+        );
     });
 }
 
@@ -1929,7 +1956,7 @@ fn config_rejects_whitespace_only_relay_token() {
 fn config_hmac_secret_uses_exact_bytes() {
     with_env_snapshot(&["RELAY_TOKEN", "HMAC_SECRET"], || {
         unsafe {
-            std::env::set_var("RELAY_TOKEN", "tok");
+            std::env::set_var("RELAY_TOKEN", "config-test-token");
             std::env::set_var("HMAC_SECRET", "my-secret");
         }
         let cfg = Config::resolve(None).unwrap();
@@ -3503,8 +3530,8 @@ fn route_keys_differ_per_device_and_do_not_depend_on_the_relay_token() {
             hmac::derive_route_key(b"shared-master", "ee11")
         };
         assert_eq!(
-            key_for_token("token-a"),
-            key_for_token("token-b"),
+            key_for_token("token-alpha"),
+            key_for_token("token-bravo"),
             "route keys must be independent of RELAY_TOKEN"
         );
     });
@@ -4367,7 +4394,7 @@ async fn a_configured_pin_that_does_not_match_refuses_to_start() {
     std::fs::create_dir_all(&dir).expect("temp dir");
 
     let overrides = Overrides {
-        relay_token: Some("t".into()),
+        relay_token: Some("config-test-token".into()),
         wss_port: Some(0),
         health_port: Some(0),
         ws_port: Some(0),
@@ -4404,7 +4431,7 @@ async fn no_configured_pin_starts_normally() {
     std::fs::create_dir_all(&dir).expect("temp dir");
 
     let overrides = Overrides {
-        relay_token: Some("t".into()),
+        relay_token: Some("config-test-token".into()),
         wss_port: Some(0),
         health_port: Some(0),
         ws_port: Some(0),
@@ -4427,4 +4454,594 @@ async fn no_configured_pin_starts_normally() {
     handle.shutdown().await;
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ================================================================
+//  W6 remediation — the connection hot path
+//
+//  One test (or tight group) per audit item, each written so that it
+//  fails with that item's fix removed:
+//
+//  W6.4   a superseded connection cannot deregister the live one
+//  W6.6   a slow forward does not hold the routing table's lock, and the
+//         byte budget survives the clone the fix relies on
+//  W6.8   the auth deadline is total, not per frame
+//  W6.10  an unsupported protocol_version is refused with the documented
+//         code, and a current one still connects
+//  W6.11  over-size frames are answered with `message_too_large` before
+//         the connection closes
+// ================================================================
+
+// ---------------------------------------------------------------
+//  W6.6 — the read lock must not outlive the lookup
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_slow_forward_does_not_hold_the_routing_table_lock() {
+    // `forward_text_with_timeout` held `state.clients`' read guard across its
+    // whole queueing timeout, and tokio's RwLock is write-preferring — so one
+    // wedged target stalled registration, deregistration and the 30 s sweep
+    // behind it (W6.6).
+    let state = Arc::new(test_state(0, 0, 0, 0, 0));
+
+    // A target that accepts exactly one message and then never drains: the
+    // forward below parks inside `Queue::send` for its whole timeout, which
+    // is exactly the window in which the guard used to be held.
+    let (tx, _rx) = mpsc::channel::<Message>(1);
+    state
+        .clients
+        .write()
+        .await
+        .insert("wedged".to_string(), Queue::new(tx));
+    {
+        let fill = state
+            .clients
+            .read()
+            .await
+            .get("wedged")
+            .expect("registered")
+            .clone();
+        assert_eq!(
+            fill.send(Message::Text("fills the single slot".to_string()))
+                .await,
+            SendOutcome::Sent
+        );
+    }
+
+    let forwarding_state = state.clone();
+    let forward = tokio::spawn(async move {
+        forward_text_with_timeout(
+            &forwarding_state,
+            "5e4de4",
+            "wedged",
+            serde_json::json!({"n": 1}),
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+    });
+
+    // Let the forward task start and — before the fix — take the read guard.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // A writer must enter immediately, not queue behind the forward's
+    // three-second wait.
+    let mut writer =
+        tokio::time::timeout(std::time::Duration::from_millis(500), state.clients.write())
+            .await
+            .expect("a writer must not queue behind a slow forward");
+    writer.insert("late".to_string(), Queue::new(mpsc::channel(1).0));
+    drop(writer);
+
+    forward.abort();
+}
+
+#[tokio::test]
+async fn cloned_queues_share_one_byte_budget() {
+    // The forward path now clones the queue out of the table before it sends
+    // (W6.6). That is only sound because the byte budget bounding the queue
+    // lives behind an `Arc` the clone shares: without that, a clone would
+    // start a private budget and `QUEUE_BYTE_BUDGET` would bound nothing.
+    let (tx, _rx) = mpsc::channel::<Message>(4);
+    let registered = Queue::new(tx);
+    let cloned = registered.clone();
+
+    // Drain the whole budget through the clone, the way a forward does.
+    let whole_budget = Message::Binary(vec![0u8; QUEUE_BYTE_BUDGET]);
+    assert_eq!(cloned.send(whole_budget).await, SendOutcome::Sent);
+
+    // The handle still in the routing table must see that reservation: its
+    // own send has to wait for budget rather than succeed on a private one.
+    let starved = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        registered.send(Message::Text("needs budget".to_string())),
+    )
+    .await;
+    assert!(
+        starved.is_err(),
+        "a clone's reservations must draw down the same budget"
+    );
+
+    // And a release through one handle must reopen it for the other.
+    registered.release(QUEUE_BYTE_BUDGET);
+    let reopened = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        registered.send(Message::Text("fits again".to_string())),
+    )
+    .await
+    .expect("releasing the budget must unblock the next send");
+    assert_eq!(reopened, SendOutcome::Sent);
+}
+
+// ---------------------------------------------------------------
+//  W6.4 — a stale disconnect must not deregister the live device
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn a_superseded_connection_cannot_deregister_the_live_one() {
+    // The exact interleaving behind W6.4: connection A registers the device,
+    // the same device reconnects as connection B and overwrites the entry,
+    // then A's disconnect runs its cleanup. Removing by key alone took B's
+    // registration with it — the socket stayed up but the device was
+    // permanently unroutable, and `reconcile_clients` cannot repair it
+    // because B's sender is open and healthy.
+    let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
+    let (tx_a, _rx_a) = mpsc::channel::<Message>(4);
+    let (tx_b, mut rx_b) = mpsc::channel::<Message>(4);
+    let connection_a = Queue::new(tx_a);
+    let connection_b = Queue::new(tx_b);
+    clients
+        .write()
+        .await
+        .insert("device".to_string(), connection_a.clone());
+    // The reconnect overwrites A's entry with B's queue.
+    clients
+        .write()
+        .await
+        .insert("device".to_string(), connection_b.clone());
+
+    // A's late cleanup runs now and must find nothing of its own to remove.
+    assert!(
+        !deregister_if_current(&clients, "device", connection_a.connection_id()).await,
+        "the superseded connection must not remove an entry it no longer owns"
+    );
+    {
+        let map = clients.read().await;
+        let entry = map.get("device").expect("the live registration survives");
+        assert_eq!(
+            entry.connection_id(),
+            connection_b.connection_id(),
+            "the surviving entry must still be the newer connection's"
+        );
+        // ...and it answers on the newer connection's channel, not the old one's.
+        assert_eq!(
+            entry.send(Message::Text("for B".to_string())).await,
+            SendOutcome::Sent
+        );
+    }
+    assert!(
+        matches!(rx_b.recv().await, Some(Message::Text(t)) if t == "for B"),
+        "the entry must still deliver to the connection that replaced the old one"
+    );
+
+    // The live connection's own cleanup still works.
+    assert!(
+        deregister_if_current(&clients, "device", connection_b.connection_id()).await,
+        "the owning connection must still be able to deregister"
+    );
+    assert!(!clients.read().await.contains_key("device"));
+}
+
+#[tokio::test]
+async fn e2e_a_stale_disconnect_leaves_the_reconnected_device_routable() {
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    // The device's first connection registers it.
+    let mut first = ws_client(relay.ws_addr).await;
+    let ok = authenticate(&mut first, "d00d", E2E_RELAY_TOKEN)
+        .await
+        .expect("first connection gets an answer");
+    assert!(ok.contains("relay_auth_ok"), "got: {ok}");
+    assert!(state.clients.read().await.contains_key("d00d"));
+
+    // The same device reconnects; the entry now belongs to the new socket
+    // (`relay_auth_ok` is only sent after the insert).
+    let mut second = ws_client(relay.ws_addr).await;
+    let ok = authenticate(&mut second, "d00d", E2E_RELAY_TOKEN)
+        .await
+        .expect("reconnect gets an answer");
+    assert!(ok.contains("relay_auth_ok"), "got: {ok}");
+    assert_eq!(
+        state.metrics.auth_attempts_success.load(Ordering::Relaxed),
+        2
+    );
+
+    // The *old* connection now goes away, running its cleanup long after it
+    // was superseded.
+    drop(first);
+    let cleaned_up = wait_until(3000, || {
+        state
+            .metrics
+            .connections_disconnected
+            .load(Ordering::Relaxed)
+            >= 1
+    })
+    .await;
+    assert!(cleaned_up, "the stale connection's cleanup must run");
+    assert!(
+        state.clients.read().await.contains_key("d00d"),
+        "the stale disconnect must not evict the connection that replaced it"
+    );
+
+    // Present *and* routable: a third device routes to it and the live
+    // connection receives.
+    let mut sender = ws_client(relay.ws_addr).await;
+    authenticate(&mut sender, "e00e", E2E_RELAY_TOKEN).await;
+    let route = signed_route(
+        "e00e",
+        "d00d",
+        &serde_json::json!({"type": "ping"}),
+        now_millis(),
+        "nonce-stale-disconnect-1",
+    );
+    sender
+        .send(Message::Text(route.to_string()))
+        .await
+        .expect("send route");
+    let delivered = recv_text_matching(&mut second, 5, |t| t.contains("relay_delivery")).await;
+    assert!(
+        delivered.is_some(),
+        "the device must still receive routed messages after its old connection's cleanup"
+    );
+
+    drop(relay);
+}
+
+// ---------------------------------------------------------------
+//  W6.8 — the auth deadline is total, not per frame
+// ---------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_auth_deadline_is_total_not_per_frame() {
+    // One junk frame per interval used to re-arm the auth timeout on every
+    // frame, so a client that never authenticated could hold its connection —
+    // and its `active_connections` slot — for as long as it kept going (W6.8).
+    let state = e2e_state_with_auth_timeout(1000, 1);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    let give_up = tokio::time::Instant::now() + std::time::Duration::from_millis(5000);
+    let mut closed = false;
+    while tokio::time::Instant::now() < give_up && !closed {
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+                // Valid size, valid JSON, not an auth attempt: exactly the
+                // frame that used to buy the connection another full timeout
+                // on every send.
+                if ws.send(Message::Text(r#"{"type":"ping"}"#.to_string()))
+                    .await
+                    .is_err()
+                {
+                    closed = true;
+                }
+            }
+            next = ws.next() => match next {
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => closed = true,
+            },
+        }
+    }
+
+    assert!(
+        closed,
+        "the connection must close at its total auth deadline even while \
+         junk frames keep arriving"
+    );
+    assert_eq!(
+        state.metrics.auth_attempts_success.load(Ordering::Relaxed),
+        0,
+        "a dripping client must never authenticate"
+    );
+
+    drop(relay);
+}
+
+// ---------------------------------------------------------------
+//  W6.10 — inbound protocol_version
+// ---------------------------------------------------------------
+
+#[test]
+fn unsupported_version_frame_only_refuses_newer_versions() {
+    // Missing: `protocol_version` is optional (PROTOCOL.md §1.1) and every
+    // current client omits it, so absence must stay accepted.
+    assert!(unsupported_version_frame(&serde_json::json!({"type": "ping"})).is_none());
+    assert!(
+        unsupported_version_frame(&serde_json::json!({
+            "type": "relay_auth",
+            "device_id": "aabb",
+            "relay_token": "t",
+        }))
+        .is_none()
+    );
+    // The version this relay speaks is accepted.
+    assert!(
+        unsupported_version_frame(&serde_json::json!({"type": "ping", "protocol_version": 1}))
+            .is_none()
+    );
+
+    // A newer version is refused, with exactly the documented code, wording
+    // and server_version (PROTOCOL.md §1.1 / §8.1).
+    let frame =
+        unsupported_version_frame(&serde_json::json!({"type": "ping", "protocol_version": 2}))
+            .expect("a newer protocol_version must be refused");
+    let Message::Text(text) = frame else {
+        panic!("error frames are text");
+    };
+    let parsed: Value = serde_json::from_str(&text).expect("error frame is JSON");
+    assert_eq!(parsed.get("type").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("unsupported_protocol_version")
+    );
+    assert_eq!(
+        parsed.get("message").and_then(Value::as_str),
+        Some("Server supports protocol_version 1, got 2")
+    );
+    assert_eq!(parsed.get("server_version"), Some(&Value::from(1)));
+}
+
+#[tokio::test]
+async fn e2e_auth_declaring_a_newer_protocol_version_is_refused() {
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    ws.send(Message::Text(
+        serde_json::json!({
+            "type": "relay_auth",
+            "device_id": "f00d",
+            "relay_token": E2E_RELAY_TOKEN,
+            "protocol_version": 2,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send auth");
+
+    let answer = recv_text(&mut ws, 5)
+        .await
+        .expect("the relay answers a version it does not speak");
+    let parsed: Value = serde_json::from_str(&answer).expect("answer is JSON");
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("unsupported_protocol_version"),
+        "got: {answer}"
+    );
+    assert!(!state.clients.read().await.contains_key("f00d"));
+    assert!(
+        state.metrics.auth_attempts_failure.load(Ordering::Relaxed) >= 1,
+        "refusing a too-new version is a failed handshake"
+    );
+    // The rejection ends the connection rather than leaving it half-authed.
+    assert!(
+        recv_text(&mut ws, 2).await.is_none(),
+        "the refused connection must close"
+    );
+
+    // A current-version auth on a fresh connection still succeeds.
+    let mut ok = ws_client(relay.ws_addr).await;
+    let resp = authenticate(&mut ok, "f00d", E2E_RELAY_TOKEN)
+        .await
+        .expect("a current-version client gets an answer");
+    assert!(
+        resp.contains("relay_auth_ok"),
+        "a current protocol_version must still connect, got: {resp}"
+    );
+
+    drop(relay);
+}
+
+#[tokio::test]
+async fn e2e_newer_protocol_version_messages_are_refused_without_dropping_the_session() {
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    authenticate(&mut ws, "d00d", E2E_RELAY_TOKEN).await;
+
+    // A too-new version is refused with the documented code, like the
+    // desktop hub answers it (PROTOCOL.md §8.1).
+    ws.send(Message::Text(
+        serde_json::json!({"type": "ping", "protocol_version": 2}).to_string(),
+    ))
+    .await
+    .expect("send ping");
+    let answer = recv_text_matching(&mut ws, 5, |t| t.contains("unsupported_protocol_version"))
+        .await
+        .expect("the frame is answered");
+    let parsed: Value = serde_json::from_str(&answer).expect("answer is JSON");
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("unsupported_protocol_version"),
+        "got: {answer}"
+    );
+
+    // The session survives: a plain ping is still answered...
+    ws.send(Message::Text(
+        serde_json::json!({"type": "ping"}).to_string(),
+    ))
+    .await
+    .expect("send ping");
+    let pong = recv_text_matching(&mut ws, 5, |t| t.contains("pong")).await;
+    assert!(
+        pong.is_some(),
+        "a refused frame must not cost the connection its session"
+    );
+    assert!(state.clients.read().await.contains_key("d00d"));
+
+    // ...and a route stamped with the version this relay speaks still routes.
+    let mut target = ws_client(relay.ws_addr).await;
+    authenticate(&mut target, "ee11", E2E_RELAY_TOKEN).await;
+    let mut route = signed_route(
+        "d00d",
+        "ee11",
+        &serde_json::json!({"type": "ping"}),
+        now_millis(),
+        "nonce-protocol-version-1",
+    );
+    route["protocol_version"] = serde_json::json!(1);
+    ws.send(Message::Text(route.to_string()))
+        .await
+        .expect("send current-version route");
+    let delivered = recv_text_matching(&mut target, 5, |t| t.contains("relay_delivery")).await;
+    assert!(
+        delivered.is_some(),
+        "a route carrying the current protocol_version must still be delivered"
+    );
+
+    drop(relay);
+}
+
+// ---------------------------------------------------------------
+//  W6.11 — over-size frames are answered, not just dropped
+// ---------------------------------------------------------------
+
+/// Send `frame` while reading the relay's answer, and return the answer.
+///
+/// The two directions have to be in flight together: the relay rejects an
+/// over-size frame the moment it has read enough to know it is over the
+/// ceiling — long before a 1 MB payload has finished arriving — answers, and
+/// closes. Reading only after `send` has returned would race that close, and
+/// a connection reset while unread data sits in the socket can take the
+/// answer with it.
+///
+/// Frames that are not the answer are skipped rather than returned: the relay
+/// pings as soon as the writer task starts (`interval` fires its first tick
+/// immediately) and the `relay_auth_ok` reply may still be queued behind it,
+/// so "first text frame" is not "the answer". A close or a reset ends the
+/// wait either way — those are exactly the outcomes the refusal is meant to
+/// prevent, so returning `None` on them is what the tests want to see.
+async fn send_frame_and_read_answer(ws: WsClient, frame: Message, secs: u64) -> Option<String> {
+    let (mut sink, mut stream) = ws.split();
+    let sender = tokio::spawn(async move {
+        // A write error is the relay closing mid-frame; the answer on the
+        // read side is what the test is about.
+        let _ = sink.send(frame).await;
+    });
+
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut answer = None;
+    while answer.is_none() && tokio::time::Instant::now() < end {
+        let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let is_answer = serde_json::from_str::<Value>(&text)
+                    .is_ok_and(|value| value.get("type").and_then(Value::as_str) == Some("error"));
+                if is_answer {
+                    answer = Some(text.to_string());
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sender).await;
+    answer
+}
+
+#[tokio::test]
+async fn e2e_oversized_text_frame_is_answered_with_message_too_large() {
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    authenticate(&mut ws, "b16", E2E_RELAY_TOKEN).await;
+
+    let answer = send_frame_and_read_answer(ws, Message::Text("x".repeat(MAX_TEXT_SIZE + 1)), 5)
+        .await
+        .expect("the relay must answer an over-size frame before it closes");
+    let parsed: Value = serde_json::from_str(&answer).expect("answer is JSON");
+    assert_eq!(parsed.get("type").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("message_too_large"),
+        "the documented code must reach the sender, got: {answer}"
+    );
+
+    // The answer does not soften the outcome: the connection still closes and
+    // the device is still deregistered.
+    let mut removed = false;
+    for _ in 0..50 {
+        if !state.clients.read().await.contains_key("b16") {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(removed, "an over-size frame must still drop the connection");
+
+    drop(relay);
+}
+
+#[tokio::test]
+async fn e2e_oversized_binary_frame_is_answered_with_message_too_large() {
+    // The binary arm closed in silence for exactly the same reason the text
+    // arm did, and deserved the same answer (W6.11).
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    authenticate(&mut ws, "b16", E2E_RELAY_TOKEN).await;
+
+    let answer = send_frame_and_read_answer(ws, Message::Binary(vec![0u8; MAX_BINARY_SIZE + 1]), 5)
+        .await
+        .expect("the relay must answer an over-size binary frame before it closes");
+    let parsed: Value = serde_json::from_str(&answer).expect("answer is JSON");
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("message_too_large"),
+        "the documented code must reach the sender, got: {answer}"
+    );
+
+    let mut removed = false;
+    for _ in 0..50 {
+        if !state.clients.read().await.contains_key("b16") {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        removed,
+        "an over-size binary frame must still drop the connection"
+    );
+
+    drop(relay);
+}
+
+#[tokio::test]
+async fn e2e_oversized_frame_during_auth_is_answered_with_message_too_large() {
+    // Same refusal on the auth path, where the write side is still the read
+    // loop's own sink and no routing entry has been made yet.
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let ws = ws_client(relay.ws_addr).await;
+    let answer = send_frame_and_read_answer(ws, Message::Text("x".repeat(MAX_TEXT_SIZE + 1)), 5)
+        .await
+        .expect("the relay must answer an over-size frame even during auth");
+    let parsed: Value = serde_json::from_str(&answer).expect("answer is JSON");
+    assert_eq!(
+        parsed.get("code").and_then(Value::as_str),
+        Some("message_too_large"),
+        "got: {answer}"
+    );
+    assert_eq!(
+        state.metrics.auth_attempts_success.load(Ordering::Relaxed),
+        0,
+        "an over-size frame must never authenticate"
+    );
+
+    drop(relay);
 }

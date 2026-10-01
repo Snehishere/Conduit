@@ -44,12 +44,11 @@ are will break:
 `PROTOCOL_VERSION = 1` (`packages/protocol/src/types.rs`). A message MAY carry
 an integer `protocol_version`.
 
-> **Known gap — enforcement is asymmetric.** Only the **desktop hub** enforces
-> it: `apps/desktop/src-tauri/src/server/mod.rs` rejects any inbound frame whose
+> **Known gap — enforcement is asymmetric.** The **desktop hub** and the
+> **relay** both enforce it: each rejects any inbound frame whose
 > `protocol_version` is greater than `PROTOCOL_VERSION` and answers
-> `unsupported_protocol_version`. The **relay does not check
-> `protocol_version` at all**, and neither does the mobile app. A client MUST
-> NOT assume that a peer has rejected a too-new version on its behalf.
+> `unsupported_protocol_version`. The **mobile app** still does not. A client
+> MUST NOT assume that a peer has rejected a too-new version on its behalf.
 
 ```json
 {
@@ -164,9 +163,9 @@ interface of what is usually a laptop.
 | `RELAY_HEALTH_PORT` | no | `9530` | Plain HTTP health/metrics/pin listener. The desktop sets this from `relay_health_port`. |
 | `RELAY_ENABLE_PLAIN_WS` | no | `false` | `true` or `1` binds the plaintext listener. The desktop always enables it, on loopback. |
 | `RELAY_AUTH_TIMEOUT_SECS` | no | `10` | How long a fresh socket may take to send a valid `relay_auth` before it is dropped. |
-| `HMAC_SECRET` | no | — | Master secret. If unset, resolved from `HMAC_SECRET_FILE` or bootstrapped. **No route-signing role:** it backs the `/health` token default and nothing else. |
+| `HMAC_SECRET` | no | — | Master secret. If unset, resolved from `HMAC_SECRET_FILE` or bootstrapped. **No route-signing role, and no user-facing role:** it backs nothing an operator presents — the `/health` token is derived from it (domain-separated, so holding the health token reveals nothing), and route keys come from per-device pairing secrets. |
 | `HMAC_SECRET_FILE` | no | `./secrets/hmac_secret` | Read the master secret from here; a missing file is generated (32 random bytes, hex, persisted `0600`). Fail-closed: an unreadable non-empty file is a config error. |
-| `RELAY_HEALTH_TOKEN` | no | `HMAC_SECRET` | Bearer token for `/health` and `/`. |
+| `RELAY_HEALTH_TOKEN` | no | derived from `HMAC_SECRET` | Bearer token for `/health` and `/`. When unset or empty a token is **derived** from the master secret rather than copied from it, so it is stable across restarts and never equal to the secret the nonce cache is keyed from. Must be at least 8 bytes after trimming. |
 | `RELAY_METRICS_TOKEN` | no | — | When set, `/metrics` requires it. |
 | `RELAY_NONCE_FILE` | no | platform data dir | Persisted replay-nonce cache. The desktop sets this to `app_data_dir()/relay-nonces.json`. |
 | `RELAY_CERT_DIR` | no | — | Directory holding the TLS certificate and key. The desktop sets this to `app_data_dir()/relay-certs`. |
@@ -196,8 +195,8 @@ a factor of 50.
 
 | Where | Constant | Value | Enforcement |
 |-------|----------|-------|-------------|
-| Relay, inbound text frames | `MAX_TEXT_SIZE` (`services/relay/src/limits.rs`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before parsing. Over the limit the relay logs and **closes the connection** — it does *not* send an `error` frame, so `message_too_large` is a documented code that is not currently emitted. |
-| Relay, inbound binary frames | `MAX_BINARY_SIZE` (same file, defined as `MAX_TEXT_SIZE`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before `handle_binary_frame`. Binary frames previously had no application-level check of any kind; the two ceilings are one ceiling now. |
+| Relay, inbound text frames | `MAX_TEXT_SIZE` (`services/relay/src/limits.rs`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before parsing. Over the limit the relay answers `error` with code `message_too_large` and **closes the connection**. It lingers `REFUSAL_LINGER` before closing, because an answer sent into a connection that is then reset is discarded by the OS rather than delivered. |
+| Relay, inbound binary frames | `MAX_BINARY_SIZE` (same file, defined as `MAX_TEXT_SIZE`) | `1024 * 1024` (1 MiB) | Checked during auth and after it, before `handle_binary_frame`, and answered `message_too_large` exactly as the text path is. Binary frames previously had no application-level check of any kind; the two ceilings are one ceiling now. |
 | Relay, tungstenite read limits | explicit `WebSocketConfig` | 1 MiB message / 1 MiB frame | Passed to `accept_async_with_config`. This is the bound that matters most, because it refuses an over-size frame *while it is being read* — before the bytes are allocated. The relay previously used `accept_async`, so tungstenite's 64 MiB / 16 MiB defaults stood and the application check was the only one. |
 | Relay, outbound queue depth | `QUEUE_DEPTH` | `1024` messages | A bound on *messages*, which on its own says nothing about bytes. |
 | Relay, outbound queue bytes | `QUEUE_BYTE_BUDGET` | `16 * 1024 * 1024` (16 MiB) | Every queued message holds `message.len()` permits from a per-connection `Semaphore` (`state::Queue`) and returns exactly those as the writer dequeues it. A target that stops reading cannot accumulate more than 16 MiB however deep the channel runs; producers cannot enqueue without reserving, because the raw `Sender` is not exposed. |
@@ -1349,16 +1348,23 @@ hashed are the bytes the verifier reconstructs.
 * The window is `now - timestamp ∈ [-5 s, +30 s]`.
 * An empty `nonce` is refused.
 * `NonceCache` keeps an insertion-ordered queue per device. Entries older than
-  60 s are pruned; when a device exceeds its `MAX_NONCES_PER_DEVICE` (4096)
-  quota the cache evicts **oldest-first** — it never `clear()`s — and a
-  process-wide ceiling of `MAX_NONCES` (10 000) is applied the same way. One
+  60 s are pruned; when a device reaches its `MAX_NONCES_PER_DEVICE` (4096)
+  quota the cache evicts **oldest-first** — it never `clear()`s. One
   high-volume client can therefore only ever evict its own oldest nonces.
+* A process-wide ceiling of `MAX_NONCES` (10 000) is enforced **only against
+  devices that have filled their own quota**: a device still under quota is
+  never a victim, so no device can lose an in-window nonce while it has quota
+  headroom. When every device is under quota the ceiling yields, and the hard
+  bound becomes one quota per registered device.
 * The scope is always the *authenticated connection identity*, never a value
   taken from the message body, so a client cannot burn another client's replay
   protection by naming them.
 * The cache is persisted to `RELAY_NONCE_FILE` and reloaded, so a reconnect
-  cannot replay a nonce accepted before the restart. A corrupt cache file is
-  treated as empty and logged rather than aborting startup.
+  cannot replay a nonce accepted before the restart. Reload **fails closed**: a
+  nonce file that exists but cannot be read or parsed is logged at error level
+  and aborts startup rather than silently starting an empty cache; only a
+  missing file (first start) loads as empty. Persisted entries are truncated
+  per device to `MAX_NONCES_PER_DEVICE`, never globally.
 * A refusal is answered with `replay_detected`.
 
 ---
@@ -1639,6 +1645,8 @@ listed above, before any handler runs.
 | `replay_detected` | Nonce already used, or the timestamp was outside −5 s … +30 s |
 | `not_wrapped_in_relay_route` | An `encrypted` envelope arrived unwrapped |
 | `unknown_message_type` | Any `type` the relay does not route |
+| `unsupported_protocol_version` | A declared `protocol_version` above the relay's own (§1.1). During auth this is followed by closing the connection; after auth the frame alone is refused and the session continues |
+| `message_too_large` | An inbound frame over `MAX_TEXT_SIZE` or `MAX_BINARY_SIZE` (§2.5) |
 | `binary_frame_too_short` | Binary frame shorter than 53 bytes |
 | `binary_version_unsupported` | Binary frame version was not `0x02` |
 | `binary_target_id_invalid` | The 16-byte target id is not valid UTF-8 |
@@ -1653,7 +1661,7 @@ Auth failures use a different message type entirely: `relay_auth_rejected` with
 
 | Code | Status |
 |------|--------|
-| `message_too_large` | The relay's 1 MiB check logs and closes the connection; it does not answer. The desktop's 50 MiB tungstenite limit surfaces as a read error, which is also not answered. |
+| `message_too_large` | **Desktop only.** The desktop's 50 MiB tungstenite limit surfaces as a read error and is not answered. The relay emits this code since the size checks were unified (§8.2). |
 | `decryption_failed` | The desktop drops a bad `encrypted` envelope silently. |
 | `invalid_public_key` | A malformed `public_key` fails `validate_message` and is reported as `invalid_message` instead. |
 
