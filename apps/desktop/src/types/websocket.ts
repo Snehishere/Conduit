@@ -434,6 +434,13 @@ export interface RelayRouteMessage {
   payload: any;
 }
 
+export interface RelayDeliveryMessage {
+  type: 'relay_delivery';
+  from_device_id: string;
+  to_device_id?: string;
+  payload: any;
+}
+
 export interface EncryptedEnvelopeMessage {
   type: 'encrypted';
   nonce: string;
@@ -559,6 +566,7 @@ export type WebSocketMessage =
   | RelayAuthOKMessage
   | RelayAuthRejectedMessage
   | RelayRouteMessage
+  | RelayDeliveryMessage
   | EncryptedEnvelopeMessage
   | SMSSyncMessage
   | SMSNewMessage

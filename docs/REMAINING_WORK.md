@@ -178,14 +178,26 @@ where the drift actually is. The items below are that drift.
   **is** correct and matches `types.rs:1305-1307`. Only the relay-routed binary
   path is broken.
 
-- [ ] **W1.4 (HIGH)** Mobile certificate pinning can never succeed. The phone
-  hashes the whole DER certificate (`websocket_service.dart:202`,
-  `_computeSha256Sync(cert.der)`); the relay publishes an SPKI pin at
-  `GET /pin`. The doc comment at `websocket_service.dart:55-64` claims the
-  opposite and is wrong. Consequence: any certificate re-issue breaks pairing.
-  The desktop has no pin configuration target at all — see W6.5.
-  *Left to do:* hash the `SubjectPublicKeyInfo`, per
-  `docs/relay-tls.md:33`; add a desktop pin setting.
+- [x] **W1.4 (RESOLVED)** Mobile certificate pinning can never succeed. **Fixed.**
+  The phone hashed the whole DER certificate while the relay publishes an SPKI
+  pin at `GET /pin`, so the two could never match and every pinned connection
+  was rejected. `apps/mobile/lib/services/relay_route.dart` now carries a
+  minimal DER walker (`extractSpkiDer`) that pulls the SubjectPublicKeyInfo out
+  of `cert.der`, and `computeSpkiPin` produces the `sha256/<base64>` form the
+  relay publishes. The desktop now has the pin target this item asked for: the
+  `relay_cert_pin` setting, enforced by the relay at startup
+  (`service.rs` refuses to start on a mismatch).
+
+  Both halves are pinned against each other, which is what stops them drifting
+  again: `services/relay/src/tls.rs::spki_vector_for_the_dart_client` and
+  `apps/mobile/test/services/relay_route_test.dart` assert the same recorded
+  certificate and the same SPKI pin, and the Rust side cross-checks the
+  extraction against `openssl`. The vector is a fixture
+  (`services/relay/tests/fixtures/`) rather than a generated certificate,
+  because two sides handed different certificates would prove nothing.
+
+  Residual, tracked as W7.2: the mobile client still re-pins on mismatch during
+  pairing rather than failing.
 
 - [ ] **W1.5 (HIGH)** `automation/rule` is flat in the schema and nested on the
   wire. `schema.json` "Automation Rule" (and the generated
@@ -254,12 +266,51 @@ where the drift actually is. The items below are that drift.
   (`src-tauri/src/security.rs:394-395`) but have no handler, so they burn
   rate-limit budget and land in the catch-all at `server/mod.rs:899-914`.
 
-- [ ] **W1.15 (LOW)** The receiver of a relayed message gets no authenticated
-  attribution. `services/relay/src/main.rs:2121` forwards the bare inner
-  payload and discards the verified envelope, which is why the desktop
-  attributes everything to the literal `"relay_server"`
-  (`src-tauri/src/server/mod.rs:1089`). The `sender_mismatch` check at
-  `relay/src/main.rs:1891` buys the relay knowledge it then throws away.
+- [x] **W1.15 (RESOLVED)** The receiver of a relayed message gets no authenticated
+  attribution. **Fixed — and the investigation found this was worse than a
+  missing attribution: the feature did not work at all.**
+
+  What the audit recorded as an attribution gap was in fact a dead path. The
+  relay forwarded the bare inner payload and the desktop dispatched it under the
+  literal `"relay_server"`, which is in no pairing registry, so
+  `is_trusted_peer` returned false and **every** inbound relayed message was
+  refused with `not_authenticated`. A phone on another network could not deliver
+  a notification at all. `resolve_sender_secret` also fell through to the
+  unauthenticated `source_device` self-claim. Every existing test drove
+  `handle_message` with a `ws_*` id the test had itself registered, so the relay
+  id was never exercised; `relay_delivery` existed only as a branch in the
+  mobile client with no producer anywhere in the tree.
+
+  The fix, and why it is one change rather than three:
+
+  - `RelayDelivery` in `packages/protocol/src/types.rs` — the envelope carrying
+    the relay's verified attribution. Produced only by the relay, after
+    `handle_relay_route` has checked `from_device_id` against the identity the
+    connection authenticated as. It is deliberately *not* signed: the trust is
+    the relay's, and a client cannot mint one that says anything the relay did
+    not verify.
+  - `services/relay/src/connection.rs` wraps the verified payload in it instead
+    of forwarding `route.payload` alone, and the binary path now re-frames rather
+    than stripping the v2 header (which made relayed file chunks undecodable).
+    `conduit_protocol::build_binary_frame` is the single producer of a v2 frame.
+  - The desktop unwraps at `handle_message`, re-enters as the *sender*, and
+    resolves that device against the pairing registry — so `is_trusted_peer` and
+    `resolve_sender_secret` now have a real identity to work with. An unpaired
+    sender is refused before dispatch.
+  - The mobile side already had the `relay_delivery` branch and needed no change;
+    it had been written against an envelope nothing produced.
+
+  Regression tests that would have caught this: the relay suite asserts the
+  envelope and its attribution, and that a forwarded binary frame is re-framed
+  and re-tagged; the desktop suite drives the real `"relay_server"` id end to
+  end, asserting a paired phone's relayed notification reaches storage, that an
+  unpaired sender's does not, and that the relay socket is never itself a
+  trusted peer.
+
+  Not done, and deliberately: there is no `relay_delivery` version negotiation.
+  The envelope is only ever produced by a relay and consumed by a client of the
+  same build generation, and inventing a version byte for it would be ceremony
+  around a case that does not arise.
 
 - [ ] **W1.16 (LOW)** `screen_mirror/hologram` (`handlers/screen_mirror.rs:1249`)
   has no Dart branch. `automation/triggered` is never emitted outbound by the
@@ -1079,259 +1130,206 @@ where the drift actually is. The items below are that drift.
 
 ## W6 — Relay library
 
-> **⚠ STALE — re-audit before actioning.** Everything below describes a
-> standalone relay service built from `services/relay/src/main.rs`. That file
-> has been deleted. `conduit-relay` is now a library with no `[[bin]]`, hosted
-> in-process by the desktop app in
-> `apps/desktop/src-tauri/src/relay.rs` (`RelayHost`), so there is no container,
-> no compose file, no build script and no separate operator. Items have **not**
-> been renumbered or deleted; re-audit each one against the tree.
+### W6 status after re-audit at `5b1b694` + the relay_delivery work
 
-### W6 status after the service → library refactor
+**Re-audited against the tree, not carried over.** Every item below was
+re-derived from the current modules. Where an item was already settled, it says
+so and says how that was checked; the ones that survive are the ones that were
+reproduced in the current code, with the current line reference.
 
-Definitive, and settled from the tree rather than re-derived:
+Items are renumbered into three groups: **OPEN** (still reproducible),
+**SETTLED** (no longer true, with the evidence), and **OBSOLETE** (the artefact
+they describe is gone and there is nothing to action).
 
-- **The health listener is loopback-pinned and tested.** The old W6.20 complaint
-  (`main.rs:829` hardcoded `0.0.0.0`, loopback only because of
-  `docker-compose.yml:27`) is resolved: the desktop pins `health_bind` and
-  `ws_bind` to loopback in `build_config`, deliberately not overridable by the
-  environment, and `conduit-relay`'s suite covers it
-  (`the_plaintext_listener_defaults_to_loopback`,
-  `a_host_may_still_widen_the_plaintext_bind_explicitly`,
+#### Settled by the service → library refactor
+
+- **The health listener is loopback-pinned and tested.** W6.20 as written is
+  resolved: the desktop pins `health_bind` and `ws_bind` to loopback in
+  `build_config` (`apps/desktop/src-tauri/src/relay.rs`), deliberately not
+  overridable by the environment, and `conduit-relay` covers it
+  (`the_health_surface_is_always_loopback`,
+  `the_plaintext_listener_defaults_to_loopback`,
   `graceful_shutdown_stops_health_listener`). No compose file is involved.
 - **The shared signing key and its rotation window are gone entirely.** There is
   no shared message-signing key in the tree. `RELAY_SIGNING_KEY`,
   `RELAY_SIGNING_KEY_ID`, `RELAY_SIGNING_KEY_PREVIOUS` and
-  `RELAY_SIGNING_KEY_PREVIOUS_ID` have all been removed, and with them the
-  current/previous ring and the rotation window. Signing is per-device: HMAC-
-  SHA256 keyed by the pairing secret over
+  `RELAY_SIGNING_KEY_PREVIOUS_ID` have all been removed. Signing is per-device:
+  HMAC-SHA256 keyed by the pairing secret over
   `"conduit-protocol/v1/derive:conduit-relay/v1/route-key:" + device_id`, with
   `key_id == from_device_id`. See
   [ADR-0011](decisions/0011-per-device-relay-route-keys.md), which supersedes
-  [ADR-0004](decisions/0004-domain-separated-relay-signing-key.md). Every W6 item
-  premised on a shared key or on a rotation window (W6.2 in particular) is
-  answering a question that is no longer asked.
-- **Every item citing `services/relay/src/main.rs` is unverifiable as written.**
-  W6.1, W6.4, W6.5, W6.6, W6.7, W6.8, W6.9, W6.14, W6.17, W6.18, W6.19, W6.20,
-  W6.21, W6.22, W6.23 and W6.29 all cite `main.rs` line ranges that do not exist.
-- **Container and compose items are obsolete, not pending:** W6.9 (compose
-  quickstart), W6.24 (`alpine:3.20`, floating tags), W6.25 (compose hardening),
-  and the `Dockerfile` half of W6.29. The files they cite were deleted. Whether
-  any underlying concern survives as a library concern needs a fresh audit.
+  [ADR-0004](decisions/0004-domain-separated-relay-signing-key.md).
 - **`-p relay` no longer resolves.** The crate is `conduit-relay`. Every command
   in this file that says `cargo test -p relay` is wrong; use `-p conduit-relay`.
 - **The relay is not optional and there is nothing to deploy.** `relay_enabled`
   defaults to true, and a relay restart is a desktop restart.
 
-Not settled: the substantive security and protocol questions several of these
-items raise (frame size caps, replay protection, lock-across-await, handshake
-timing) are exactly the kind of thing that survives a reorganisation. They have
-to be re-derived from the new modules, not carried over.
-
-### Items as written at `48724e0`
+#### OPEN — reproduced in the current tree
 
 - [ ] **W6.1 (CRITICAL)** No size cap on binary frames.
-  `services/relay/src/main.rs:1719-1720` handles `Message::Binary` with no
-  `MAX_TEXT_SIZE` check, unlike the Text arm at `:1598`. tungstenite 0.24's
-  default `max_message_size` is 64 MiB, and the payload is `to_vec()`'d into a
-  1024-deep queue (`main.rs:1370`) with no byte budget — roughly **64 GiB per
+  `services/relay/src/connection.rs:465` handles `Message::Binary` with no
+  `MAX_TEXT_SIZE` check, unlike the two Text arms at `:109` and `:324`.
+  tungstenite 0.24's default `max_message_size` is 64 MiB, and the payload is
+  `to_vec()`'d into a 1024-deep queue with no byte budget — roughly **64 GiB per
   target connection** from one authenticated client. `PROTOCOL.md:184` claims
   the 1 MiB check bounds memory; for binary frames it does not exist.
   *Left to do:* enforce a cap before `handle_binary_frame`; pass an explicit
   `WebSocketConfig`; add a per-queue byte budget.
 
-- [ ] **W6.2 (HIGH)** The `/health` bearer token defaults to the master HMAC
-  secret (`main.rs:311-314, 435-441`), and the master secret is the KDF input
-  for the message-signing key (`:387`). Anyone holding the health token can
-  derive the signing key and forge a `relay_route` for any device.
-  *Left to do:* require `RELAY_HEALTH_TOKEN` explicitly, or derive a separate
-  purpose-bound token.
-
-- [ ] **W6.3 (HIGH)** A mismatched cert/key pair panics instead of failing
-  closed. `tls.rs:157-160` uses `.expect(...)` in `build_context`, but the
-  `Provided` path at `tls.rs:139-146` passes file contents in with no prior
-  validation — so the premise of the `expect` is false. The graceful degradation
-  at `main.rs:1008-1011` is never reached. `docs/relay-tls.md:117-118` and
-  `README.md:404-405` both claim the opposite.
-  *Left to do:* make `build_context` return `Result` and propagate; add a test
-  that calls `load_tls_context()` with a bad pair and asserts `Err`.
+- [ ] **W6.6 (HIGH)** A read lock is held across `await`.
+  `services/relay/src/route.rs:331` and `:387` take `state.clients.read().await`
+  and then hold the guard for the full `FORWARD_TIMEOUT_SECS` while
+  `target_tx` is borrowed from it. Every writer blocks meanwhile — registration,
+  deregistration (`connection.rs:560`) and the 30 s sweep
+  (`service.rs:spawn_housekeeping`). tokio's `RwLock` is write-preferring, so one
+  slow target stalls the whole routing table.
+  *Left to do:* clone the `Sender` out and drop the guard before awaiting.
 
 - [ ] **W6.4 (HIGH)** A stale disconnect deregisters the live device.
-  `main.rs:1427-1431, 1495-1499` replaces the sender on reconnect; when the
-  *old* connection's loop later exits, `main.rs:1775` removes by key with no
-  check that the stored sender is still this connection's. The reconnected
-  device stays connected but is permanently unroutable, and `reconcile_clients`
-  (`:633-638`) cannot repair it.
+  `connection.rs:560` removes by key with no check that the stored sender is
+  still *this* connection's. A device that reconnected keeps its connection but
+  is permanently unroutable, and `reconcile_clients` cannot repair it.
   *Left to do:* store `(tx, connection_id)` and remove only on a match.
 
 - [ ] **W6.5 (HIGH)** Binary frames have no cross-connection replay protection.
-  `main.rs:1542, 2003-2011` — they carry no timestamp or nonce; the only guard
-  is `last_binary_seq`, a per-connection in-memory `Option<u32>`. A reconnect
-  or restart resets it, after which any captured frame replays forever. The
-  `relay_route` path has a persisted nonce cache; this path has nothing.
+  `connection.rs:264` holds `last_binary_seq` as a per-connection in-memory
+  `Option<u32>`, reset on every reconnect. A reconnect or a restart resets it,
+  after which any captured frame replays forever. The `relay_route` path has the
+  persisted nonce cache; this path has nothing. The delivery re-framing added for
+  `relay_delivery` does **not** change this: it re-stamps the sequence per
+  connection, which is correct for the receiver's own guard and is still not a
+  durable replay bound.
   *Left to do:* add a timestamp and nonce (a frame-version bump), or persist a
   per-device high-water sequence number alongside the nonce cache.
 
-- [ ] **W6.6 (HIGH)** A 5-second read lock is held across `await`.
-  `main.rs:2105-2122, 2161-2175` take `state.clients.read().await`, then
-  `target_tx` borrows from the guard for the full `FORWARD_TIMEOUT_SECS`. Every
-  writer blocks meanwhile — registration (`:1428, 1496`), deregistration
-  (`:1775`), and the 30 s sweep (`:1074`). tokio's `RwLock` is write-preferring,
-  so one slow target stalls the whole routing table.
-  *Left to do:* clone the `Sender` out and drop the guard before awaiting.
+- [ ] **W6.2 (HIGH)** The `/health` bearer token still defaults to the master
+  HMAC secret (`config.rs:54`, `with_health_token_fallback`). The master secret
+  is no longer a signing-key input — W6.2's original consequence was **removed**
+  by per-device keys — but it remains a credential shared by two roles, and
+  anyone holding the health token reads the secret the nonce cache is keyed from.
+  *Left to do:* require `RELAY_HEALTH_TOKEN` explicitly, or derive a separate
+  purpose-bound token.
 
 - [ ] **W6.7 (HIGH)** Handshakes are untimed and uncounted.
-  `main.rs:1166-1173` — the `ConnectionGuard` and `MAX_CONNECTIONS` check happen
-  **after** `acceptor.accept(stream).await`, which has no timeout. A client that
-  opens TCP and sends no ClientHello holds a task and an fd forever and is never
-  counted. `main.rs:1349` — the WebSocket upgrade is likewise untimed and holds
-  an `active_connections` slot. `main.rs:1359` — the per-IP rate limit is applied
-  *after* the upgrade, so it protects neither path.
+  `service.rs::admit` runs **after** `acceptor.accept(stream).await`, which has
+  no timeout, and the relay's own source says so: a client that opens TCP and
+  sends no ClientHello holds a task and an fd forever and is never counted. The
+  WebSocket upgrade is likewise untimed and holds an `active_connections` slot,
+  and the per-IP rate limit is applied *after* the upgrade, so it protects
+  neither path.
 
-- [ ] **W6.8 (HIGH)** The auth deadline is per-message, not total
-  (`main.rs:1376`). A client sending one junk frame every 9 s holds an
-  unauthenticated connection and a slot indefinitely.
+- [ ] **W6.8 (HIGH)** The auth deadline is per-message, not total.
+  `connection.rs:97` re-arms `auth_timeout` on every frame. A client sending one
+  junk frame every 9 s holds an unauthenticated connection and a slot
+  indefinitely.
 
-- [ ] **W6.9 (HIGH)** The documented `docker compose` quickstart does not work on
-  Linux. `README.md:396-398` says `openssl rand -hex 32 > secrets/hmac_secret
-  && chmod 600`. On a Linux host that file is root-owned mode 0600;
-  `docker-compose.yml:74` bind-mounts it at `/data/secrets`, and the container
-  runs as uid 1001 (`Dockerfile:32, 49`) — so it cannot read its own master
-  secret and exits 78. Nothing in the README, `.env.example` or the compose file
-  says `chown 1001:1001`. Windows and macOS are unaffected, which is why it was
-  never caught.
-  *Left to do:* document `chgrp 1001` / `chmod 640`, or use a Compose `secrets:`
-  block (files land in `/run/secrets` as 0444 and sidestep the uid problem
-  entirely); add a CI step that actually runs `docker compose up` and curls
-  `/healthz`.
-
-- [ ] **W6.10 (MEDIUM)** The relay never checks `protocol_version`, so a v2
-  client is accepted by a v1 relay. `PROTOCOL.md:50-51, 1671` documents the gap;
-  there is no code.
-
-- [ ] **W6.11 (MEDIUM)** Over-size text frames close the connection with only a
-  `warn!` (`main.rs:1598-1601`); the documented `message_too_large` code
-  (`PROTOCOL.md:183, 1609`) is never emitted.
+- [ ] **W6.15 (MEDIUM)** Self-signed certificates are valid for ~2000 years.
+  `tls.rs` never sets a validity window, so rcgen applies its defaults. No
+  `key_usages` or `extended_key_usages` are asserted, so stricter clients may
+  reject the server certificate, and `load_tls_context` never validates a
+  supplied certificate's validity window at all.
 
 - [ ] **W6.12 (MEDIUM)** Cross-restart replay protection depends on a 30 s flush
-  (`main.rs:1046`) against a 35 s freshness window, so a crash loses up to 30 s
-  of accepted nonces. The volume-loss variant is documented in
-  `docker-compose.yml:70-73`; the crash variant is not. Also
-  `packages/protocol/src/lib.rs:620-624` returns an empty nonce map on **any**
-  read error, including `PermissionDenied`, with no log — a relay whose nonce
-  file becomes unreadable silently loses replay protection.
+  against a 35 s freshness window, so a crash loses up to 30 s of accepted
+  nonces. `packages/protocol/src/lib.rs` also returns an empty nonce map on
+  **any** read error, including `PermissionDenied`, with no log — a relay whose
+  nonce file becomes unreadable silently loses replay protection.
 
-- [ ] **W6.13 (MEDIUM)** The global `MAX_NONCES` ceiling evicts another device's
-  in-window nonces. Per-device quota is 4096 and the process-wide cap is 10 000
-  (`lib.rs:62, 55`); three devices at quota is 12 288, at which point the
-  global loop (`lib.rs:532-546`) evicts the globally oldest entry, which may
-  belong to a different device. `lib.rs:58-61` and `PROTOCOL.md:1310-1312` both
-  claim a high-volume client can only evict its own.
+- [ ] **W6.13 (MEDIUM)** The global `MAX_NONCES` ceiling can evict another
+  device's in-window nonces. Per-device quota is 4096 and the process-wide cap is
+  10 000 (`lib.rs:55`, `:62`); three devices at quota exceeds the global cap, at
+  which point the global loop evicts the globally oldest entry, which may belong
+  to a different device.
   *Left to do:* raise the ceiling, or make the global loop skip devices still
   under quota; correct the docs.
 
-- [ ] **W6.14 (MEDIUM)** Unknown target devices are dropped silently
-  (`main.rs:2106-2116`). The message is counted in
-  `messages_dropped_not_found` and **no `error` frame is returned to the
-  sender**, so the sender never learns the recipient is offline.
-  *Left to do:* return `error_frame("peer_offline", …)`.
+- [ ] **W6.19 (MEDIUM)** `bearer_token_authorized` (`config.rs:451`) still has no
+  empty-expected-token guard: `bearer_token_authorized("Bearer ", "")` returns
+  `true`, because both sides are zero-length and the length check passes. Not
+  reachable today only because `effective_health_token()` falls back to a
+  never-empty secret.
 
-- [ ] **W6.15 (MEDIUM)** Self-signed certificates are valid for ~2001 years.
-  `tls.rs:114` never sets validity, so rcgen applies `1975-01-01` to
-  `4096-01-01`. There is no expiry, no renewal pressure, and a leaked key stays
-  valid forever. No `key_usages` or `extended_key_usages` are asserted
-  (`:114`), so stricter clients may reject the server certificate. And
-  `load_tls_context` (`:79-147`) never validates a supplied certificate's
-  validity window at all.
+- [ ] **W6.21 (MEDIUM)** No minimum entropy on secrets. `RELAY_TOKEN="   "` and a
+  one-character token are both accepted, and a 1-byte `HMAC_SECRET` yields a
+  1-byte-strength secret. Port parse failures silently fall back to the default
+  (`config::env_port`), so `RELAY_WSS_PORT=95x9` silently binds 9529.
 
-- [ ] **W6.16 (MEDIUM)** A partial cert directory is destructive
-  (`tls.rs:106-135`). The generate branch is entered when *either* file is
-  missing; `:123` overwrites an operator's existing `cert.pem`, then
-  `write_key_restricted` (`:125`) fails with a misleading "Failed to create key
-  file with restricted permissions".
-  *Left to do:* detect a half-present directory and fail explicitly before
-  writing anything.
-
-- [ ] **W6.17 (MEDIUM)** `/metrics` is unauthenticated by default
-  (`main.rs:883-916`, `.env.example:143-146`) and leaks exact peer count
-  (`:770-775`), tracked IP count (`:778-786`) and the payload-size histogram
-  (`:791-813`). `docker-compose.yml:60-61` ships an empty
-  `RELAY_METRICS_TOKEN`. The README claims all three endpoints are behind bearer
-  tokens; only `/health` and `/` are.
-
-- [ ] **W6.18 (MEDIUM)** `/healthz` (`main.rs:843-851`) returns a constant
-  `{"status":"ok"}` with no readiness signal, and is the **only** endpoint the
-  Docker `HEALTHCHECK` depends on — yet it has **no test at all** (the string
-  appears once in the tree, at `main.rs:844`).
-
-- [ ] **W6.19 (MEDIUM)` `bearer_token_authorized` (`main.rs:485-495`) has no
-  empty-expected-token guard. `bearer_token_authorized("Bearer ", "")` returns
-  `true` because both sides are zero-length. Not reachable today only because
-  `effective_health_token()` falls back to a never-empty secret.
-
-- [ ] **W6.20 (MEDIUM)` The health listener is hardcoded to `0.0.0.0`
-  (`main.rs:829`), as are the WS listeners (`:1136, 1207`). The loopback claim
-  holds only because of `docker-compose.yml:27`; a bare `cargo run -p relay`
-  exposes `/metrics` and `/pin` on every interface.
-  *Left to do:* add `RELAY_BIND_ADDR` / `RELAY_HEALTH_BIND` defaulting to
-  `127.0.0.1`.
-
-- [ ] **W6.21 (MEDIUM)` No minimum entropy on secrets. `RELAY_TOKEN="   "`
-  is accepted, and the test at `main.rs:3995-4007` asserts it should be
-  (`main.rs:280-285`, `:299-302`). A one-character token is equally valid; a
-  1-byte `HMAC_SECRET` yields a 1-byte-strength signing key.
-  `RELAY_SIGNING_KEY` (`:386, :412`) has no length or charset validation, and
-  port parse failures silently fall back to the default (`:286-297`), so
-  `RELAY_WSS_PORT=95x9` silently binds 9529.
-
-- [ ] **W6.22 (MEDIUM)` `Config` and `KeyMaterial` derive `Debug` while holding
-  secrets (`main.rs:152`, `packages/protocol/src/lib.rs:243-247`). Any `{:?}`
-  — including inside a `panic!`/`expect` — prints the master secret, the relay
-  token and the signing keys. `KeyMaterial.secret` being `pub` makes it
-  reachable from any downstream crate.
+- [ ] **W6.22 (MEDIUM)** `Config` still derives `Debug` while holding
+  `hmac_secret` and `relay_token` (`config.rs:26`). Any `{:?}` — including
+  inside a `panic!`/`expect` — prints both.
   *Left to do:* implement `Debug` manually with redaction.
 
-- [ ] **W6.23 (MEDIUM)` Twelve operational constants are hardcoded and not
-  env-configurable (`main.rs:31-42`): `MAX_TEXT_SIZE` 1 MiB,
-  `MAX_CONNECTIONS` 10 000, message rate 100/s, burst 50, forward timeout 5 s,
-  drain timeout 5 s, queue depth 1024, ping 25 s, idle read 60 s, nonce flush
-  30 s, housekeeping 30 s, connect rate 10/60 s. Only
-  `RELAY_AUTH_TIMEOUT_SECS` is tunable. The 10/60 s connect rate breaks any NAT'd
-  deployment with more than 10 devices.
+- [ ] **W6.23 (MEDIUM)** Operational constants are hardcoded in `limits.rs` and
+  are not configurable: `MAX_TEXT_SIZE`, `MAX_CONNECTIONS`, message rate and
+  burst, forward timeout, queue depth, ping and idle-read intervals. Only
+  `RELAY_AUTH_TIMEOUT_SECS` is tunable. The 10/60 s connect rate breaks any
+  NAT'd deployment with more than 10 devices.
 
-- [ ] **W6.24 (LOW)` The documented quickstart's `alpine:3.20` base image
-  (`Dockerfile:30`) reached end of support on 2026-04-01. Both `FROM` lines are
-  floating tags, not digest-pinned.
-  *Left to do:* pin both to `@sha256:` digests; drop the unused
-  `ca-certificates` (`:31`) — the relay makes no outbound TLS.
-
-- [ ] **W6.25 (LOW)` `docker-compose.yml` has no container hardening: no
-  `read_only`, `cap_drop`, `security_opt: no-new-privileges`, `pids_limit`,
-  resource limits, or bounded logging. `./secrets` is mounted read-write (`:74`).
-  The relay correctly does **not** run as root (`Dockerfile:32, 49`, uid 1001).
-
-- [ ] **W6.26 (LOW)` Unused direct dependencies: `serde`
-  (`services/relay/Cargo.toml:22`, zero `serde::` paths — the relay only uses
-  `serde_json::Value`) and the dev-dependency `tokio-test` (`:7`, zero
-  references). `docs/TESTING.md:249` claims the relay's tests use `tokio-test`;
-  that is false. `services/relay/Cargo.toml` also has no `license` field.
-
-- [ ] **W6.27 (LOW)` `packages/protocol/src/lib.rs:339-378` — the unscoped free
+- [ ] **W6.27 (LOW)** `packages/protocol/src/lib.rs:346` — the unscoped free
   function `check_replay` is superseded by `NonceCache::check_replay` and used
   only in its own tests. It is a footgun: unscoped, a single cap, no per-device
   isolation.
 
-- [ ] **W6.28 (LOW)` README inaccuracy: "The relay fails closed on a missing
-  master secret rather than generating a throwaway one"
-  (`README.md:402-403`, repeated at `docker-compose.yml:36-39`) is **false** —
-  `main.rs:217-229` generates 32 random bytes and persists them. The behaviour
-  is defensible; the claim is not. `.env.example:35-37` documents it correctly.
+#### SETTLED — re-checked against the current tree, no longer true
 
-- [ ] **W6.29 (LOW)` `Dockerfile:1-5` references a `render.yaml` that does not
-  exist. `Dockerfile:19-24`'s dependency-warm hack compiles
-  `conduit-protocol` twice and deletes the built binary; the healthcheck is
-  declared twice with different timeouts (`:53-54` vs
-  `docker-compose.yml:78-86`).
+- [x] **W6.3** A mismatched cert/key pair panics instead of failing closed.
+  **Resolved.** `load_tls_context` now validates before building: `tls.rs:224`
+  and `:226` carry `expect`s whose premises are now guaranteed, and the suite
+  covers the bad-pair path (`cert_key_mismatch_is_refused`, plus the
+  "no private key found" and key-format cases). The claim in
+  `docs/relay-tls.md` that this was unhandled is stale.
+
+- [x] **W6.16** A partial cert directory is destructive.
+  **Resolved.** `tls.rs:159` loads only when `cert_path.exists() &&
+  key_path.exists()`, so a half-present directory can no longer overwrite an
+  operator's `cert.pem` and then fail on the key. The misleading
+  "Failed to create key file with restricted permissions" path is gone.
+
+- [x] **W6.26** Unused direct dependencies.
+  **Partly resolved.** `services/relay/Cargo.toml` now has a `license` field, and
+  the dev-dependency is `serial_test` (used), not `tokio-test`. `serde` is
+  still declared and still has only 2 `serde::` paths in the crate — it is used
+  by the `Deserialize` derives, so it is not unused in the strict sense, but it
+  could be dropped if the derives were spelled through `serde_json`'s re-export.
+  `docs/TESTING.md:249` no longer claims `tokio-test`.
+
+- [x] **W6.28** README inaccuracy about the master secret.
+  **Resolved.** The claim "fails closed on a missing master secret rather than
+  generating a throwaway one" no longer appears in `README.md`; the behaviour
+  (generate + persist) is documented correctly.
+
+- [ ] **W6.11 (MEDIUM)** Over-size text frames close the connection with only a
+  `warn!` (`connection.rs:108-112` during auth, `:324` afterwards), and the
+  documented `message_too_large` code is **never emitted anywhere in the crate** —
+  the only occurrence of the string is a comment in `limits.rs:15` and a
+  `PROTOCOL.md` reference. The sender learns nothing, so "my messages vanish" and
+  "the peer is gone" are indistinguishable.
+  *Left to do:* send `error_frame("message_too_large", …)` before closing, on both
+  the auth and post-auth paths.
+
+- [ ] **W6.10 (MEDIUM)** The relay never checks an inbound `protocol_version`, so
+  a newer client is silently accepted. `connection.rs:582` only *emits*
+  `PROTOCOL_VERSION` in its error frames; nothing reads one off the wire.
+  `PROTOCOL.md:50-51, 1671` documents the gap and there is still no code for it.
+  *Left to do:* reject a `protocol_version` above what the relay speaks, with
+  `unsupported_protocol_version`.
+
+#### OBSOLETE — the artefact is gone
+
+These describe a standalone service. There is nothing to action; they are listed
+only so nobody goes looking for a container.
+
+- **W6.9** the documented `docker compose` quickstart, and its uid-1001 secret
+  ownership problem.
+- **W6.24** the `alpine:3.20` base image and floating tags.
+- **W6.25** compose hardening (`read_only`, `cap_drop`, `pids_limit`).
+- **W6.29** the `Dockerfile`, its `render.yaml` reference, the double
+  `conduit-protocol` build and the duplicated healthcheck.
+
+`Dockerfile`, `docker-compose.yml`, `.env.example` and
+`scripts/build-relay.ps1` were all deleted. The concerns behind some of them
+survive as library concerns and are restated above where they do: bounded memory
+is W6.1, and bounded logging is part of W6.23.
 
 ---
 
@@ -1345,16 +1343,36 @@ to be re-derived from the new modules, not carried over.
   IP-keyed or global limit anywhere.
   *Left to do:* add an IP-keyed bucket; lengthen the token to 8+ characters.
 
-- [ ] **W7.2 (HIGH)` Certificate pinning is one-sided. The desktop has no pin
-  configuration target at all, and `connect_async` takes no connector, so it
-  cannot be given one (`docs/relay-tls.md` says so). The mobile re-pins on
-  mismatch instead of failing, and hashes the wrong thing (W1.4).
+- [ ] **W7.2 (HIGH)` Certificate pinning is one-sided. **Partly resolved.** The
+  desktop now has a pin configuration target: the `relay_cert_pin` setting,
+  enforced by the relay at startup, and a mismatch refuses to start rather than
+  warning. The "hashes the wrong thing" half was W1.4 and is fixed — the phone
+  pins the SPKI, verified against a cross-language vector.
+
+  Still open, and this is the part that matters:
+
+  - **The mobile client re-pins on mismatch during pairing** instead of failing.
+    Pairing is the trust bootstrap, so a peer that can answer the handshake
+    replaces the pin. A pin that can be replaced by whoever asks is not a pin.
+  - The desktop's relay client joins over **loopback plaintext**
+    (`relay.rs::local_relay_url`) and so performs no TLS check at all. That is a
+    defensible choice — the traffic never leaves the machine — but it means the
+    `relay_cert_pin` setting protects the *served* certificate, not the
+    connection the desktop itself makes. An operator standing behind a remote
+    relay needs the client side too, and `connect_async` still takes no
+    connector.
+  - The mobile pin is a single global field shared between the LAN hub and the
+    relay, so a pin captured from one is compared against the other.
 
 - [ ] **W7.3 (MEDIUM)` The relay forwards a v2 payload that the desktop parses as
-  a 28-byte LAN chunk frame. Encrypted binary chunks have no AAD on either side,
-  so the 28-byte header is unauthenticated — an on-path peer can rewrite `index`
-  or `id` and still pass Poly1305. The desktop defends structurally
-  (`file_transfer.rs:592-615`) but the metadata itself is unsigned.
+  a 28-byte LAN chunk frame. **The first half is fixed** — the relay now re-frames
+  a binary delivery instead of stripping the v2 header, and the desktop unwraps a
+  v2 frame at `handle_binary_message` before the LAN chunk parser sees it, so the
+  two formats are no longer confused.
+  **The rest stands:** encrypted binary chunks have no AAD on either side, so
+  the 28-byte header is unauthenticated — an on-path peer can rewrite `index` or
+  `id` and still pass Poly1305. The desktop defends structurally
+  (`file_transfer.rs`) but the metadata itself is unsigned.
   *Left to do:* set AAD to the metadata block on both sides.
 
 - [ ] **W7.4 (MEDIUM)` Unbounded audio queue fed by a remote peer
@@ -1373,15 +1391,19 @@ to be re-derived from the new modules, not carried over.
   > is now per-device, so a frame cannot be *forged*, but the routing table can
   > still be *hijacked* by a token holder. Re-audit against `connection.rs`.
 
-- [ ] **W7.6 (MEDIUM)` The relay forwards no authenticated attribution (W1.15),
-  so `server/mod.rs:1089` attributes relayed frames to the literal
-  `"relay_server"` with no verification. Enabling the relay client re-opens
-  this — any LAN peer could inject frames as a paired device.
-  > **⚠ AFFECTED BY THE RELAY REFACTOR.** The relay client is no longer
-  > disabled, so this is not a future risk — it is the current default path
-  > whenever `relay_enabled` is true. Attribution is still worth re-auditing, and
-  > it is now easier to do: the relay verifies a per-device route key and gets
-  > `from_device_id` from the `RouteKeys` trait rather than from a shared secret.
+- [x] **W7.6 (RESOLVED)** The relay forwards no authenticated attribution.
+  **Fixed by the same change as W1.15**, and the risk this item described is
+  closed: the relay now emits `relay_delivery` carrying the sender it
+  authenticated, the desktop unwraps it and re-enters as that device, and an
+  unpaired sender is refused before any handler runs. A LAN peer cannot inject a
+  relayed frame as a paired device, because the desktop resolves the claimed
+  sender against its own registry and the `relay_server` id is never itself a
+  trusted peer. Both facts are asserted by tests.
+
+- [ ] **W7.3 (MEDIUM)` Encrypted binary chunks have no AAD on either side, so
+  the 28-byte LAN chunk header is unauthenticated — an on-path peer can rewrite
+  `index` or `id` and still pass Poly1305. The desktop defends structurally
+  (`file_transfer.rs`) but the metadata itself is unsigned.
 
 - [ ] **W7.7 (MEDIUM)` `verify_binary_tag` (`relay/src/main.rs:2064-2074`)
   hex-encodes the entire MAC input (up to 128 MiB of `String`) and MACs the hex

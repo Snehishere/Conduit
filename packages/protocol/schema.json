@@ -1542,6 +1542,33 @@
       }
     },
     {
+      "title": "Relay Delivery",
+      "description": "Emitted by the relay after it has verified a relay_route, carrying the authenticated sender alongside the forwarded payload. Not client-producible: it is the relay's own attestation, so it is not signed.",
+      "type": "object",
+      "required": [
+        "type",
+        "from_device_id",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "relay_delivery"
+        },
+        "from_device_id": {
+          "type": "string",
+          "description": "The device id the relay authenticated on the sending connection. Not a sender-chosen claim."
+        },
+        "to_device_id": {
+          "type": "string",
+          "description": "The device this delivery is addressed to."
+        },
+        "payload": {
+          "type": "object",
+          "description": "The forwarded message, verbatim. Normally an encrypted envelope."
+        }
+      }
+    },
+    {
       "title": "Encrypted Envelope",
       "type": "object",
       "required": [

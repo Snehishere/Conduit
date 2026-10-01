@@ -71,16 +71,22 @@ from the parsed certificate rather than from the PEM text, so it cannot be
 computed over the wrong file. `scripts/generate-cert-pin.sh` prefers the served
 endpoint and falls back to `openssl` only if the endpoint is unreachable.
 
-> **Still true, and now live rather than hypothetical: the mobile client**
-> (`apps/mobile/lib/services/websocket_service.dart`)
-> **still hashes the whole DER certificate.** It must be changed to hash the
-> SPKI before mobile pinning works. The desktop app has no pin configuration
-> target at all — `VITE_RELAY_CERT_SHA256` was deliberately removed from the
-> project.
+> **Resolved.** The mobile client (`apps/mobile/lib/services/relay_route.dart`)
+> used to hash the whole DER certificate. It now extracts the
+> SubjectPublicKeyInfo and pins that, via `computeSpkiPin`. The desktop has a
+> pin target: the `relay_cert_pin` setting, enforced by the relay at startup —
+> a mismatch refuses to start rather than warning.
 >
-> This used to be a latent defect behind a relay nobody ran by default. The
-> relay is **on by default** now, so the gap is reachable on a normal install:
-> any phone that pins will fail, and the desktop will not warn about it.
+> Both are pinned against a shared vector so they cannot drift again:
+> `services/relay/src/tls.rs::spki_vector_for_the_dart_client` and
+> `apps/mobile/test/services/relay_route_test.dart` assert the same recorded
+> certificate and the same pin, and the Rust side cross-checks against `openssl`.
+>
+> Still open, tracked as W7.2: the mobile client re-pins on mismatch during
+> pairing rather than failing, its pin is a single field shared between the LAN
+> hub and the relay, and the desktop's own relay connection is loopback
+> plaintext — so `relay_cert_pin` protects the *served* certificate, not the
+> desktop's client connection.
 
 ---
 
@@ -114,11 +120,13 @@ scripts/generate-cert-pin.sh relay.example.com 9529 --health-port 9530
 Then:
 
 - **mobile** — Settings → pinned certificate, or
-  `websocketService.setPinnedCertificate('sha256/…')`.
-  **The client code must hash the SPKI, not `cert.der`** (§2).
-- **desktop** — no configuration target exists today; the project removed
-  `VITE_RELAY_CERT_SHA256`. Until one is added, re-check `/pin` after every
-  renewal.
+  `websocketService.setPinnedCertificate('sha256/…')`. The client hashes the
+  SPKI (§2), so a pin taken from `/pin` matches.
+- **desktop** — Settings → Relay → certificate pin (`relay_cert_pin`), or
+  `RELAY_CERT_PIN`. Empty enforces nothing, which is the default and is right
+  when this app *is* the relay. Set it and a mismatch stops the relay from
+  starting, so a certificate that changed without being intended to is not
+  served. A renewal is therefore a deliberate act: update the pin.
 
 ---
 

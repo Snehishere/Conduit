@@ -5,13 +5,13 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/io.dart';
-import 'package:crypto/crypto.dart' as crypto;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'encryption_service.dart';
 import 'relay_route.dart'
     show
         BinaryFrame,
         buildBinaryFrame,
+        computeSpkiPin,
         deriveRouteKey,
         parseBinaryFrame,
         signRoute,
@@ -69,10 +69,12 @@ class WebSocketService extends ChangeNotifier {
   String? _apnsToken;
   String? _osVersion;
   String? _relayToken;
+
   /// The v2 binary frame counter. Strictly increasing per connection, because
   /// the relay drops a frame whose sequence does not advance — that is its
   /// replay defence for file chunks, which carry no nonce to dedupe on.
   int _binarySequence = 0;
+
   /// Highest inbound binary sequence accepted from the current peer, for the
   /// same reason: a relayed chunk replayed at the client must not reappear.
   int? _lastInboundSequence;
@@ -142,7 +144,8 @@ class WebSocketService extends ChangeNotifier {
   String? get lastError => _lastError;
   String? get deviceName => _deviceName;
   String? get deviceId => _deviceId;
-  List<Map<String, dynamic>> get connectedDevices => List.unmodifiable(_connectedDevices);
+  List<Map<String, dynamic>> get connectedDevices =>
+      List.unmodifiable(_connectedDevices);
 
   /// The address this app is actually connected to, e.g. `wss://192.168.1.5:9531`.
   ///
@@ -202,11 +205,13 @@ class WebSocketService extends ChangeNotifier {
   void setPinnedCertificate(String sha256Fingerprint) {
     _pinnedCertSha256 = sha256Fingerprint;
     _pinLoaded = true;
-    unawaited(_secureStorage
-        .write(key: _pinStorageKey, value: sha256Fingerprint)
-        .catchError((Object e) {
-      debugPrint('WS: Failed to persist certificate pin: $e');
-    }));
+    unawaited(
+      _secureStorage
+          .write(key: _pinStorageKey, value: sha256Fingerprint)
+          .catchError((Object e) {
+            debugPrint('WS: Failed to persist certificate pin: $e');
+          }),
+    );
   }
 
   /// Load the certificate pin captured during a previous pairing.
@@ -320,7 +325,10 @@ class WebSocketService extends ChangeNotifier {
   bool _verifyCertificatePin(X509Certificate cert, {required bool isPairing}) {
     String actualSha256;
     try {
-      actualSha256 = _computeSha256Sync(cert.der).replaceAll('=', '').trim();
+      actualSha256 = computeSpkiPin(cert.der);
+    } on FormatException catch (e) {
+      debugPrint('Certificate pin verification error: ${e.message}');
+      return false;
     } catch (e) {
       debugPrint('Certificate pin verification error: $e');
       return false;
@@ -343,13 +351,17 @@ class WebSocketService extends ChangeNotifier {
     }
 
     if (_pinnedCertSha256 == null || _pinnedCertSha256!.isEmpty) {
-      debugPrint('Certificate pin verification failed: no pin configured — rejecting connection');
+      debugPrint(
+        'Certificate pin verification failed: no pin configured — rejecting connection',
+      );
       return false; // Fail closed — never accept without a pin
     }
 
     final expectedSha256 = _normalizePin(_pinnedCertSha256!);
     if (actualSha256 != expectedSha256) {
-      debugPrint('Certificate pin mismatch: expected $expectedSha256, got $actualSha256');
+      debugPrint(
+        'Certificate pin mismatch: expected $expectedSha256, got $actualSha256',
+      );
       return false;
     }
     return true;
@@ -363,11 +375,6 @@ class WebSocketService extends ChangeNotifier {
         .replaceAll(' ', '')
         .replaceAll('=', '')
         .trim();
-  }
-
-  /// Compute SHA-256 hash of bytes, returning base64-encoded result.
-  String _computeSha256Sync(List<int> bytes) {
-    return base64.encode(crypto.sha256.convert(bytes).bytes);
   }
 
   /// Try connecting to the last known URL (called on startup)
@@ -431,12 +438,12 @@ class WebSocketService extends ChangeNotifier {
         final client = HttpClient(context: SecurityContext())
           ..badCertificateCallback =
               (X509Certificate cert, String host, int port) {
-            // Never accept blindly. The pin was captured and stored during
-            // pairing; every other connection must match it. If no pin is
-            // configured (and this is not the pairing handshake itself) the
-            // certificate is rejected.
-            return _verifyCertificatePin(cert, isPairing: isPairing);
-          };
+                // Never accept blindly. The pin was captured and stored during
+                // pairing; every other connection must match it. If no pin is
+                // configured (and this is not the pairing handshake itself) the
+                // certificate is rejected.
+                return _verifyCertificatePin(cert, isPairing: isPairing);
+              };
 
         _channel = IOWebSocketChannel.connect(
           uri,
@@ -493,7 +500,8 @@ class WebSocketService extends ChangeNotifier {
               return;
             }
 
-            final rawMessage = jsonDecode(data as String) as Map<String, dynamic>;
+            final rawMessage =
+                jsonDecode(data as String) as Map<String, dynamic>;
             final type = rawMessage['type'] as String?;
 
             if (type == 'ping') {
@@ -549,7 +557,8 @@ class WebSocketService extends ChangeNotifier {
         'protocol_version': 1,
         'device_name': _deviceName ?? 'Mobile Device',
         'device_type': 'phone',
-        'device_id': _deviceId ?? 'mobile_${DateTime.now().millisecondsSinceEpoch}',
+        'device_id':
+            _deviceId ?? 'mobile_${DateTime.now().millisecondsSinceEpoch}',
         'os': Platform.operatingSystem,
         'version': _osVersion ?? '1.0.0',
         'apns_token': _apnsToken,
@@ -614,7 +623,9 @@ class WebSocketService extends ChangeNotifier {
 
     final last = _lastInboundSequence;
     if (last != null && frame.sequence <= last) {
-      debugPrint('WS: replayed relay frame (sequence ${frame.sequence} <= $last); dropping');
+      debugPrint(
+        'WS: replayed relay frame (sequence ${frame.sequence} <= $last); dropping',
+      );
       return;
     }
     _lastInboundSequence = frame.sequence;
@@ -630,7 +641,9 @@ class WebSocketService extends ChangeNotifier {
   Future<void> _handleEncrypted(Map<String, dynamic> envelope) async {
     final sharedSecretHex = getSharedSecret?.call();
     if (sharedSecretHex == null) {
-      debugPrint('WS: Received encrypted message but no shared secret available');
+      debugPrint(
+        'WS: Received encrypted message but no shared secret available',
+      );
       return;
     }
     try {
@@ -644,7 +657,11 @@ class WebSocketService extends ChangeNotifier {
         return;
       }
 
-      final decrypted = await EncryptionService().decrypt(secretBytes, nonceBytes, hexToBytes(dataHex));
+      final decrypted = await EncryptionService().decrypt(
+        secretBytes,
+        nonceBytes,
+        hexToBytes(dataHex),
+      );
       _handleMessage(jsonDecode(decrypted) as Map<String, dynamic>);
     } catch (e) {
       debugPrint('WS: could not decrypt an encrypted message: $e');
@@ -658,7 +675,10 @@ class WebSocketService extends ChangeNotifier {
   /// relay's assertion rather than something the payload claims about itself.
   /// It is recorded on the message so a handler that cares about who is talking
   /// does not have to trust a self-reported `source_device`.
-  Future<void> _handleAttributed(Map<String, dynamic> message, String sender) async {
+  Future<void> _handleAttributed(
+    Map<String, dynamic> message,
+    String sender,
+  ) async {
     _lastRelaySender = sender;
     if (message['type'] == 'encrypted') {
       // Reuse the ordinary decrypt-and-dispatch path; the envelope is the same
@@ -695,18 +715,29 @@ class WebSocketService extends ChangeNotifier {
     }
     try {
       final nonce = payload.sublist(0, chunkNonceLen);
-      final jsonLen =
-          ByteData.sublistView(payload, chunkNonceLen, chunkNonceLen + chunkLenFieldLen)
-              .getUint32(0, Endian.little);
+      final jsonLen = ByteData.sublistView(
+        payload,
+        chunkNonceLen,
+        chunkNonceLen + chunkLenFieldLen,
+      ).getUint32(0, Endian.little);
       if (payload.length < chunkNonceLen + chunkLenFieldLen + jsonLen) {
         debugPrint('WS: relayed chunk metadata length mismatch');
         return;
       }
-      final metadataBytes = payload.sublist(chunkNonceLen + chunkLenFieldLen, chunkNonceLen + chunkLenFieldLen + jsonLen);
-      final ciphertext = payload.sublist(chunkNonceLen + chunkLenFieldLen + jsonLen);
-      final metadata = jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
-      final decrypted = await EncryptionService()
-          .decryptBinary(hexToBytes(sharedSecretHex), nonce, ciphertext);
+      final metadataBytes = payload.sublist(
+        chunkNonceLen + chunkLenFieldLen,
+        chunkNonceLen + chunkLenFieldLen + jsonLen,
+      );
+      final ciphertext = payload.sublist(
+        chunkNonceLen + chunkLenFieldLen + jsonLen,
+      );
+      final metadata =
+          jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
+      final decrypted = await EncryptionService().decryptBinary(
+        hexToBytes(sharedSecretHex),
+        nonce,
+        ciphertext,
+      );
       _handleMessage({
         'type': 'file',
         'action': 'chunk_binary',
@@ -729,17 +760,26 @@ class WebSocketService extends ChangeNotifier {
       return;
     }
     final nonce = bytes.sublist(0, chunkNonceLen);
-    final byteData = ByteData.sublistView(bytes, chunkNonceLen, chunkNonceLen + chunkLenFieldLen);
+    final byteData = ByteData.sublistView(
+      bytes,
+      chunkNonceLen,
+      chunkNonceLen + chunkLenFieldLen,
+    );
     final jsonLen = byteData.getUint32(0, Endian.little);
     if (bytes.length < chunkNonceLen + chunkLenFieldLen + jsonLen) {
       debugPrint('WS: Binary message metadata length mismatch');
       return;
     }
-    final metadataBytes =
-        bytes.sublist(chunkNonceLen + chunkLenFieldLen, chunkNonceLen + chunkLenFieldLen + jsonLen);
-    final ciphertext = bytes.sublist(chunkNonceLen + chunkLenFieldLen + jsonLen);
+    final metadataBytes = bytes.sublist(
+      chunkNonceLen + chunkLenFieldLen,
+      chunkNonceLen + chunkLenFieldLen + jsonLen,
+    );
+    final ciphertext = bytes.sublist(
+      chunkNonceLen + chunkLenFieldLen + jsonLen,
+    );
 
-    final metadata = jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
+    final metadata =
+        jsonDecode(utf8.decode(metadataBytes)) as Map<String, dynamic>;
 
     final sharedSecretHex = getSharedSecret?.call();
     if (sharedSecretHex == null) {
@@ -747,8 +787,11 @@ class WebSocketService extends ChangeNotifier {
       return;
     }
     try {
-      final decrypted = await EncryptionService()
-          .decryptBinary(hexToBytes(sharedSecretHex), nonce, ciphertext);
+      final decrypted = await EncryptionService().decryptBinary(
+        hexToBytes(sharedSecretHex),
+        nonce,
+        ciphertext,
+      );
       _handleMessage({
         'type': 'file',
         'action': 'chunk_binary',
@@ -794,7 +837,8 @@ class WebSocketService extends ChangeNotifier {
     _reconnectTimer?.cancel();
     // Exponential backoff: 3s, 6s, 12s ... capped at 60s.
     _reconnectAttempts += 1;
-    final delaySeconds = (3 * (1 << (_reconnectAttempts - 1).clamp(0, 4))).clamp(3, 60);
+    final delaySeconds = (3 * (1 << (_reconnectAttempts - 1).clamp(0, 4)))
+        .clamp(3, 60);
     _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
       if (!_isConnected) connect(url);
     });
@@ -823,7 +867,9 @@ class WebSocketService extends ChangeNotifier {
           'device_name': deviceInfo['name'] as String? ?? 'Unknown',
           'device_type': deviceInfo['type'] as String? ?? 'desktop',
         };
-        _connectedDevices.removeWhere((d) => d['device_id'] == device['device_id']);
+        _connectedDevices.removeWhere(
+          (d) => d['device_id'] == device['device_id'],
+        );
         _connectedDevices.add(device);
         notifyListeners();
       }
@@ -858,7 +904,9 @@ class WebSocketService extends ChangeNotifier {
         'device_name': message['device_name'] as String? ?? 'Unknown',
         'device_type': message['device_type'] as String? ?? 'desktop',
       };
-      _connectedDevices.removeWhere((d) => d['device_id'] == device['device_id']);
+      _connectedDevices.removeWhere(
+        (d) => d['device_id'] == device['device_id'],
+      );
       _connectedDevices.add(device);
       notifyListeners();
     } else if (type == 'discovery' && action == 'remove') {
@@ -909,7 +957,11 @@ class WebSocketService extends ChangeNotifier {
     if (target == null || deviceId == null || key == null) {
       debugPrint(
         'WS: cannot route through the relay — '
-        'missing ${target == null ? 'target' : deviceId == null ? 'own device id' : 'pairing secret'}',
+        'missing ${target == null
+            ? 'target'
+            : deviceId == null
+            ? 'own device id'
+            : 'pairing secret'}',
       );
       return null;
     }
@@ -932,22 +984,28 @@ class WebSocketService extends ChangeNotifier {
       final deviceId = _deviceId;
       final key = _routeKey();
       if (deviceId == null || key == null) {
-        debugPrint('WS: cannot route a binary frame through the relay: no route key');
+        debugPrint(
+          'WS: cannot route a binary frame through the relay: no route key',
+        );
         return;
       }
       final Uint8List payload = message is Uint8List
           ? message
           : Uint8List.fromList(utf8.encode(jsonEncode(message)));
       try {
-        _channel!.sink.add(buildBinaryFrame(
-          routeKey: key,
-          fromDeviceId: deviceId,
-          targetDeviceId: target,
-          sequence: Uint32List.fromList([_nextSequence()]),
-          payload: payload,
-        ));
+        _channel!.sink.add(
+          buildBinaryFrame(
+            routeKey: key,
+            fromDeviceId: deviceId,
+            targetDeviceId: target,
+            sequence: Uint32List.fromList([_nextSequence()]),
+            payload: payload,
+          ),
+        );
       } on FormatException catch (e) {
-        _surfaceSendError('Could not build the relayed file frame: ${e.message}');
+        _surfaceSendError(
+          'Could not build the relayed file frame: ${e.message}',
+        );
       }
       return;
     }
@@ -983,11 +1041,14 @@ class WebSocketService extends ChangeNotifier {
         try {
           final secretBytes = EncryptionService.hexToBytes(sharedSecretHex);
           final plaintext = jsonEncode(message);
-          final (nonceBytes, combinedBytes) = await EncryptionService().encrypt(secretBytes, plaintext);
-          
+          final (nonceBytes, combinedBytes) = await EncryptionService().encrypt(
+            secretBytes,
+            plaintext,
+          );
+
           final dataHex = EncryptionService.bytesToHex(combinedBytes);
           final hmacHex = EncryptionService.generateHmac(secretBytes, dataHex);
-          
+
           payloadToSend = {
             'type': 'encrypted',
             'source_device': _deviceId ?? 'mobile',
@@ -1035,11 +1096,7 @@ class WebSocketService extends ChangeNotifier {
   }
 
   void sendNotificationDismiss(String id) {
-    _sendMessage({
-      'type': 'notification',
-      'action': 'dismiss',
-      'id': id,
-    });
+    _sendMessage({'type': 'notification', 'action': 'dismiss', 'id': id});
   }
 
   void sendNotificationReply(String id, String text) {
@@ -1052,11 +1109,7 @@ class WebSocketService extends ChangeNotifier {
   }
 
   void sendNotificationMarkRead(String id) {
-    _sendMessage({
-      'type': 'notification',
-      'action': 'mark_read',
-      'id': id,
-    });
+    _sendMessage({'type': 'notification', 'action': 'mark_read', 'id': id});
   }
 
   void sendStatusUpdate({int? battery}) {
@@ -1067,7 +1120,11 @@ class WebSocketService extends ChangeNotifier {
     });
   }
 
-  void sendPairingRequest(String token, String publicKey, Map<String, dynamic> deviceInfo) {
+  void sendPairingRequest(
+    String token,
+    String publicKey,
+    Map<String, dynamic> deviceInfo,
+  ) {
     _sendMessage({
       'type': 'pairing',
       'action': 'request',
@@ -1078,15 +1135,15 @@ class WebSocketService extends ChangeNotifier {
   }
 
   void sendSmsMessage(String to, String body) {
-    _sendMessage({
-      'type': 'sms',
-      'action': 'send',
-      'to': to,
-      'body': body,
-    });
+    _sendMessage({'type': 'sms', 'action': 'send', 'to': to, 'body': body});
   }
 
-  void sendCallAction(String action, {String? callId, String? toDeviceId, String? route}) {
+  void sendCallAction(
+    String action, {
+    String? callId,
+    String? toDeviceId,
+    String? route,
+  }) {
     _sendMessage({
       'type': 'call',
       'action': action,
@@ -1096,7 +1153,13 @@ class WebSocketService extends ChangeNotifier {
     });
   }
 
-  void sendFileRequest(String id, String name, int size, String mime, String toDeviceId) {
+  void sendFileRequest(
+    String id,
+    String name,
+    int size,
+    String mime,
+    String toDeviceId,
+  ) {
     _sendMessage({
       'type': 'file',
       'action': 'request',

@@ -59,6 +59,63 @@ use crate::limits::{MAX_CONNECTIONS, RateLimiter};
 use crate::metrics::Metrics;
 use crate::state::{AppState, ConnectionGuard};
 
+/// Compare two SPKI pins, tolerating the formatting a human would type.
+///
+/// Both sides are `sha256/<base64>`. The prefix, surrounding whitespace and
+/// base64 padding are all ignored, because an operator pasting a pin out of
+/// `/pin` should not have to reproduce the exact padding. The digest itself is
+/// compared as bytes, so a wrong key is a wrong key.
+pub(crate) fn pins_match(expected: &str, actual: &str) -> bool {
+    fn normalise(pin: &str) -> Option<Vec<u8>> {
+        let body = pin.trim().strip_prefix("sha256/").unwrap_or(pin.trim());
+        let body = body.replace([' ', '\n', '\t'], "");
+        let body = body.trim_end_matches('=');
+        if body.is_empty() {
+            return None;
+        }
+        base64_decode(body).filter(|bytes| bytes.len() == 32)
+    }
+
+    match (normalise(expected), normalise(actual)) {
+        (Some(a), Some(b)) => a == b,
+        // An unparseable pin on either side is never a match. Silently treating
+        // a typo as "no pin configured" would disable the check the operator
+        // believes they have.
+        _ => false,
+    }
+}
+
+/// Standard base64 decode. Returns `None` on any invalid character.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a') as u32 + 26,
+            b'0'..=b'9' => (c - b'0') as u32 + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        })
+    }
+
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &byte in input.as_bytes() {
+        acc = (acc << 6) | value(byte)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    // Leftover bits must be zero, or the input was not a clean encoding.
+    if bits > 0 && (acc & ((1 << bits) - 1)) != 0 {
+        return None;
+    }
+    Some(out)
+}
+
 /// How often the replay cache is written to disk, and the routing table and
 /// connection rate limiter are swept.
 ///
@@ -286,6 +343,31 @@ impl RelayService {
         let config = self.config;
 
         // --- TLS -------------------------------------------------------------
+        // An operator-configured pin is a hard requirement, checked before the
+        // context is built: it is the only statement the operator has made about
+        // which key this relay is allowed to serve, and serving a different one
+        // is precisely the failure they were trying to prevent.
+        if let Some(expected) = config.relay_cert_pin.as_deref().map(str::trim)
+            && !expected.is_empty()
+        {
+            let actual = match crate::tls::load_tls_context() {
+                Ok(ctx) => ctx.spki_pin.clone(),
+                Err(e) => {
+                    return Err(StartError::Config(format!(
+                        "a certificate pin is configured but the TLS context could not be built: {e}"
+                    )));
+                }
+            };
+            if !pins_match(expected, &actual) {
+                return Err(StartError::Config(format!(
+                    "the relay certificate does not match the configured pin \
+                     (expected {expected}, serving {actual}). If the certificate was \
+                     renewed, update the pin; if it was not, do not."
+                )));
+            }
+            info!("Relay certificate matches the configured pin {expected}");
+        }
+
         // Non-fatal: the relay is still useful without it, and a certificate
         // that cannot be created or read is a warning, not a refusal to start.
         let tls_context = match crate::tls::load_tls_context() {

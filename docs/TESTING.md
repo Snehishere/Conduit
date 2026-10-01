@@ -25,15 +25,15 @@ common source of "command not found" / "no such package" in this project.
 ```bash
 # repository root
 cargo test -p conduit-protocol     # 275 passed, 0 failed
-cargo test -p conduit-relay        # 187 passed, 0 failed, plus 2 doctests
-cargo test -p conduit              # 724 passed, 0 failed
+cargo test -p conduit-relay        # 193 passed, 0 failed, plus 2 doctests
+cargo test -p conduit              # 729 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
 | `packages/protocol` | `conduit-protocol` | repository root | 275 passed, 0 failed |
-| `services/relay` | `conduit-relay` | repository root | 187 passed, 0 failed |
-| `apps/desktop/src-tauri` | `conduit` | repository root | 724 passed, 0 failed |
+| `services/relay` | `conduit-relay` | repository root | 193 passed, 0 failed |
+| `apps/desktop/src-tauri` | `conduit` | repository root | 729 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
 [DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem).
@@ -146,7 +146,7 @@ example advertises `"wss_port": 9531`, and that
 `kLanWssPort = 9531` / `kLanWsPort = 9527` and hard-codes neither number in any
 call site.
 
-### `conduit-relay` — 187 tests, plus 2 doctests
+### `conduit-relay` — 193 tests, plus 2 doctests
 
 The crate is a library with no `src/main.rs` and no `[[bin]]`. Its tests live in
 two places: `src/suite.rs` is the whole in-crate suite, and `src/tls.rs` keeps
@@ -156,11 +156,11 @@ its own `mod tests` beside the code it exercises. The other modules
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/suite.rs` | 152 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; and an end-to-end WebSocket lifecycle against a real listener |
-| `src/tls.rs` | 35 | Self-signed certificate generation and SAN handling; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening; SPKI extraction cross-checked against `openssl` |
+| `src/suite.rs` | 157 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; and an end-to-end WebSocket lifecycle against a real listener |
+| `src/tls.rs` | 36 | Self-signed certificate generation and SAN handling; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening; SPKI extraction cross-checked against `openssl` |
 
 One of the 36 `#[test]` functions in `tls.rs` is `#[cfg(unix)]`, so a Windows run
-reports 35. There are 2 doctests in `lib.rs`'s module docs.
+reports 36. There are 2 doctests in `lib.rs`'s module docs.
 
 The suite lives in one file because it is written against the relay as a whole
 rather than module by module; the doc comment at the top of `suite.rs` says so.
@@ -273,8 +273,8 @@ Stated without softening:
 | "The frontend is tested against the backend" | **No test exercises real Tauri IPC.** `__mocks__/tauri.ts` is a 3-line stub whose `invoke` is a bare `vi.fn()` returning `undefined`. Any test that depends on a command's real return value is either asserting on `undefined` or mocking the return itself. |
 | "End-to-end tested" | **The Playwright suite runs in a plain browser and cannot reach Tauri at all.** It exercises layout, navigation, keyboard handling and the app's behaviour when `invoke()` rejects. It proves the shell renders and degrades. It does not prove a single Rust command works. |
 | "The protocol is consistent across languages" | **There is no cross-language conformance test.** Nothing verifies that `types.rs`, `websocket.ts` and `protocol.dart` agree. The `conduit-protocol` tests link `types.rs` to `schema.json` and check a handful of *textual* invariants in the Dart source (two port constants, no hard-coded port literals). Beyond that, the only link between the three languages is two codegen invocations and a developer's discipline. |
-| "The relay is tested against a real client" | **No.** The relay's tests build their frames by hand — synthetic input, against a real listener the suite starts itself. There is no round-trip of a frame produced by the real desktop encoder or the real mobile encoder. `tokio-test` is not a dependency of this crate. |
-| "Certificate pinning is tested" | **No.** No test covers the SPKI pin computation on either client. And `docs/relay-tls.md` records that the mobile client still hashes the whole DER certificate while the documented pin is over the SPKI — so mobile pinning does not work as specified. |
+| "The relay is tested against a real client" | **Partly.** The relay's unit tests still build their frames by hand, but the end-to-end lifecycle tests now assert the wire format a real client depends on: that a routed message arrives as a `relay_delivery` carrying the authenticated sender, and that a forwarded binary frame is re-framed as a well-formed v2 frame whose tag verifies under the sender's route key. The *receiver* half is tested in the desktop crate, which drives the real `"relay_server"` connection id through the real dispatcher. What is still missing is one test that puts a real client on a real socket and runs the whole path in a single process. |
+| "Certificate pinning is tested" | **Yes, on the SPKI computation.** `services/relay/src/tls.rs::spki_vector_for_the_dart_client` and `apps/mobile/test/services/relay_route_test.dart` assert the same recorded certificate and the same pin, and the Rust side cross-checks the DER walk against `openssl`. That is what would have caught the client hashing `cert.der`. The pin *enforcement* path — the relay refusing to start on a configured-pin mismatch — is also covered. What is not covered is a live TLS handshake through the mobile client, which needs a device. |
 | "`dart format` is clean" | **No.** 63 of 74 Dart files are unformatted. `scripts/lint-all.ps1` and the CI `flutter` job both run the check, but non-blocking (`-Optional` / `continue-on-error: true`), so nothing fails on it. |
 
 What that means in practice: the Rust backend and the protocol crate are
@@ -476,8 +476,8 @@ Ordered by the risk each one leaves uncovered. All are also tracked in
 | 2 | **No cross-language conformance test** (`types.rs` ↔ `websocket.ts` ↔ `protocol.dart`) | The only guarantee is codegen discipline. The `codegen` CI job regenerates and runs `git diff --exit-code`, which catches a stale artifact; a real conformance suite that validates the runtime behaviour of both generated clients is still missing. |
 | 3 | **No test exercises real Tauri IPC** | `__mocks__/tauri.ts` returns `undefined` for every command. A richer mock — or a Tauri-driver-based test against a built app — would cover the 123 command tests' actual return shapes. |
 | 4 | **Almost no tests for mobile `lib/services/` (14 files) or `lib/models/` (5 files)** | `test/services/relay_route_test.dart` covers one service; the other 13 and all 5 models have no unit tests. The bulk of `flutter test` is still 13 screens, 5 widget suites and the theme — presentation only. |
-| 5 | **No relay binary-frame round-trip against a real client** | The relay's frame tests use synthetic input. A frame produced by the real desktop encoder, or by the real mobile encoder, and relayed end to end is untested. |
-| 6 | **No certificate-pinning tests** | The SPKI pin is not computed or checked by any test, and `docs/relay-tls.md` records that the mobile client hashes the wrong thing. A test pinning the SPKI computation would have caught it. |
+| 5 | **No single-process relay round-trip against a real client** | The relay's own frame tests build input by hand. The end-to-end lifecycle tests assert the wire format a real client depends on, and the desktop crate drives the real `"relay_server"` path, but no single test puts a real encoder on a real socket and runs phone → relay → desktop in one process. That is the gap that let a non-functional relay ship. |
+| 6 | ~~**No certificate-pinning tests**~~ — **closed** | The SPKI pin is now computed and asserted on both sides against a shared fixture, cross-checked against `openssl` on the Rust side. This is the test whose absence let the mobile client hash `cert.der` for a year. A live TLS handshake through the mobile client still needs a device. |
 | 7 | **No Rust integration tests** (no `tests/` directory) | Every Rust test is an in-crate unit test. Crate-level behaviour — the public API as a consumer sees it, and the `conduit-protocol` → `conduit` / `conduit-relay` boundary — has no coverage. |
 | 8 | **Playwright cannot reach Tauri** | Structural, not fixable without a Tauri-aware harness. Documented so nobody reads a green Playwright run as backend coverage. |
 | 9 | **`dart format` is checked but non-blocking; 63 of 74 files unformatted** | Both `scripts/lint-all.ps1` and the CI `flutter` job run the check and neither fails on it. Mechanical to fix, but until one does, every Dart diff carries unrelated churn. |

@@ -589,9 +589,28 @@ impl WsServer {
         client_id: &str,
         claimed_id: Option<&str>,
     ) -> Option<String> {
-        let connection_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
-
         let engine = ctx.sync_engine.read().await;
+
+        // A relayed message arrives already attributed: `client_id` is the
+        // device the relay authenticated, not a connection id. It is resolved
+        // directly against the registry, and it is not overridable by the
+        // envelope's own `source_device` claim — a device that is not paired
+        // yields no secret at all.
+        //
+        // This tier comes first because a relayed id is a stronger statement
+        // than anything the socket itself can say: it is what the relay
+        // established during `relay_auth` and re-checked against the signature.
+        if let Some(secret) = engine
+            .get_client(client_id)
+            .map(|c| c.shared_secret.clone())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(secret);
+        }
+
+        // Otherwise this is a LAN socket, and its identity is whatever the hub
+        // wrote at pairing time.
+        let connection_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
         let by_connection = connection_id
             .as_deref()
             .and_then(|id| engine.get_client(id))
@@ -614,7 +633,85 @@ impl WsServer {
         })
     }
 
+    /// The client id the outbound relay connection is dispatched under.
+    ///
+    /// It is deliberately not a device id and deliberately not in
+    /// `ws_to_device_id`: it names the *transport*, not a peer. A relayed message
+    /// carries its own authenticated sender in a `relay_delivery` envelope, and
+    /// that sender — not this id — is what the rest of the hub sees.
+    const RELAY_CLIENT_ID: &str = "relay_server";
+
+    /// Unwrap a `relay_delivery` envelope into `(sender, payload)`.
+    ///
+    /// Returns `None` for anything that is not a well-formed envelope, and for
+    /// any sender this desktop has not paired. The `from_device_id` is checked
+    /// against the pairing registry rather than trusted: the relay stamped it,
+    /// but a field that arrives over a socket is attacker-influenced, and the
+    /// cost of being wrong is impersonating a paired device.
+    async fn unwrap_relay_delivery(text: &str, ctx: &WsContext) -> Option<(String, Value)> {
+        let msg: Value = serde_json::from_str(text).ok()?;
+        if msg.get("type").and_then(|v| v.as_str()) != Some("relay_delivery") {
+            return None;
+        }
+
+        let from = msg
+            .get("from_device_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?;
+
+        // The relay only routes to a device it authenticated, and only a paired
+        // device has a route key at all, so this is nearly always redundant. It
+        // is still the difference between "the relay said so" and "the desktop
+        // verified it", and an unpaired sender must never reach a handler.
+        let trusted = ctx
+            .sync_engine
+            .read()
+            .await
+            .get_client(from)
+            .is_some_and(|c| !c.shared_secret.is_empty());
+        if !trusted {
+            warn!("Refusing a relay_delivery from unpaired device {from}");
+            return None;
+        }
+
+        let payload = msg.get("payload")?.clone();
+        Some((from.to_string(), payload))
+    }
+
     async fn handle_message(text: &str, client_id: &str, ctx: &WsContext) {
+        // A relayed message is not this socket's traffic: it is another
+        // device's, carried here. Unwrap it and re-enter as the sender the
+        // relay authenticated, so the auth gate and the handlers see a real
+        // paired identity instead of a transport id that is in no registry.
+        //
+        // Without this the whole feature is dead on arrival: `relay_server` is
+        // never a trusted peer, so every relayed message was refused with
+        // `not_authenticated` and the phone's notification simply vanished.
+        if client_id == Self::RELAY_CLIENT_ID {
+            match Self::unwrap_relay_delivery(text, ctx).await {
+                Some((sender, payload)) => {
+                    let forwarded = payload.to_string();
+                    // Not a recursive call: an unwrapped delivery is dispatched
+                    // once, as the sender, and a second envelope inside it is
+                    // refused like any other unexpected type. A loop here would
+                    // also be an unbounded nesting primitive.
+                    return Self::dispatch(&forwarded, &sender, ctx).await;
+                }
+                None => {
+                    // Not a delivery, or a sender we do not trust. `ping`/`pong`
+                    // still have to work on this socket, so fall through to the
+                    // normal dispatcher, which will refuse anything else.
+                }
+            }
+        }
+
+        Self::dispatch(text, client_id, ctx).await
+    }
+
+    /// The body of [`Self::handle_message`], once the transport has been peeled
+    /// off: everything below this point is about the *message*, not about which
+    /// socket carried it.
+    async fn dispatch(text: &str, client_id: &str, ctx: &WsContext) {
         let msg: Value = match serde_json::from_str(text) {
             Ok(v) => v,
             Err(e) => {
@@ -941,6 +1038,36 @@ impl WsServer {
                     let _ = tx.send(pong);
                 }
             }
+            // ── Relay control plane ───────────────────────────────────────────
+            //
+            // Only reachable on the outbound relay connection. These used to be
+            // rejected by `validate_msg_type` before dispatch, so a `relay_auth`
+            // the relay refused was indistinguishable from a dropped socket, and
+            // the reconnect loop just backed off and tried again.
+            ("relay_auth_ok", _) => {
+                info!("Relay accepted this desktop's relay_auth");
+            }
+            ("relay_auth_rejected", _) => {
+                let reason = processed_msg
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unspecified");
+                error!(
+                    "Relay refused this desktop's relay_auth ({reason}). The stored relay token \
+                     is wrong or was rotated; messages to phones off the LAN will not be routed."
+                );
+            }
+            ("error", _) => {
+                let code = processed_msg
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let detail = processed_msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no detail");
+                warn!("Relay refused a message from this desktop: {code} ({detail})");
+            }
             // `tv` and `watch` are accepted by `validate_msg_type` but have no
             // handler anywhere in the workspace — dead protocol surface that
             // silently swallows frames. Report rather than delete: the mobile
@@ -1131,7 +1258,7 @@ impl WsServer {
                         while let Some(Ok(msg)) = read.next().await {
                             match msg {
                                 Message::Text(text) => {
-                                    Self::handle_message(&text, "relay_server", &ctx).await;
+                                    Self::handle_message(&text, Self::RELAY_CLIENT_ID, &ctx).await;
                                 }
                                 Message::Binary(bytes) => {
                                     handlers::files::handle_binary_message(
@@ -3029,6 +3156,171 @@ mod tests {
             ids,
             vec!["ui_1".to_string()],
             "only the capability-proved webview may create the rule"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    //  The relay's inbound path
+    //
+    //  Every test above drives `handle_message` with a `ws_*` client id that
+    //  the test itself registered in the pairing registry. The relay connection
+    //  does not: it dials the relay as `"relay_server"` and the relay forwards
+    //  only the inner payload, so nothing ever puts that id in `ws_to_device_id`.
+    //  These tests drive the id the relay actually uses, which is the only way
+    //  to see what a phone that is not on the LAN experiences.
+    // -----------------------------------------------------------------
+
+    /// The client id the outbound relay connection is dispatched under.
+    const RELAY_CLIENT_ID: &str = "relay_server";
+
+    /// A relayed payload is the *inner* message only: the relay has already
+    /// verified and discarded the `relay_route` envelope.
+    ///
+    /// Returns the bytes a relay would actually put on the wire for `inner`.
+    async fn as_relay_forwarded_payload(ctx: &WsContext, from_device: &str, inner: &str) -> String {
+        WsServer::seal_for_peer(ctx, from_device, inner).await
+    }
+
+    /// A phone on another network is paired, and the relay forwards a
+    /// notification from it. It must reach storage.
+    ///
+    /// This is the whole point of the relay. Before `relay_delivery` existed
+    /// the payload arrived as a bare `encrypted` envelope attributed to
+    /// `relay_server`, which is in no pairing registry, so the auth gate
+    /// dropped it and the notification was silently lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_notification_from_a_paired_phone_reaches_storage() {
+        let ctx = create_test_ctx();
+        let secret = "11".repeat(32);
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        ctx.sync_engine
+            .write()
+            .await
+            .add_client(crate::sync::ConnectedClient {
+                device_id: "dev_phone".into(),
+                device_name: "Phone".into(),
+                device_type: "phone".into(),
+                shared_secret: secret.clone(),
+                last_heartbeat: 0,
+                battery_level: None,
+            });
+
+        let inner = serde_json::to_string(&serde_json::json!({
+            "type": "notification",
+            "action": "post",
+            "id": "n_relayed",
+            "app": "Slack",
+            "title": "Relayed",
+            "body": "across the internet",
+            "timestamp": 1_700_000_000
+        }))
+        .unwrap();
+
+        // What the relay puts on the wire: the sender's sealed payload, wrapped
+        // in the `relay_delivery` envelope the relay emits after verifying the
+        // route. Built with the real `RelayDelivery` constructor, so this test
+        // cannot drift from what the relay actually produces.
+        let sealed = as_relay_forwarded_payload(&ctx, "ws_phone", &inner).await;
+        assert!(
+            sealed.contains("\"encrypted\""),
+            "the forwarded payload is still an encrypted envelope; got {sealed}"
+        );
+        let delivery = RelayDelivery::new(
+            "dev_phone",
+            "test-device",
+            serde_json::from_str(&sealed).expect("sealed payload is JSON"),
+        );
+        let wire = serde_json::to_string(&delivery).expect("RelayDelivery serializes");
+
+        WsServer::handle_message(&wire, RELAY_CLIENT_ID, &ctx).await;
+
+        let stored = ctx.storage.get_notifications(10).await.unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "a relayed notification from a paired phone must be stored, not dropped"
+        );
+        assert_eq!(stored[0].id, "n_relayed");
+    }
+
+    /// The receiver must learn who the message was from, and must be able to
+    /// tell a *different* paired device apart from the one that sent it.
+    ///
+    /// Attribution is the thing the relay verifies and then used to throw away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_message_carries_its_sender_to_the_receiver() {
+        let ctx = create_test_ctx();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+
+        let delivery = serde_json::to_string(&serde_json::json!({
+            "type": "relay_delivery",
+            "from_device_id": "dev_phone",
+            "to_device_id": "test-device",
+            "payload": {
+                "type": "clipboard", "action": "sync", "content": "hi"
+            }
+        }))
+        .unwrap();
+
+        let attributed = WsServer::unwrap_relay_delivery(&delivery, &ctx).await;
+        assert_eq!(
+            attributed.as_ref().map(|(from, _)| from.as_str()),
+            Some("dev_phone"),
+            "the receiver must be told which device sent this"
+        );
+        let (_from, body) = attributed.expect("envelope unwraps");
+        assert_eq!(
+            body.get("type").and_then(|v| v.as_str()),
+            Some("clipboard"),
+            "the unwrapped body is the original message, not the envelope"
+        );
+    }
+
+    /// A `relay_delivery` naming a device that is not paired is refused, and
+    /// its payload is never dispatched.
+    ///
+    /// The envelope is attacker-influenced input: the relay stamps
+    /// `from_device_id`, but the desktop must still resolve it against its own
+    /// registry rather than trusting the string.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_delivery_from_an_unpaired_device_is_refused() {
+        let ctx = create_test_ctx();
+        // No device named "dev_stranger" is paired.
+        let forged = serde_json::to_string(&serde_json::json!({
+            "type": "relay_delivery",
+            "from_device_id": "dev_stranger",
+            "payload": {
+                "type": "notification", "action": "post",
+                "id": "n_forged", "app": "Slack"
+            }
+        }))
+        .unwrap();
+
+        assert!(
+            WsServer::unwrap_relay_delivery(&forged, &ctx)
+                .await
+                .is_none(),
+            "an envelope claiming an unknown sender must not unwrap"
+        );
+
+        WsServer::handle_message(&forged, RELAY_CLIENT_ID, &ctx).await;
+        assert!(
+            ctx.storage.get_notifications(10).await.unwrap().is_empty(),
+            "nothing from an unpaired sender may be stored"
+        );
+    }
+    /// A relayed frame must not be dispatchable as if it came from the relay
+    /// connection's own identity.
+    ///
+    /// `"relay_server"` is the id the relay socket is dispatched under. If a
+    /// relayed message is fed in under that id *without* being unwrapped, it
+    /// inherits whatever authority that id has. It must have none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_connection_id_is_never_a_trusted_peer() {
+        let ctx = create_test_ctx();
+        assert!(
+            !handlers::is_trusted_peer(&ctx, RELAY_CLIENT_ID).await,
+            "the relay socket must not be able to send protected messages as itself"
         );
     }
 }

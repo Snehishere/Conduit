@@ -946,6 +946,93 @@ mod tests {
         assert!(spki_der_from_pem("").is_err());
     }
 
+    /// A real certificate, and the pin a client must compute from it.
+    ///
+    /// The Dart client parses SPKI out of `cert.der` itself, and this is the
+    /// only thing that can prove the two parsers agree: the Rust side walks the
+    /// DER, the Dart side walks it again, and both must land on the same bytes.
+    /// A freshly generated certificate would prove nothing, because the two
+    /// sides would be handed different input.
+    ///
+    /// `apps/mobile/test/services/relay_route_test.dart` asserts the same two
+    /// fixtures. Regenerate both sides with
+    /// `cargo test -p conduit-relay --lib emit_spki_vector_fixture -- --ignored --nocapture`.
+    #[test]
+    fn spki_vector_for_the_dart_client() {
+        const CERT_DER_BASE64: &str = include_str!("../tests/fixtures/spki_vector_cert.der.b64");
+        let der = decode_base64(CERT_DER_BASE64.trim());
+        let spki = spki_der_from_certificate(&CertificateDer::from(der.clone())).unwrap();
+        let pin = base64_encode(&conduit_protocol::hmac::sha256(&spki));
+
+        const EXPECTED_PIN: &str = include_str!("../tests/fixtures/spki_vector_pin.txt");
+        assert_eq!(
+            pin.trim(),
+            EXPECTED_PIN.trim(),
+            "the recorded SPKI pin no longer matches the recorded certificate"
+        );
+        assert_ne!(
+            pin.trim(),
+            base64_encode(&conduit_protocol::hmac::sha256(&der)),
+            "the SPKI pin must differ from the whole-certificate hash — this is \
+             the exact confusion the mobile client had"
+        );
+    }
+
+    /// Decode standard base64, ignoring whitespace.
+    fn decode_base64(input: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc: u32 = 0;
+        let mut bits = 0;
+        for ch in input.chars().filter(|c| !c.is_whitespace()) {
+            if ch == '=' {
+                break;
+            }
+            let v = match ch {
+                'A'..='Z' => ch as u32 - 'A' as u32,
+                'a'..='z' => ch as u32 - 'a' as u32 + 26,
+                '0'..='9' => ch as u32 - '0' as u32 + 52,
+                '+' => 62,
+                '/' => 63,
+                _ => panic!("invalid base64 character {ch:?}"),
+            };
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
+    }
+
+    /// Emit the fixture files, once, by hand.
+    ///
+    /// Not a normal test: run with `SPKI_VECTOR=1 cargo test -p conduit-relay
+    /// --lib emit_spki_vector_fixture -- --nocapture --ignored` and commit what
+    /// it prints. The generated certificate is thrown away afterwards, so the
+    /// committed fixture is a real certificate that simply happens to be old.
+    #[test]
+    #[ignore = "fixture generator; run manually"]
+    fn emit_spki_vector_fixture() {
+        let (cert_pem, _) = generate_self_signed_pair();
+        let mut cr = std::io::BufReader::new(cert_pem.as_bytes());
+        let der: Vec<u8> = certs(&mut cr).next().unwrap().unwrap().as_ref().to_vec();
+        let spki = spki_der_from_certificate(&CertificateDer::from(der.clone())).unwrap();
+        let pin = base64_encode(&conduit_protocol::hmac::sha256(&spki));
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures");
+        std::fs::create_dir_all(&root).expect("fixtures dir");
+        std::fs::write(
+            root.join("spki_vector_cert.der.b64"),
+            format!("{}\n", base64_encode(&der)),
+        )
+        .expect("write cert fixture");
+        std::fs::write(root.join("spki_vector_pin.txt"), format!("{pin}\n"))
+            .expect("write pin fixture");
+        println!("wrote fixtures under {}", root.display());
+    }
+
     // ---------------------------------------------------------------
     //  Base64 encoder
     // ---------------------------------------------------------------

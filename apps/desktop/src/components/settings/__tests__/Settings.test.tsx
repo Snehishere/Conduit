@@ -35,6 +35,7 @@ const { baseInvoke } = vi.hoisted(() => {
         relay_port: 9529,
         relay_health_port: 9530,
         relay_hostname: '',
+        relay_cert_pin: '',
       });
     }
     if (cmd === 'get_relay_status') {

@@ -395,6 +395,19 @@ fn validate_msg_type(msg_type: &str) -> Result<(), ConduitError> {
         "watch",
         "ping",
         "pong",
+        // The relay's own delivery envelope. Only ever received on the outbound
+        // relay connection, and unwrapped by `handle_message` before it reaches
+        // any handler, so allowing the type here does not expose it to the LAN
+        // dispatcher: a LAN client that sends one has it refused as an unknown
+        // action, because no `(relay_delivery, _)` arm exists below the unwrap.
+        "relay_delivery",
+        // Relay control-plane frames. `relay_auth_ok` / `relay_auth_rejected` /
+        // `error` are the relay's answers to this app's own connection; without
+        // them in the list `validate_message` rejected them before dispatch, so a
+        // rejected token looked identical to a dropped socket.
+        "relay_auth_ok",
+        "relay_auth_rejected",
+        "error",
     ];
     if !VALID_TYPES.contains(&msg_type) {
         return Err(ConduitError::Protocol(format!(

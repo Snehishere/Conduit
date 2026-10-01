@@ -61,6 +61,12 @@ export interface SettingsData {
   relay_port: number;
   relay_health_port: number;
   relay_hostname: string;
+  // The SPKI pin the served certificate must present, as `sha256/<base64>`.
+  // Empty — the default — enforces nothing, which is right when this app hosts
+  // the relay and is authenticating nobody. Set it when standing behind a
+  // specific key, and a certificate that changed without being intended to will
+  // stop the relay rather than being served.
+  relay_cert_pin: string;
 }
 
 export type SettingsKey = keyof SettingsData;
@@ -91,6 +97,7 @@ export const SETTINGS_KEYS = {
   relay_port: true,
   relay_health_port: true,
   relay_hostname: true,
+  relay_cert_pin: true,
 } as const satisfies Record<SettingsKey, true>;
 
 /** `SETTINGS_KEYS` as an array, for runtime iteration and tests. */
@@ -122,6 +129,7 @@ export const DEFAULT_SETTINGS: SettingsData = {
   relay_port: 9529,
   relay_health_port: 9530,
   relay_hostname: '',
+  relay_cert_pin: '',
 };
 
 export type UpdateSetting = <K extends SettingsKey>(

@@ -8,7 +8,9 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use conduit_protocol::{ErrorMessage, Ping, Pong, RelayAuth, RelayAuthOk, RelayAuthRejected};
+use conduit_protocol::{
+    ErrorMessage, Ping, Pong, RelayAuth, RelayAuthOk, RelayAuthRejected, RelayDelivery,
+};
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
@@ -260,6 +262,10 @@ pub(crate) async fn handle_connection<S>(
     let nonces = state.nonces.clone();
     // Highest binary sequence number accepted on this connection (replay guard).
     let mut last_binary_seq: Option<u32> = None;
+    // Outbound frame counter for deliveries this relay re-frames. Separate from
+    // `last_binary_seq`, which guards what arrives: a sender's own numbering and
+    // the numbering the relay stamps on what it forwards are different series.
+    let mut delivery_seq: u32 = 0;
 
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(25));
 
@@ -353,11 +359,26 @@ pub(crate) async fn handle_connection<S>(
                                 .await
                                 {
                                     Ok(route) => {
+                                        // Wrap rather than forward bare. `handle_relay_route`
+                                        // has just established that this connection *is*
+                                        // `my_id` and that the signature verifies under that
+                                        // device's own route key, so the attribution is
+                                        // known here and nowhere else. Forwarding
+                                        // `route.payload` alone discarded it, which left the
+                                        // receiver unable to tell who sent the message and
+                                        // unable to apply its own pairing check — see
+                                        // `RelayDelivery` for the full argument.
+                                        let delivery = RelayDelivery::new(
+                                            my_id.clone(),
+                                            route.to_device_id.clone(),
+                                            route.payload,
+                                        );
                                         forward_text(
                                             &state,
                                             &my_id,
                                             &route.to_device_id,
-                                            route.payload,
+                                            serde_json::to_value(&delivery)
+                                                .unwrap_or(serde_json::Value::Null),
                                         )
                                         .await;
                                     }
@@ -453,8 +474,47 @@ pub(crate) async fn handle_connection<S>(
                         .await
                         {
                             Ok(Some(frame)) => {
-                                forward_binary(&state, &my_id, &frame.target_id, frame.payload)
-                                    .await;
+                                // Re-frame rather than forward the stripped payload.
+                                //
+                                // The incoming frame was addressed to the recipient and
+                                // tagged for this connection's sender, which is exactly
+                                // right for verification but useless to the recipient:
+                                // the header the far end parses is gone, and the tag was
+                                // computed over a MAC input naming a sender it cannot
+                                // check. Building a fresh v2 frame here means the
+                                // recipient gets a well-formed frame whose tag names the
+                                // sender the relay actually authenticated.
+                                //
+                                // The sequence is re-based per recipient, which is what
+                                // the receiver's replay guard expects: it is monotonic per
+                                // sending connection, and this is a new connection from
+                                // the recipient's point of view.
+                                match state.route_keys.key_for(&my_id) {
+                                    Some(key) => {
+                                        delivery_seq = delivery_seq.wrapping_add(1);
+                                        let reframed = conduit_protocol::build_binary_frame(
+                                            &key,
+                                            &my_id,
+                                            &frame.target_id,
+                                            delivery_seq,
+                                            frame.payload,
+                                        );
+                                        forward_binary(&state, &my_id, &frame.target_id, &reframed)
+                                            .await;
+                                    }
+                                    None => {
+                                        // Unreachable: the tag verified under this
+                                        // device's key a moment ago.
+                                        warn!(
+                                            "Dropping binary frame from {my_id}: route key \
+                                             vanished mid-connection"
+                                        );
+                                        state
+                                            .metrics
+                                            .messages_dropped_hmac_failed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                }
                             }
                             Ok(None) => {}
                             Err(rejection) => {

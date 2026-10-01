@@ -11,6 +11,10 @@ String protocolToJson(Protocol data) => json.encode(data.toJson());
 
 ///JSON message schema for the Conduit ecosystem (desktop, mobile, relay).
 ///
+///Emitted by the relay after it has verified a relay_route, carrying the authenticated
+///sender alongside the forwarded payload. Not client-producible: it is the relay's own
+///attestation, so it is not signed.
+///
 ///A newly received SMS. Both sender ({from, body, timestamp}) and receiver ({thread_id,
 ///message}) shapes are accepted; see PROTOCOL.md on the unresolved divergence.
 ///
@@ -104,6 +108,8 @@ class Protocol {
     final String? callId;
     final String? number;
     final String? route;
+    
+    ///The device this delivery is addressed to.
     final String? toDeviceId;
     final String? wifiSsid;
     final String? code;
@@ -112,7 +118,13 @@ class Protocol {
     final String? relayToken;
     
     ///Complete JSON message to forward
+    ///
+    ///The forwarded message, verbatim. Normally an encrypted envelope.
     final Map<String, dynamic>? payload;
+    
+    ///The device id the relay authenticated on the sending connection. Not a sender-chosen
+    ///claim.
+    final String? fromDeviceId;
     
     ///Hex-encoded HMAC-SHA256
     final String? hmac;
@@ -193,6 +205,7 @@ class Protocol {
         this.serverVersion,
         this.relayToken,
         this.payload,
+        this.fromDeviceId,
         this.hmac,
         this.nonce,
         this.threads,
@@ -270,6 +283,7 @@ class Protocol {
         serverVersion: json["server_version"],
         relayToken: json["relay_token"],
         payload: Map.from(json["payload"]!).map((k, v) => MapEntry<String, dynamic>(k, v)),
+        fromDeviceId: json["from_device_id"],
         hmac: json["hmac"],
         nonce: json["nonce"],
         threads: json["threads"] == null ? [] : List<SmsThread>.from(json["threads"]!.map((x) => SmsThread.fromJson(x))),
@@ -347,6 +361,7 @@ class Protocol {
         "server_version": serverVersion,
         "relay_token": relayToken,
         "payload": Map.from(payload!).map((k, v) => MapEntry<String, dynamic>(k, v)),
+        "from_device_id": fromDeviceId,
         "hmac": hmac,
         "nonce": nonce,
         "threads": threads == null ? [] : List<dynamic>.from(threads!.map((x) => x.toJson())),
@@ -746,6 +761,7 @@ enum PurpleType {
     RELAY_AUTH,
     RELAY_AUTH_OK,
     RELAY_AUTH_REJECTED,
+    RELAY_DELIVERY,
     RELAY_ROUTE,
     REMOTE_INPUT,
     SCREEN_MIRROR,
@@ -769,6 +785,7 @@ final purpleTypeValues = EnumValues({
     "relay_auth": PurpleType.RELAY_AUTH,
     "relay_auth_ok": PurpleType.RELAY_AUTH_OK,
     "relay_auth_rejected": PurpleType.RELAY_AUTH_REJECTED,
+    "relay_delivery": PurpleType.RELAY_DELIVERY,
     "relay_route": PurpleType.RELAY_ROUTE,
     "remote_input": PurpleType.REMOTE_INPUT,
     "screen_mirror": PurpleType.SCREEN_MIRROR,

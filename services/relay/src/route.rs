@@ -264,12 +264,9 @@ pub(crate) fn binary_mac_input(
     authenticated_device_id: &str,
     header_and_payload: &[u8],
 ) -> Vec<u8> {
-    let mut input =
-        Vec::with_capacity(authenticated_device_id.len() + 1 + header_and_payload.len());
-    input.extend_from_slice(authenticated_device_id.as_bytes());
-    input.push(0x1f);
-    input.extend_from_slice(header_and_payload);
-    input
+    // Delegates to the protocol crate so the bytes verified here and the bytes
+    // stamped by `conduit_protocol::build_binary_frame` cannot drift apart.
+    conduit_protocol::binary_mac_input(authenticated_device_id, header_and_payload)
 }
 
 /// Verify a v2 binary frame tag.

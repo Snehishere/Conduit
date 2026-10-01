@@ -99,6 +99,13 @@ pub struct Config {
     /// certificate a relay presents is a function of its configuration rather
     /// than of process-global state.
     pub tls: crate::tls::TlsParams,
+    /// SPKI pin the served certificate must present, as `sha256/<base64>`.
+    ///
+    /// `None` enforces nothing, which is right when the host *is* the server and
+    /// is not authenticating anyone. When set, a mismatch refuses startup: a
+    /// certificate change is either a renewal the operator knows about or
+    /// something that should not be served, and only failing tells them apart.
+    pub relay_cert_pin: Option<String>,
 }
 
 /// Resolve the HMAC secret: env var → secret file → generate + persist.
@@ -216,6 +223,13 @@ pub struct Overrides {
     pub metrics_token: Option<String>,
     /// Serve TLS on this port, or generate a self-signed certificate for it.
     pub tls_hostname: Option<String>,
+    /// SPKI pin the served certificate must present, as `sha256/<base64>`.
+    ///
+    /// `None` — the default — means no pin is enforced, which is right for a
+    /// relay hosting its own connections. Setting it makes a mismatch a refusal
+    /// to start rather than a log line, so a certificate that changed without
+    /// being intended to cannot be served.
+    pub relay_cert_pin: Option<String>,
     /// Extra subject alternative names for a generated certificate.
     pub tls_extra_sans: Option<Vec<String>>,
     /// Directory holding (or receiving) `cert.pem` and `key.pem`.
@@ -377,6 +391,11 @@ impl Config {
             auth_timeout_secs,
             relay_token,
             tls,
+            relay_cert_pin: o
+                .relay_cert_pin
+                .or_else(|| std::env::var("RELAY_CERT_PIN").ok())
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty()),
         };
         Ok(config.with_health_token_fallback())
     }

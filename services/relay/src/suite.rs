@@ -362,6 +362,7 @@ fn test_config() -> Config {
         enable_plain_ws: false,
         nonce_file: std::path::PathBuf::from("./data/test-nonces.json"),
         auth_timeout_secs: 10,
+        relay_cert_pin: None,
     }
 }
 
@@ -2194,13 +2195,45 @@ async fn e2e_connect_authenticate_forward_disconnect_full_lifecycle() {
         .await
         .expect("send route");
 
-    let delivered = recv_text_matching(&mut bob, 5, |t| t.contains("ping"))
+    // Match the delivery specifically, not the relay's own 25s `ping` keepalive,
+    // which also contains "ping".
+    let delivered = recv_text_matching(&mut bob, 5, |t| t.contains("relay_delivery"))
         .await
         .expect("bob should receive routed payload");
+
+    // The relay wraps the verified payload rather than forwarding it bare, so
+    // the recipient learns who sent it. It used to forward the inner message
+    // alone, which discarded the one attribution it had just authenticated.
+    let parsed: serde_json::Value =
+        serde_json::from_str(&delivered).expect("delivered frame is JSON");
+    assert_eq!(
+        parsed.get("type").and_then(|v| v.as_str()),
+        Some("relay_delivery"),
+        "a routed message is delivered in a relay_delivery envelope, got: {delivered}"
+    );
+    assert_eq!(
+        parsed.get("from_device_id").and_then(|v| v.as_str()),
+        Some("a11ce"),
+        "the envelope must name the authenticated sender"
+    );
+    assert_eq!(
+        parsed.get("to_device_id").and_then(|v| v.as_str()),
+        Some("b0b"),
+        "the envelope must name the recipient"
+    );
+    assert_eq!(
+        parsed
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|v| v.as_str()),
+        Some("ping"),
+        "the inner message rides inside the envelope unchanged"
+    );
+    // The verified signature and the sender claim must not be re-sent: the
+    // envelope is the relay's statement, not the sender's.
     assert!(
-        delivered.contains("\"type\":\"ping\"") || delivered.contains("ping"),
-        "delivered payload should be the inner message, got: {}",
-        delivered
+        parsed.get("hmac").is_none(),
+        "the relay's own envelope is not a signed relay_route"
     );
 
     // Metrics reflect the routing.
@@ -2766,10 +2799,53 @@ async fn e2e_binary_frame_routed_to_target_device() {
         }
     }
     let bytes = got.expect("bin-dst should receive binary payload");
-    assert_eq!(
-        bytes, b"binary-payload-bytes",
-        "payload should be forwarded without the 53-byte v2 header"
+
+    // The relay re-frames rather than stripping. It used to forward the bare
+    // payload, which left the recipient with no v2 header to parse and a tag it
+    // could not check — so a relayed file chunk could not be decoded at all.
+    // What arrives is a well-formed v2 frame addressed to the recipient and
+    // tagged for the sender the relay authenticated.
+    assert!(
+        bytes.len() > conduit_protocol::BINARY_HEADER_LEN,
+        "a relayed binary frame carries its own v2 header; got {} bytes",
+        bytes.len()
     );
+    assert_eq!(
+        bytes[0],
+        conduit_protocol::BINARY_FRAME_VERSION,
+        "the forwarded frame must still be v2"
+    );
+
+    let target = std::str::from_utf8(&bytes[1..1 + conduit_protocol::BINARY_DEVICE_ID_LEN])
+        .expect("target id is ASCII")
+        .trim_end_matches('\0');
+    assert_eq!(target, "b145d", "the frame is addressed to the recipient");
+
+    // The payload survives intact behind the header.
+    assert_eq!(
+        &bytes[conduit_protocol::BINARY_HEADER_LEN..],
+        b"binary-payload-bytes",
+        "the re-framed payload must be byte-identical to what was sent"
+    );
+
+    // And the tag verifies under the *sender's* route key, which is what makes
+    // the attribution real rather than asserted.
+    let sender_key = state
+        .route_keys
+        .key_for("b1455")
+        .expect("the sender has a route key");
+    let mut authenticated = Vec::new();
+    authenticated.extend_from_slice(&bytes[..conduit_protocol::BINARY_AUTHENTICATED_PREFIX_LEN]);
+    authenticated.extend_from_slice(&bytes[conduit_protocol::BINARY_HEADER_LEN..]);
+    let mac_input = hex::encode(conduit_protocol::binary_mac_input("b1455", &authenticated));
+    let tag = hex::encode(
+        &bytes[conduit_protocol::BINARY_TAG_OFFSET..conduit_protocol::BINARY_HEADER_LEN],
+    );
+    assert!(
+        crate::hmac::verify_hmac(&sender_key, &mac_input, &tag),
+        "the forwarded frame's tag must verify under the authenticated sender's route key"
+    );
+
     assert!(
         wait_until(2000, || {
             state.metrics.messages_routed.load(Ordering::Relaxed) >= 1
@@ -3072,6 +3148,7 @@ fn e2e_state_with_opts(opts: StateOpts) -> Arc<AppState> {
             enable_plain_ws: true,
             nonce_file,
             auth_timeout_secs: opts.auth_timeout_secs,
+            relay_cert_pin: None,
         },
     })
 }
@@ -4015,4 +4092,131 @@ fn interop_vector_for_the_dart_client() {
         value["hmac"].as_str().expect("signed"),
         "9c2018aa54f8a9fe7fa674899eee2665d891e7f34ee38077effc541132796dcb",
     );
+}
+
+// ---------------------------------------------------------------
+//  Certificate pin enforcement
+//
+//  The desktop had no pin target at all, so an operator had no way to say
+//  "serve this key and nothing else". A pin that is only displayed is not a
+//  control; these tests pin the behaviour that makes it one.
+// ---------------------------------------------------------------
+
+#[test]
+fn pins_match_ignores_formatting_a_human_would_change() {
+    // The real value from the SPKI vector fixture.
+    let pin = "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag=";
+    assert!(crate::service::pins_match(pin, pin), "identical");
+
+    // Padded, unpadded, prefixed, whitespace — all the same key.
+    assert!(crate::service::pins_match(
+        "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag=",
+        "MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag"
+    ));
+    assert!(crate::service::pins_match(
+        "  sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag=  ",
+        "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag="
+    ));
+}
+
+#[test]
+fn pins_match_rejects_a_different_key() {
+    let a = "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag=";
+    let b = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    assert!(!crate::service::pins_match(a, b));
+}
+
+#[test]
+fn a_malformed_pin_never_matches() {
+    // A typo must not be read as "no pin configured" and quietly disable the
+    // check the operator believes they have.
+    let good = "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTag=";
+    for bad in [
+        "",
+        "sha256/",
+        "sha256/not-base64!!",
+        "sha256/QUJD", // valid base64, but not a 32-byte digest
+    ] {
+        assert!(
+            !crate::service::pins_match(bad, good),
+            "{bad:?} must not match a real pin"
+        );
+    }
+    // Trailing bits that are not zero mean the input is not a clean encoding of
+    // a whole number of bytes, so it is refused rather than silently truncated.
+    assert!(!crate::service::pins_match(
+        "sha256/MEgep9/xCDDwKndPH8EBw6zfNzWG9xwwxyaJZaZBTagB",
+        good
+    ));
+}
+
+#[tokio::test]
+async fn a_configured_pin_that_does_not_match_refuses_to_start() {
+    // The point of the setting: a certificate that changed without anyone
+    // intending it must not be served, and the only way to guarantee that is to
+    // refuse rather than warn.
+    let dir = std::env::temp_dir().join(format!("conduit-pin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let overrides = Overrides {
+        relay_token: Some("t".into()),
+        wss_port: Some(0),
+        health_port: Some(0),
+        ws_port: Some(0),
+        enable_plain_ws: Some(false),
+        nonce_file: Some(dir.join("nonces.json")),
+        hmac_secret_file: Some(dir.join("secret")),
+        tls_cert_dir: Some(dir.join("certs")),
+        relay_cert_pin: Some("sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+        ..Overrides::default()
+    };
+    let config = Config::resolve(Some(overrides)).expect("config resolves");
+    let result = RelayService::from_config(config)
+        .start(Arc::new(StaticRouteKeys::new()))
+        .await;
+
+    match result {
+        Err(StartError::Config(msg)) => {
+            assert!(
+                msg.contains("does not match the configured pin"),
+                "the failure must say the pin did not match, got: {msg}"
+            );
+        }
+        _ => panic!("a pin mismatch must refuse to start"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn no_configured_pin_starts_normally() {
+    // The default must not regress into refusing to start: a host that is the
+    // relay is not authenticating a remote server.
+    let dir = std::env::temp_dir().join(format!("conduit-nopin-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let overrides = Overrides {
+        relay_token: Some("t".into()),
+        wss_port: Some(0),
+        health_port: Some(0),
+        ws_port: Some(0),
+        enable_plain_ws: Some(true),
+        nonce_file: Some(dir.join("nonces.json")),
+        hmac_secret_file: Some(dir.join("secret")),
+        tls_cert_dir: Some(dir.join("certs")),
+        ..Overrides::default()
+    };
+    let config = Config::resolve(Some(overrides)).expect("config resolves");
+    assert!(
+        config.relay_cert_pin.is_none(),
+        "no pin is configured unless one is asked for"
+    );
+
+    let handle = RelayService::from_config(config)
+        .start(Arc::new(StaticRouteKeys::new()))
+        .await
+        .expect("an unpinned relay starts");
+    handle.shutdown().await;
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -72,19 +72,17 @@ const List<String> signedFields = [
 /// with the desktop hub, and [deviceId] must be the id the hub filed it under —
 /// the relay looks the key up under exactly that id.
 List<int> deriveRouteKey(List<int> pairingSecret, String deviceId) {
-  return crypto
-      .Hmac(crypto.sha256, pairingSecret)
-      .convert(utf8.encode('$kdfPrefix$routeKeyLabel:$deviceId'))
-      .bytes;
+  return crypto.Hmac(
+    crypto.sha256,
+    pairingSecret,
+  ).convert(utf8.encode('$kdfPrefix$routeKeyLabel:$deviceId')).bytes;
 }
 
 /// Recursively sort every JSON object's keys, matching serde_json's BTreeMap.
 Object? _sorted(Object? value) {
   if (value is Map) {
     final keys = value.keys.map((k) => k as String).toList()..sort();
-    return <String, Object?>{
-      for (final key in keys) key: _sorted(value[key]),
-    };
+    return <String, Object?>{for (final key in keys) key: _sorted(value[key])};
   }
   if (value is List) {
     return value.map(_sorted).toList();
@@ -122,7 +120,10 @@ String signHex(List<int> secret, String message) {
 bool verifyMessageHmac(List<int> secret, Map<String, dynamic> message) {
   final tag = message['hmac'];
   if (tag is! String || tag.isEmpty) return false;
-  return constantTimeHexEquals(signHex(secret, canonicalSigningString(message)), tag);
+  return constantTimeHexEquals(
+    signHex(secret, canonicalSigningString(message)),
+    tag,
+  );
 }
 
 /// Compare two hex strings without leaking their contents through timing.
@@ -191,7 +192,10 @@ Map<String, dynamic> signRoute({
     'key_id': fromDeviceId,
   };
 
-  return {...unsigned, 'hmac': signHex(routeKey, canonicalSigningString(unsigned))};
+  return {
+    ...unsigned,
+    'hmac': signHex(routeKey, canonicalSigningString(unsigned)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +241,11 @@ Uint8List binaryMacInput(String fromDeviceId, List<int> headerAndPayload) {
   final input = Uint8List(idBytes.length + 1 + headerAndPayload.length)
     ..setRange(0, idBytes.length, idBytes)
     ..[idBytes.length] = binaryMacSeparator
-    ..setRange(idBytes.length + 1, idBytes.length + 1 + headerAndPayload.length, headerAndPayload);
+    ..setRange(
+      idBytes.length + 1,
+      idBytes.length + 1 + headerAndPayload.length,
+      headerAndPayload,
+    );
   return input;
 }
 
@@ -263,17 +271,26 @@ Uint8List buildBinaryFrame({
   // The 16-byte field truncates a longer id. A real device id fits, and a
   // truncated id simply will not resolve on the far side.
   final targetBytes = utf8.encode(targetDeviceId);
-  final n = targetBytes.length < binaryDeviceIdLen ? targetBytes.length : binaryDeviceIdLen;
+  final n = targetBytes.length < binaryDeviceIdLen
+      ? targetBytes.length
+      : binaryDeviceIdLen;
   frame.setRange(1, 1 + n, targetBytes.sublist(0, n));
 
   final seqBytes = ByteData(4)..setUint32(0, sequence[0], Endian.big);
-  frame.setRange(1 + binaryDeviceIdLen, 1 + binaryDeviceIdLen + binarySeqLen, seqBytes.buffer.asUint8List());
+  frame.setRange(
+    1 + binaryDeviceIdLen,
+    1 + binaryDeviceIdLen + binarySeqLen,
+    seqBytes.buffer.asUint8List(),
+  );
 
   final authenticated = Uint8List(binaryTagOffset + payload.length)
     ..setRange(0, binaryTagOffset, frame)
     ..setRange(binaryTagOffset, binaryTagOffset + payload.length, payload);
   final macInput = binaryMacInput(fromDeviceId, authenticated);
-  final tag = crypto.Hmac(crypto.sha256, routeKey).convert(utf8.encode(hexEncode(macInput))).bytes;
+  final tag = crypto.Hmac(
+    crypto.sha256,
+    routeKey,
+  ).convert(utf8.encode(hexEncode(macInput))).bytes;
   frame.setRange(binaryTagOffset, binaryTagOffset + binaryTagLen, tag);
   frame.setRange(binaryHeaderLen, binaryHeaderLen + payload.length, payload);
   return frame;
@@ -334,7 +351,9 @@ BinaryFrame parseBinaryFrame(Uint8List frame) {
   return BinaryFrame(
     targetId: targetId,
     sequence: sequence,
-    tag: Uint8List.fromList(frame.sublist(binaryTagOffset, binaryTagOffset + binaryTagLen)),
+    tag: Uint8List.fromList(
+      frame.sublist(binaryTagOffset, binaryTagOffset + binaryTagLen),
+    ),
     payload: Uint8List.fromList(frame.sublist(binaryHeaderLen)),
   );
 }
@@ -348,10 +367,15 @@ bool verifyBinaryFrame({
   final parsed = parseBinaryFrame(frame);
   final authenticated = Uint8List(binaryTagOffset + parsed.payload.length)
     ..setRange(0, binaryTagOffset, frame)
-    ..setRange(binaryTagOffset, binaryTagOffset + parsed.payload.length, parsed.payload);
-  final expected = crypto
-      .Hmac(crypto.sha256, routeKey)
-      .convert(utf8.encode(hexEncode(binaryMacInput(fromDeviceId, authenticated))))
+    ..setRange(
+      binaryTagOffset,
+      binaryTagOffset + parsed.payload.length,
+      parsed.payload,
+    );
+  final expected = crypto.Hmac(crypto.sha256, routeKey)
+      .convert(
+        utf8.encode(hexEncode(binaryMacInput(fromDeviceId, authenticated))),
+      )
       .bytes;
   return constantTimeBytesEquals(expected, parsed.tag);
 }
@@ -373,4 +397,137 @@ String hexEncode(List<int> bytes) {
     buffer.write(byte.toRadixString(16).padLeft(2, '0'));
   }
   return buffer.toString();
+}
+
+// ---------------------------------------------------------------------------
+//  Certificate pinning
+//
+//  The pin is `sha256/<base64 of sha256(SPKI-DER)>` — the standard HPKP form.
+//
+//  Hashing the whole certificate instead is a different value, and it is the
+//  defect this replaces: the relay publishes an SPKI pin (`GET /pin` reports
+//  `"algorithm": "spki-sha256"`, computed in `conduit_relay::tls`), so a client
+//  that hashed `cert.der` could never match it and rejected every connection.
+//  Hashing the SPKI is also what makes the pin survive certificate renewal,
+//  which is the point of pinning a key rather than a leaf.
+// ---------------------------------------------------------------------------
+
+/// DER tag for a SEQUENCE, constructed.
+const int _derTagSequence = 0x30;
+
+/// Extract the SubjectPublicKeyInfo (SPKI) from a DER-encoded X.509 certificate.
+///
+/// Walks `Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+/// signatureValue }` and returns the DER bytes of
+/// `tbsCertificate.subjectPublicKeyInfo`, which is the single structure a
+/// public-key pin is defined over.
+///
+/// Minimal on purpose: the only field whose position matters is the SPKI, and
+/// a certificate is a fixed shape. Throws [FormatException] for anything that
+/// is not a well-formed certificate, so a malformed input fails the connection
+/// rather than producing a pin over the wrong bytes.
+Uint8List extractSpkiDer(Uint8List certificateDer) {
+  final cert = _readTlv(certificateDer, 0);
+  if (cert == null || cert.tag != _derTagSequence) {
+    throw const FormatException('certificate is not a DER SEQUENCE');
+  }
+
+  // tbsCertificate, then two more top-level fields we only need to skip past.
+  final tbs = _readTlv(certificateDer, cert.contentStart);
+  if (tbs == null || tbs.tag != _derTagSequence) {
+    throw const FormatException('tbsCertificate is not a DER SEQUENCE');
+  }
+  final sigAlg = _readTlv(certificateDer, tbs.end);
+  final sigValue = _readTlv(certificateDer, sigAlg?.end ?? tbs.end);
+  if (sigAlg == null || sigValue == null) {
+    throw const FormatException('certificate is missing its signature fields');
+  }
+
+  // TBSCertificate ::= SEQUENCE {
+  //   version [0] EXPLICIT Version DEFAULT v1,
+  //   serialNumber, signature, issuer, validity, subject,
+  //   subjectPublicKeyInfo, ... }
+  var pos = tbs.contentStart;
+
+  // The optional [0] EXPLICIT version tag. Its presence is the only thing that
+  // distinguishes v3 (which every modern certificate is) from v1, and it must
+  // be skipped before serialNumber or every field after it is read wrong.
+  if (pos < tbs.end && certificateDer[pos] == 0xA0) {
+    final version = _readTlv(certificateDer, pos);
+    if (version == null) return _badTbs();
+    pos = version.end;
+  }
+
+  // The remaining five elements before the SPKI: serialNumber, signature,
+  // issuer, validity, subject. The optional version was consumed above, so
+  // this loop accounts for the other five of the six.
+  //
+  // Getting this count wrong is the subtle failure: `subject` is also a
+  // SEQUENCE, so stopping one field early parses "successfully" and yields a
+  // stable pin over the wrong bytes. `extractSpkiDer` is pinned against openssl
+  // and the Rust relay in `relay_route_test.dart`.
+  for (var i = 0; i < 5; i++) {
+    final field = _readTlv(certificateDer, pos);
+    if (field == null) return _badTbs();
+    pos = field.end;
+  }
+
+  final spki = _readTlv(certificateDer, pos);
+  if (spki == null || spki.tag != _derTagSequence) {
+    throw const FormatException('subjectPublicKeyInfo is not a DER SEQUENCE');
+  }
+  return Uint8List.sublistView(certificateDer, spki.start, spki.end);
+}
+
+Never _badTbs() => throw const FormatException('malformed tbsCertificate');
+
+/// A parsed DER tag-length-value triple.
+class _Tlv {
+  const _Tlv(this.tag, this.start, this.contentStart, this.end);
+  final int tag;
+  final int start;
+  final int contentStart;
+  final int end;
+}
+
+/// Read one TLV at [offset], or `null` if the encoding is truncated or invalid.
+_Tlv? _readTlv(Uint8List der, int offset) {
+  if (offset + 2 > der.length) return null;
+  final tag = der[offset];
+
+  var lengthByte = der[offset + 1];
+  var headerLen = 2;
+
+  // 0x80 is indefinite length, which DER forbids.
+  if (lengthByte == 0x80) return null;
+
+  if (lengthByte & 0x80 != 0) {
+    // Long form: the low 7 bits are the count of length bytes.
+    final lengthBytes = lengthByte & 0x7F;
+    // A length that needs more than 4 bytes cannot describe this input.
+    if (lengthBytes == 0 || lengthBytes > 4) return null;
+    if (offset + 2 + lengthBytes > der.length) return null;
+
+    var length = 0;
+    for (var i = 0; i < lengthBytes; i++) {
+      length = (length << 8) | der[offset + 2 + i];
+    }
+    headerLen = 2 + lengthBytes;
+    final end = offset + headerLen + length;
+    if (end > der.length) return null;
+    return _Tlv(tag, offset, offset + headerLen, end);
+  }
+
+  final end = offset + headerLen + lengthByte;
+  if (end > der.length) return null;
+  return _Tlv(tag, offset, offset + headerLen, end);
+}
+
+/// The certificate pin for [certificateDer], as `sha256/<base64>`.
+///
+/// The base64 is unpadded, matching `conduit_relay::tls::spki_sha256_pin`, so
+/// the value can be compared to whatever `/pin` publishes or an operator typed.
+String computeSpkiPin(Uint8List certificateDer) {
+  final spki = extractSpkiDer(certificateDer);
+  return 'sha256/${base64.encode(crypto.sha256.convert(spki).bytes)}';
 }

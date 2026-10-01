@@ -477,6 +477,11 @@ fn build_config(
         // the OS chose and that is frequently not writable at all.
         hmac_secret_file: Some(app_data_dir().join("relay-hmac-secret")),
         tls_hostname: Some(settings.relay_hostname.clone()),
+        // Empty by default, which enforces nothing: this app hosts the relay,
+        // so it is not authenticating a remote server and has no pin to check.
+        // Set it to pin a certificate the operator is standing behind, and a
+        // mismatch stops the relay instead of being logged and ignored.
+        relay_cert_pin: Some(settings.relay_cert_pin.clone()),
         ..Overrides::default()
     };
     Config::resolve(Some(overrides))

@@ -103,17 +103,29 @@ pub async fn has_identity(ctx: &WsContext, client_id: &str) -> bool {
 /// no-secret case — but it means an entry on its own is never sufficient, so a
 /// half-finished pairing (or a device whose `ConnectedClient` was already
 /// reaped) is treated as untrusted instead of trusted.
+///
+/// A relayed message arrives already attributed to a device that has no socket
+/// here, so `client_id` is a **device id** and there is no registry entry for
+/// it. That case is resolved against the device registry directly: the relay
+/// authenticated the sender during `relay_auth` and re-checked the route
+/// signature against that same id, so the device row plus its derived secret is
+/// the authority, and the absence of a LAN socket is not evidence of anything.
 pub async fn is_trusted_peer(ctx: &WsContext, client_id: &str) -> bool {
-    let stable_id = match paired_device_id(ctx, client_id).await {
-        Some(id) => id,
-        None => return false,
+    let engine = ctx.sync_engine.read().await;
+
+    // A relayed sender: trusted iff it is a paired device with a derived secret.
+    // Tried first because a LAN connection id is never also a device id.
+    if let Some(client) = engine.get_client(client_id) {
+        return !client.shared_secret.is_empty();
+    }
+
+    let Some(stable_id) = paired_device_id(ctx, client_id).await else {
+        return false;
     };
     if stable_id == LOCAL_DESKTOP_ID {
         return true;
     }
-    ctx.sync_engine
-        .read()
-        .await
+    engine
         .get_client(&stable_id)
         .is_some_and(|c| !c.shared_secret.is_empty())
 }

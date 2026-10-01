@@ -1111,6 +1111,66 @@ pub struct RelayRoute {
     pub hmac: Option<String>,
 }
 
+/// `type: "relay_delivery"`
+///
+/// What the relay sends to the recipient once it has verified a `relay_route`.
+///
+/// # Why this exists
+///
+/// The relay used to forward `route.payload` on its own, which threw away the
+/// one piece of information it had just authenticated: *who* the sender was. It
+/// checks `from_device_id` against the identity the connection presented during
+/// `relay_auth` and refuses any mismatch, so by the time it forwards anything it
+/// knows the sender with certainty. Forwarding the bare payload threw that away,
+/// and the consequence was not theoretical:
+///
+///   * the receiver had no way to authenticate the sender, so a message that
+///     arrived over the relay could not be told apart from one that arrived over
+///     the LAN; and
+///   * receivers that require their own pairing registry to authorise a message
+///     had no identity to check, so the message was refused outright.
+///
+/// This type is the envelope that carries the verified attribution across. It is
+/// produced **only** by the relay, after verification, and it is not signed: the
+/// trust is the relay's, and a client cannot produce one that says anything the
+/// relay did not verify. `from_device_id` is the identity the relay authenticated
+/// on the sending connection, not a claim the sender chose.
+///
+/// The recipient still authenticates the *content* end to end through the inner
+/// `encrypted` envelope, exactly as it does on the LAN. This type adds
+/// attribution, not confidentiality, and it does not let an unpaired device send.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelayDelivery {
+    #[serde(rename = "type")]
+    pub msg_type: String, // "relay_delivery"
+    /// The device the relay authenticated as the sender.
+    pub from_device_id: String,
+    /// The device this delivery is addressed to. Carried so a recipient can
+    /// reject a message the relay misrouted before parsing the payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_device_id: Option<String>,
+    /// The forwarded message, verbatim. Normally an `encrypted` envelope.
+    pub payload: serde_json::Value,
+}
+
+impl RelayDelivery {
+    /// Wrap `payload` as having been sent by `from_device_id`.
+    ///
+    /// Called by the relay only, after `handle_relay_route` has returned `Ok`.
+    pub fn new(
+        from_device_id: impl Into<String>,
+        to_device_id: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            msg_type: "relay_delivery".into(),
+            from_device_id: from_device_id.into(),
+            to_device_id: Some(to_device_id.into()),
+            payload,
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 //  Encrypted Envelope
 // ───────────────────────────────────────────────────────────────────────────
@@ -1318,6 +1378,66 @@ pub const BINARY_TAG_OFFSET: usize = 1 + BINARY_DEVICE_ID_LEN + BINARY_SEQ_LEN; 
 pub const BINARY_AUTHENTICATED_PREFIX_LEN: usize = BINARY_TAG_OFFSET; // 21
 /// Total fixed header: version + target id + sequence + tag.
 pub const BINARY_HEADER_LEN: usize = BINARY_TAG_OFFSET + BINARY_TAG_LEN; // 53
+
+/// Build a v2 binary frame addressed to `target_device_id` and tagged for
+/// `from_device_id`.
+///
+/// The single place a v2 frame is *produced*, so the sender id, the header and
+/// the tag cannot drift apart. The mobile client has a byte-compatible
+/// implementation in `relay_route.dart`; `conduit-protocol`'s tests pin the two
+/// against a shared vector.
+///
+/// `sequence` is the per-connection frame counter and must strictly increase.
+pub fn build_binary_frame(
+    route_key: &[u8],
+    from_device_id: &str,
+    target_device_id: &str,
+    sequence: u32,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = vec![0u8; BINARY_HEADER_LEN + payload.len()];
+    frame[0] = BINARY_FRAME_VERSION;
+
+    // A 16-byte field cannot hold an arbitrarily long id. Truncation is safe
+    // here: the far side either matches on the full id or drops the frame, and
+    // the tag still covers the bytes actually sent.
+    let target = target_device_id.as_bytes();
+    let n = target.len().min(BINARY_DEVICE_ID_LEN);
+    frame[1..1 + n].copy_from_slice(&target[..n]);
+    frame[1 + BINARY_DEVICE_ID_LEN..1 + BINARY_DEVICE_ID_LEN + BINARY_SEQ_LEN]
+        .copy_from_slice(&sequence.to_be_bytes());
+
+    // MAC input: sender id, 0x1F, then the header and payload as they will be
+    // transmitted. Computed over the *hex encoding* of those bytes, which is
+    // what both implementations do and is pinned by the interop vector.
+    let authenticated_len = BINARY_AUTHENTICATED_PREFIX_LEN + payload.len();
+    let mut authenticated = Vec::with_capacity(authenticated_len);
+    authenticated.extend_from_slice(&frame[..BINARY_AUTHENTICATED_PREFIX_LEN]);
+    authenticated.extend_from_slice(payload);
+
+    let mut mac_input = Vec::with_capacity(from_device_id.len() + 1 + authenticated_len);
+    mac_input.extend_from_slice(from_device_id.as_bytes());
+    mac_input.push(0x1f);
+    mac_input.extend_from_slice(&authenticated);
+
+    let tag = crate::hmac::compute_hmac(route_key, &hex::encode(&mac_input));
+    let tag_bytes = hex::decode(&tag).expect("compute_hmac returns lowercase hex");
+    frame[BINARY_TAG_OFFSET..BINARY_HEADER_LEN].copy_from_slice(&tag_bytes);
+    frame[BINARY_HEADER_LEN..].copy_from_slice(payload);
+    frame
+}
+
+/// The byte string a v2 frame's tag is computed over.
+///
+/// `from_device_id || 0x1F || frame[..21] || payload`. Exposed because the relay
+/// verifies the tag itself and must build the identical input.
+pub fn binary_mac_input(from_device_id: &str, header_and_payload: &[u8]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(from_device_id.len() + 1 + header_and_payload.len());
+    input.extend_from_slice(from_device_id.as_bytes());
+    input.push(0x1f);
+    input.extend_from_slice(header_and_payload);
+    input
+}
 
 /// LAN direct-connection binary chunk format (version 0x01 implied, no header).
 ///
@@ -4979,6 +5099,15 @@ mod tests {
                 "Relay Route",
                 json!({
                     "type": "relay_route",
+                    "to_device_id": "d2",
+                    "payload": {"type": "ping"}
+                }),
+            ),
+            (
+                "Relay Delivery",
+                json!({
+                    "type": "relay_delivery",
+                    "from_device_id": "d1",
                     "to_device_id": "d2",
                     "payload": {"type": "ping"}
                 }),

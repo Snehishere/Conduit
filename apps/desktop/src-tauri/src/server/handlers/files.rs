@@ -5,6 +5,86 @@ use conduit_protocol::types::*;
 
 use super::{WsContext, broadcast_to_others};
 
+/// Unwrap a relayed v2 binary frame into `(sender, payload)`.
+///
+/// The relay has already verified the frame and re-stamped the tag for the
+/// sender it authenticated, so the recipient re-verifies against that sender's
+/// own route key. That is the check that makes the attribution real rather than
+/// asserted: a frame naming any other sender cannot verify, because the tag was
+/// computed with the sender's id inside the MAC input.
+///
+/// Returns `Err` with a human-readable reason so the caller can log why.
+async fn unwrap_relay_binary_frame(
+    bytes: &[u8],
+    ctx: &WsContext,
+) -> Result<(String, Vec<u8>), String> {
+    if bytes.len() < BINARY_HEADER_LEN {
+        return Err(format!(
+            "frame is {} bytes; v2 requires at least {BINARY_HEADER_LEN}",
+            bytes.len()
+        ));
+    }
+
+    let target_end = 1 + BINARY_DEVICE_ID_LEN;
+    let target_id = std::str::from_utf8(&bytes[1..target_end])
+        .map_err(|_| "target device id is not valid UTF-8".to_string())?
+        .trim_end_matches('\0')
+        .to_string();
+    if target_id.is_empty() {
+        return Err("target device id is empty".to_string());
+    }
+
+    // The relay routes only to the named recipient, so a frame naming anyone
+    // else means the routing table and the wire disagree.
+    let local = ctx.device_id.as_str();
+    if target_id != local {
+        return Err(format!("addressed to {target_id}, not this desktop"));
+    }
+
+    // The relay re-stamps the tag with the authenticated sender, but the frame
+    // itself does not carry that id — it is the *sender's* id that went into the
+    // MAC input, and the recipient cannot read it out of the header. So the
+    // candidate senders are the devices this desktop shares a secret with, and
+    // the one whose route key verifies the tag is the sender.
+    //
+    // Trying candidates is safe precisely because the sender id is inside the MAC
+    // input: a frame from `dev_b` cannot verify under `dev_a`'s key.
+    let candidates: Vec<String> = {
+        let engine = ctx.sync_engine.read().await;
+        engine
+            .get_all_client_ids()
+            .into_iter()
+            .filter(|id| {
+                engine
+                    .get_client(id)
+                    .is_some_and(|c| !c.shared_secret.is_empty())
+            })
+            .collect()
+    };
+    if candidates.is_empty() {
+        return Err("no paired device to attribute this frame to".to_string());
+    }
+
+    let payload = &bytes[BINARY_HEADER_LEN..];
+    let mut authenticated = Vec::with_capacity(BINARY_AUTHENTICATED_PREFIX_LEN + payload.len());
+    authenticated.extend_from_slice(&bytes[..BINARY_AUTHENTICATED_PREFIX_LEN]);
+    authenticated.extend_from_slice(payload);
+    let actual = hex::encode(&bytes[BINARY_TAG_OFFSET..BINARY_HEADER_LEN]);
+
+    for sender in candidates {
+        let Some(route_key) = ctx.route_keys.signing_key(&sender) else {
+            continue;
+        };
+        let key_hex = hex::encode(&route_key);
+        let mac_input = hex::encode(conduit_protocol::binary_mac_input(&sender, &authenticated));
+        if ctx.encryption.verify_hmac(&key_hex, &mac_input, &actual) {
+            return Ok((sender, payload.to_vec()));
+        }
+    }
+
+    Err("tag did not verify under any paired device's route key".to_string())
+}
+
 /// Enforce `auto_accept_files` on an inbound file request.
 ///
 /// The desktop hub is a potential *receiver* as well as a relay, so a paired
@@ -75,7 +155,36 @@ pub async fn handle_file_request(msg: Value, client_id: &str, ctx: &WsContext) {
     }
 }
 
+/// Handle an inbound binary frame, from either a LAN socket or the relay.
+///
+/// The relay connection carries v2 relay frames, which are a *different* format
+/// from the LAN chunk envelope below. They are unwrapped here, at the one place
+/// binary bytes enter, and the resulting payload is re-entered as the LAN chunk
+/// it always was. Without this the relay's own frame format was parsed as a
+/// chunk header and every relayed file transfer failed to decode.
 pub async fn handle_binary_message(bytes: Vec<u8>, client_id: &str, ctx: &WsContext) {
+    // A relayed frame is v2, not a chunk envelope. Unwrap and re-enter as the
+    // authenticated sender so the rest of this function sees what a LAN socket
+    // would have delivered. Not recursive: one unwrap, then the LAN path.
+    if client_id == crate::server::WsServer::RELAY_CLIENT_ID
+        && bytes.first() == Some(&BINARY_FRAME_VERSION)
+    {
+        match unwrap_relay_binary_frame(&bytes, ctx).await {
+            Ok((sender, payload)) => {
+                return handle_lan_chunk(payload, &sender, ctx).await;
+            }
+            Err(reason) => {
+                warn!("Refusing a relayed binary frame: {reason}");
+                return;
+            }
+        }
+    }
+
+    handle_lan_chunk(bytes, client_id, ctx).await
+}
+
+/// A LAN chunk envelope: nonce, metadata, ciphertext.
+async fn handle_lan_chunk(bytes: Vec<u8>, client_id: &str, ctx: &WsContext) {
     let stable_id = ctx
         .ws_to_device_id
         .read()

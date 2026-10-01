@@ -1045,6 +1045,7 @@ impl Storage {
                 .parse()
                 .unwrap_or(crate::relay::DEFAULT_RELAY_HEALTH_PORT),
                 relay_hostname: Self::setting_or_default(&conn, "relay_hostname", "")?,
+                relay_cert_pin: Self::setting_or_default(&conn, "relay_cert_pin", "")?,
             })
         })
     }
@@ -1174,6 +1175,7 @@ impl Storage {
             ("relay_port", settings.relay_port.to_string()),
             ("relay_health_port", settings.relay_health_port.to_string()),
             ("relay_hostname", settings.relay_hostname.clone()),
+            ("relay_cert_pin", settings.relay_cert_pin.clone()),
         ];
 
         tokio::task::block_in_place(|| {
@@ -2382,6 +2384,7 @@ mod tests {
             relay_port: crate::relay::DEFAULT_RELAY_PORT,
             relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
             relay_hostname: String::new(),
+            relay_cert_pin: String::new(),
         };
         storage.save_settings(&settings).await.unwrap();
 
@@ -2474,6 +2477,7 @@ mod tests {
             relay_port: crate::relay::DEFAULT_RELAY_PORT,
             relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
             relay_hostname: String::new(),
+            relay_cert_pin: String::new(),
         };
         storage.save_settings(&s1).await.unwrap();
 

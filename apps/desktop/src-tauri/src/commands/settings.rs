@@ -90,6 +90,22 @@ pub struct ConduitSettings {
     /// for a tunnel that terminates elsewhere and wrong for a published port.
     #[serde(default)]
     pub relay_hostname: String,
+    /// The SPKI pin the relay's served certificate must present, as
+    /// `sha256/<base64>`.
+    ///
+    /// Empty — the default — means "no pin configured", and the relay starts
+    /// normally: it is hosting the connection, so it is not authenticating a
+    /// remote server and has nothing to verify. This setting exists for the case
+    /// that *does* need it, which is a desktop connecting to a relay it does not
+    /// host (an operator's own, behind a tunnel).
+    ///
+    /// When set, the pin is compared against the certificate the relay actually
+    /// loaded and a mismatch stops the relay from starting, rather than
+    /// warning. That is the point: a certificate change is either an intended
+    /// renewal — in which case the operator updates this — or it is not, and the
+    /// only way to tell the two apart is to fail.
+    #[serde(default)]
+    pub relay_cert_pin: String,
 }
 
 fn default_theme() -> String {
@@ -180,6 +196,7 @@ impl Default for ConduitSettings {
             relay_port: default_relay_port(),
             relay_health_port: default_relay_health_port(),
             relay_hostname: String::new(),
+            relay_cert_pin: String::new(),
         }
     }
 }
@@ -384,6 +401,7 @@ mod tests {
             relay_port: crate::relay::DEFAULT_RELAY_PORT,
             relay_health_port: crate::relay::DEFAULT_RELAY_HEALTH_PORT,
             relay_hostname: String::new(),
+            relay_cert_pin: String::new(),
         }
     }
 
@@ -456,6 +474,7 @@ mod tests {
         "relay_port",
         "relay_health_port",
         "relay_hostname",
+        "relay_cert_pin",
     ];
 
     /// Serialised key set of `ConduitSettings`, sorted, as owned strings.
