@@ -25,14 +25,14 @@ common source of "command not found" / "no such package" in this project.
 ```bash
 # repository root
 cargo test -p conduit-protocol     # 275 passed, 0 failed
-cargo test -p conduit-relay        # 193 passed, 0 failed, plus 2 doctests
+cargo test -p conduit-relay        # 197 passed, 0 failed, plus 2 doctests
 cargo test -p conduit              # 729 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
 | `packages/protocol` | `conduit-protocol` | repository root | 275 passed, 0 failed |
-| `services/relay` | `conduit-relay` | repository root | 193 passed, 0 failed |
+| `services/relay` | `conduit-relay` | repository root | 197 passed, 0 failed |
 | `apps/desktop/src-tauri` | `conduit` | repository root | 729 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
@@ -146,7 +146,7 @@ example advertises `"wss_port": 9531`, and that
 `kLanWssPort = 9531` / `kLanWsPort = 9527` and hard-codes neither number in any
 call site.
 
-### `conduit-relay` — 193 tests, plus 2 doctests
+### `conduit-relay` — 197 tests, plus 2 doctests
 
 The crate is a library with no `src/main.rs` and no `[[bin]]`. Its tests live in
 two places: `src/suite.rs` is the whole in-crate suite, and `src/tls.rs` keeps
@@ -156,7 +156,7 @@ its own `mod tests` beside the code it exercises. The other modules
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/suite.rs` | 157 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; and an end-to-end WebSocket lifecycle against a real listener |
+| `src/suite.rs` | 161 | Auth and the `relay_auth` handshake; the auth timeout; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; the text and binary frame size ceilings at both the read and the application layer; the outbound queue's per-connection byte budget; and an end-to-end WebSocket lifecycle against a real listener |
 | `src/tls.rs` | 36 | Self-signed certificate generation and SAN handling; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening; SPKI extraction cross-checked against `openssl` |
 
 One of the 36 `#[test]` functions in `tls.rs` is `#[cfg(unix)]`, so a Windows run

@@ -15,8 +15,9 @@ use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::accept_async_with_config;
 use tungstenite::Message;
+use tungstenite::protocol::WebSocketConfig;
 
 use std::net::SocketAddr;
 
@@ -24,12 +25,12 @@ use std::net::SocketAddr;
 /// close on their own before they are aborted.
 pub(crate) const DRAIN_TIMEOUT_SECS: u64 = 5;
 
-use super::limits::{MAX_TEXT_SIZE, MessageRateLimiter};
+use super::limits::{MAX_BINARY_SIZE, MAX_TEXT_SIZE, MessageRateLimiter, QUEUE_DEPTH};
 use super::route::{
     NOT_WRAPPED_MSG, RejectionKind, forward_binary, forward_text, handle_binary_frame,
     handle_relay_route, validate_device_id,
 };
-use super::state::AppState;
+use super::state::{AppState, Queue};
 
 pub(crate) async fn drain_connections(connections: &mut tokio::task::JoinSet<()>, label: &str) {
     if connections.is_empty() {
@@ -69,7 +70,18 @@ pub(crate) async fn handle_connection<S>(
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let mut ws_stream = match accept_async(stream).await {
+    // No size limit was ever configured here: `accept_async` uses tungstenite's
+    // default `WebSocketConfig`, which caps a message at 64 MiB and a frame at
+    // 16 MiB. That was the *only* bound on binary frames, and it is a bound an
+    // attacker chooses to approach, so it is set to the same ceiling the Text
+    // arms enforce. It is applied at read time, which matters: by the time the
+    // application can reject a frame the bytes are already allocated.
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_TEXT_SIZE),
+        max_frame_size: Some(MAX_BINARY_SIZE),
+        ..Default::default()
+    };
+    let mut ws_stream = match accept_async_with_config(stream, Some(ws_config)).await {
         Ok(ws) => ws,
         Err(e) => {
             error!("WebSocket handshake error from {}", peer);
@@ -90,7 +102,10 @@ pub(crate) async fn handle_connection<S>(
     }
 
     let (mut write, mut read) = ws_stream.split();
-    let (tx, mut rx) = mpsc::channel(1024);
+    let (tx, mut rx) = mpsc::channel(QUEUE_DEPTH);
+    // Every producer below goes through this, not through `tx`: the budget is
+    // only correct if nothing can enqueue without reserving.
+    let queue = Queue::new(tx);
 
     let mut device_id: Option<String> = None;
     let mut msg_limiter = MessageRateLimiter::new();
@@ -105,19 +120,92 @@ pub(crate) async fn handle_connection<S>(
             warn!("Message rate limit exceeded during auth from {}", peer);
             continue;
         }
-        if let Message::Text(text) = msg {
-            if text.len() > MAX_TEXT_SIZE {
-                warn!("Auth message too large from {}", peer);
-                return;
-            }
-            if let Ok(json) = serde_json::from_str::<Value>(&text)
-                && json.get("type").and_then(|v| v.as_str()) == Some("relay_auth")
-            {
-                // Primary path: fully-typed relay_auth via conduit-protocol.
-                match serde_json::from_value::<RelayAuth>(json.clone()) {
-                    Ok(auth) => {
+        // Checked for both variants, not just Text. The binary arm used to be
+        // unbounded: `handle_binary_frame` was handed whatever the socket
+        // produced, and the only cap in the whole path was tungstenite's 64 MiB
+        // default. Rejecting here closes the connection the same way an
+        // over-size Text frame always has.
+        if matches!(&msg, Message::Text(t) if t.len() > MAX_TEXT_SIZE)
+            || matches!(&msg, Message::Binary(b) if b.len() > MAX_BINARY_SIZE)
+        {
+            warn!("Auth message too large from {}", peer);
+            return;
+        }
+        if let Message::Text(text) = msg
+            && let Ok(json) = serde_json::from_str::<Value>(&text)
+            && json.get("type").and_then(|v| v.as_str()) == Some("relay_auth")
+        {
+            // Primary path: fully-typed relay_auth via conduit-protocol.
+            match serde_json::from_value::<RelayAuth>(json.clone()) {
+                Ok(auth) => {
+                    let expected_bytes = state.config.relay_token.as_bytes();
+                    let provided_bytes = auth.relay_token.as_bytes();
+                    if expected_bytes.len() != provided_bytes.len()
+                        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+                            expected_bytes,
+                            provided_bytes,
+                        ))
+                    {
+                        warn!("Invalid relay token from {}", peer);
+                        state
+                            .metrics
+                            .auth_attempts_failure
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = write
+                            .send(Message::Text(
+                                serde_json::to_string(&RelayAuthRejected::invalid_token())
+                                    .unwrap_or_default(),
+                            ))
+                            .await;
+                        return;
+                    }
+                    device_id = Some(auth.device_id.clone());
+                    if let Err(reason) = validate_device_id(&auth.device_id) {
+                        warn!("Rejected device_id from {}: {}", peer, reason);
+                        state
+                            .metrics
+                            .auth_attempts_failure
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = write.send(error_frame("invalid_device_id", reason)).await;
+                        return;
+                    }
+                    state
+                        .clients
+                        .write()
+                        .await
+                        .insert(auth.device_id.clone(), queue.clone());
+                    state
+                        .metrics
+                        .auth_attempts_success
+                        .fetch_add(1, Ordering::Relaxed);
+                    info!("Device authenticated: {} from {}", auth.device_id, peer);
+                    let _ = write
+                        .send(Message::Text(
+                            serde_json::to_string(&RelayAuthOk::new()).unwrap_or_default(),
+                        ))
+                        .await;
+                    break;
+                }
+                // Value fallback: preserve original partial-message behavior
+                // (missing device_id keeps waiting; missing token rejects).
+                Err(_) => match json.get("relay_token").and_then(|v| v.as_str()) {
+                    None => {
+                        warn!("Missing relay token from {}", peer);
+                        state
+                            .metrics
+                            .auth_attempts_failure
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = write
+                            .send(Message::Text(
+                                serde_json::to_string(&RelayAuthRejected::missing_token())
+                                    .unwrap_or_default(),
+                            ))
+                            .await;
+                        return;
+                    }
+                    Some(provided) => {
                         let expected_bytes = state.config.relay_token.as_bytes();
-                        let provided_bytes = auth.relay_token.as_bytes();
+                        let provided_bytes = provided.as_bytes();
                         if expected_bytes.len() != provided_bytes.len()
                             || !bool::from(subtle::ConstantTimeEq::ct_eq(
                                 expected_bytes,
@@ -137,106 +225,37 @@ pub(crate) async fn handle_connection<S>(
                                 .await;
                             return;
                         }
-                        device_id = Some(auth.device_id.clone());
-                        if let Err(reason) = validate_device_id(&auth.device_id) {
-                            warn!("Rejected device_id from {}: {}", peer, reason);
-                            state
-                                .metrics
-                                .auth_attempts_failure
-                                .fetch_add(1, Ordering::Relaxed);
-                            let _ = write.send(error_frame("invalid_device_id", reason)).await;
-                            return;
-                        }
-                        state
-                            .clients
-                            .write()
-                            .await
-                            .insert(auth.device_id.clone(), tx.clone());
-                        state
-                            .metrics
-                            .auth_attempts_success
-                            .fetch_add(1, Ordering::Relaxed);
-                        info!("Device authenticated: {} from {}", auth.device_id, peer);
-                        let _ = write
-                            .send(Message::Text(
-                                serde_json::to_string(&RelayAuthOk::new()).unwrap_or_default(),
-                            ))
-                            .await;
-                        break;
-                    }
-                    // Value fallback: preserve original partial-message behavior
-                    // (missing device_id keeps waiting; missing token rejects).
-                    Err(_) => match json.get("relay_token").and_then(|v| v.as_str()) {
-                        None => {
-                            warn!("Missing relay token from {}", peer);
-                            state
-                                .metrics
-                                .auth_attempts_failure
-                                .fetch_add(1, Ordering::Relaxed);
-                            let _ = write
-                                .send(Message::Text(
-                                    serde_json::to_string(&RelayAuthRejected::missing_token())
-                                        .unwrap_or_default(),
-                                ))
-                                .await;
-                            return;
-                        }
-                        Some(provided) => {
-                            let expected_bytes = state.config.relay_token.as_bytes();
-                            let provided_bytes = provided.as_bytes();
-                            if expected_bytes.len() != provided_bytes.len()
-                                || !bool::from(subtle::ConstantTimeEq::ct_eq(
-                                    expected_bytes,
-                                    provided_bytes,
-                                ))
-                            {
-                                warn!("Invalid relay token from {}", peer);
+                        if let Some(id) = json.get("device_id").and_then(|v| v.as_str()) {
+                            if let Err(reason) = validate_device_id(id) {
+                                warn!("Rejected device_id from {}: {}", peer, reason);
                                 state
                                     .metrics
                                     .auth_attempts_failure
                                     .fetch_add(1, Ordering::Relaxed);
-                                let _ = write
-                                    .send(Message::Text(
-                                        serde_json::to_string(&RelayAuthRejected::invalid_token())
-                                            .unwrap_or_default(),
-                                    ))
-                                    .await;
+                                let _ = write.send(error_frame("invalid_device_id", reason)).await;
                                 return;
                             }
-                            if let Some(id) = json.get("device_id").and_then(|v| v.as_str()) {
-                                if let Err(reason) = validate_device_id(id) {
-                                    warn!("Rejected device_id from {}: {}", peer, reason);
-                                    state
-                                        .metrics
-                                        .auth_attempts_failure
-                                        .fetch_add(1, Ordering::Relaxed);
-                                    let _ =
-                                        write.send(error_frame("invalid_device_id", reason)).await;
-                                    return;
-                                }
-                                device_id = Some(id.to_string());
-                                state
-                                    .clients
-                                    .write()
-                                    .await
-                                    .insert(id.to_string(), tx.clone());
-                                state
-                                    .metrics
-                                    .auth_attempts_success
-                                    .fetch_add(1, Ordering::Relaxed);
-                                info!("Device authenticated: {} from {}", id, peer);
-                                let _ = write
-                                    .send(Message::Text(
-                                        serde_json::to_string(&RelayAuthOk::new())
-                                            .unwrap_or_default(),
-                                    ))
-                                    .await;
-                                break;
-                            }
-                            // Token OK but no device_id — keep waiting.
+                            device_id = Some(id.to_string());
+                            state
+                                .clients
+                                .write()
+                                .await
+                                .insert(id.to_string(), queue.clone());
+                            state
+                                .metrics
+                                .auth_attempts_success
+                                .fetch_add(1, Ordering::Relaxed);
+                            info!("Device authenticated: {} from {}", id, peer);
+                            let _ = write
+                                .send(Message::Text(
+                                    serde_json::to_string(&RelayAuthOk::new()).unwrap_or_default(),
+                                ))
+                                .await;
+                            break;
                         }
-                    },
-                }
+                        // Token OK but no device_id — keep waiting.
+                    }
+                },
             }
         }
     }
@@ -269,6 +288,7 @@ pub(crate) async fn handle_connection<S>(
 
     let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(25));
 
+    let broadcast_queue = queue.clone();
     let broadcast_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -286,6 +306,12 @@ pub(crate) async fn handle_connection<S>(
                 msg_opt = rx.recv() => {
                     match msg_opt {
                         Some(msg) => {
+                            // The message has left the queue, so its bytes go
+                            // back now — not after the socket write, which may
+                            // fail and drop the whole connection. Producers
+                            // reserved exactly this much in `Queue::send`, so
+                            // this is where the accounting closes.
+                            broadcast_queue.release(msg.len());
                             if write.send(msg).await.is_err() {
                                 break;
                             }
@@ -338,7 +364,7 @@ pub(crate) async fn handle_connection<S>(
                                     .metrics
                                     .messages_dropped_unknown_type
                                     .fetch_add(1, Ordering::Relaxed);
-                                let _ = tx
+                                let _ = queue
                                     .send(error_frame(
                                         "malformed_json",
                                         "message was not valid JSON",
@@ -401,7 +427,7 @@ pub(crate) async fn handle_connection<S>(
                                                     .fetch_add(1, Ordering::Relaxed);
                                             }
                                         }
-                                        let _ = tx
+                                        let _ = queue
                                             .send(error_frame(rejection.code, rejection.reason))
                                             .await;
                                     }
@@ -412,7 +438,7 @@ pub(crate) async fn handle_connection<S>(
                             // 25 s and PROTOCOL.md specifies a 25 s ping/pong
                             // keep-alive in both directions.
                             "ping" => {
-                                let _ = tx
+                                let _ = queue
                                     .send(Message::Text(
                                         serde_json::to_string(&Pong::new()).unwrap_or_default(),
                                     ))
@@ -434,7 +460,7 @@ pub(crate) async fn handle_connection<S>(
                                     .metrics
                                     .messages_dropped_unknown_type
                                     .fetch_add(1, Ordering::Relaxed);
-                                let _ = tx
+                                let _ = queue
                                     .send(error_frame(
                                         "not_wrapped_in_relay_route",
                                         NOT_WRAPPED_MSG,
@@ -450,7 +476,7 @@ pub(crate) async fn handle_connection<S>(
                                     .metrics
                                     .messages_dropped_unknown_type
                                     .fetch_add(1, Ordering::Relaxed);
-                                let _ = tx
+                                let _ = queue
                                     .send(error_frame(
                                         "unknown_message_type",
                                         format!(
@@ -463,6 +489,16 @@ pub(crate) async fn handle_connection<S>(
                         }
                     }
                     Message::Binary(bytes) => {
+                        // Mirrors the Text arm above, which is the check this
+                        // path never had.
+                        if bytes.len() > MAX_BINARY_SIZE {
+                            warn!(
+                                "Binary message too large ({} bytes) from {}",
+                                bytes.len(),
+                                my_id
+                            );
+                            break;
+                        }
                         state.metrics.observe_message_size(bytes.len());
                         match handle_binary_frame(
                             &state,
@@ -536,8 +572,9 @@ pub(crate) async fn handle_connection<S>(
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }
-                                let _ =
-                                    tx.send(error_frame(rejection.code, rejection.reason)).await;
+                                let _ = queue
+                                    .send(error_frame(rejection.code, rejection.reason))
+                                    .await;
                             }
                         }
                     }

@@ -18,7 +18,35 @@ use std::time::Instant;
 /// concurrent sockets, so the per-frame ceiling is what keeps total inbound
 /// buffering from becoming a memory-exhaustion vector.
 pub(crate) const MAX_TEXT_SIZE: usize = 1024 * 1024; // 1 MB
+
+/// Maximum inbound binary-frame size before the connection is dropped.
+///
+/// Deliberately the same number as [`MAX_TEXT_SIZE`]: the two are the same
+/// resource, and a relay that caps one and not the other is not capped. The
+/// largest legitimate binary payload is a 64 KiB file chunk plus its nonce, MAC
+/// and v2 header (`CHUNK_SIZE` on both clients is `64 * 1024`), so there is an
+/// order of magnitude of headroom below this, and `SIZE_BUCKETS` already tops
+/// out at exactly 1 MiB — the metrics were built assuming this ceiling.
+///
+/// Until this existed, `handle_binary_frame` was handed whatever the socket
+/// produced with no check at all, while the two Text arms enforced
+/// [`MAX_TEXT_SIZE`]. `accept_async` was also given no `WebSocketConfig`, so
+/// tungstenite's 64 MiB `max_message_size` was the only bound in the path.
+pub(crate) const MAX_BINARY_SIZE: usize = MAX_TEXT_SIZE;
 pub(crate) const MAX_CONNECTIONS: usize = 10_000;
+
+/// How many messages one connection's outbound queue may hold.
+///
+/// This is a bound on *messages* and says nothing about bytes: 1024 messages
+/// at the [`MAX_BINARY_SIZE`] ceiling would be 1 GiB. The byte ceiling is
+/// [`QUEUE_BYTE_BUDGET`]; this exists only so a slow consumer cannot make the
+/// relay allocate unbounded message *headers* regardless of that budget.
+pub(crate) const QUEUE_DEPTH: usize = 1024;
+
+/// Bytes one connection may hold in its outbound queue.
+///
+/// See [`crate::state::Queue`].
+pub(crate) const QUEUE_BYTE_BUDGET: usize = 16 * 1024 * 1024;
 
 /// Per-message token-bucket refill rate (messages per second).
 pub(crate) const MSG_RATE_PER_SEC: f64 = 100.0;

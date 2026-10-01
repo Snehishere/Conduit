@@ -18,7 +18,7 @@ use tungstenite::Message;
 use std::sync::atomic::Ordering;
 
 use super::limits::{FORWARD_TIMEOUT_SECS, MAX_DEVICE_ID_LEN, is_valid_device_id};
-use super::state::AppState;
+use super::state::{AppState, SendOutcome};
 
 pub(crate) const NOT_WRAPPED_MSG: &str = "'encrypted' messages must be wrapped in a signed relay_route so the sender can be \
      authenticated";
@@ -329,7 +329,7 @@ pub(crate) async fn forward_text_with_timeout(
     timeout: std::time::Duration,
 ) {
     let clients = state.clients.read().await;
-    let Some(target_tx) = clients.get(to_device_id) else {
+    let Some(target_queue) = clients.get(to_device_id) else {
         warn!(
             "Relay drop: target {} not connected (from {})",
             to_device_id, from_device_id
@@ -342,17 +342,19 @@ pub(crate) async fn forward_text_with_timeout(
     };
 
     // Bounded wait: without this a target that stops reading (its outbound
-    // queue fills) blocks this sender's read loop indefinitely. The drop is
-    // counted as `timeout`, which is what that metric was always meant for.
-    let send = target_tx.send(Message::Text(payload.to_string()));
+    // queue fills, or its byte budget is exhausted) blocks this sender's read
+    // loop indefinitely. The drop is counted as `timeout`, which is what that
+    // metric was always meant for. Waiting for budget and waiting for a slot
+    // are the same wait from here, and both live inside this timeout.
+    let send = target_queue.send(Message::Text(payload.to_string()));
     match tokio::time::timeout(timeout, send).await {
-        Ok(Ok(())) => {
+        Ok(SendOutcome::Sent) => {
             state
                 .metrics
                 .messages_routed
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Err(_)) => {
+        Ok(SendOutcome::Closed) => {
             warn!(
                 "Relay drop: target {} channel closed (from {})",
                 to_device_id, from_device_id
@@ -385,7 +387,7 @@ pub(crate) async fn forward_binary(
     payload: &[u8],
 ) {
     let clients = state.clients.read().await;
-    let Some(target_tx) = clients.get(to_device_id) else {
+    let Some(target_queue) = clients.get(to_device_id) else {
         warn!(
             "Binary relay drop: target {} not connected (from {})",
             to_device_id, from_device_id
@@ -397,15 +399,16 @@ pub(crate) async fn forward_binary(
         return;
     };
 
-    let send = target_tx.send(Message::Binary(payload.to_vec()));
+    // Budget reserved and released inside `Queue::send`; see `forward_text`.
+    let send = target_queue.send(Message::Binary(payload.to_vec()));
     match tokio::time::timeout(std::time::Duration::from_secs(FORWARD_TIMEOUT_SECS), send).await {
-        Ok(Ok(())) => {
+        Ok(SendOutcome::Sent) => {
             state
                 .metrics
                 .messages_routed
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Ok(Err(_)) => {
+        Ok(SendOutcome::Closed) => {
             warn!(
                 "Binary relay drop: target {} channel closed (from {})",
                 to_device_id, from_device_id

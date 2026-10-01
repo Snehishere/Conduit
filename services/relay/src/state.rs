@@ -8,11 +8,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use conduit_protocol::hmac::NonceCache;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 use tungstenite::Message;
 
 use super::config::Config;
-use super::limits::RateLimiter;
+use super::limits::{QUEUE_BYTE_BUDGET, RateLimiter};
 use super::metrics::Metrics;
 
 /// Where the relay gets a device's `relay_route` signing key.
@@ -98,7 +98,104 @@ impl RouteKeys for StaticRouteKeys {
     }
 }
 
-pub(crate) type Clients = Arc<RwLock<HashMap<String, mpsc::Sender<Message>>>>;
+/// What happened when a message was offered to a connection's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendOutcome {
+    /// Queued. The message holds budget until the writer dequeues it.
+    Sent,
+    /// The receiving end is gone. Any reservation was released on the way out.
+    Closed,
+}
+
+/// One connection's outbound queue, and the byte budget that bounds it.
+///
+/// The channel underneath is `mpsc::channel(QUEUE_DEPTH)`, which bounds the
+/// *number* of queued messages and says nothing about their size. Nothing in
+/// the path bounded that size either until `MAX_BINARY_SIZE` existed, so a
+/// single target connection could hold 1024 messages of whatever an authenticated
+/// peer chose to send — at tungstenite's default read cap that was 64 GiB.
+///
+/// The budget makes the bound a bound on bytes. Every queued message holds
+/// `message.len()` permits from a [`Semaphore`] seeded with
+/// [`QUEUE_BYTE_BUDGET`], and returns them as the writer dequeues it, so queued
+/// bytes are capped no matter how deep the channel runs.
+///
+/// The raw `Sender` is not exposed, deliberately. This accounting only holds if
+/// *every* producer reserves and the writer releases for exactly what it took
+/// — a producer that enqueues without reserving, or a writer that releases for
+/// a message nobody reserved, quietly inflates the budget back towards
+/// unbounded. Forcing producers through [`Queue::send`] is what keeps the two
+/// halves in step.
+#[derive(Clone)]
+pub(crate) struct Queue {
+    tx: mpsc::Sender<Message>,
+    budget: Arc<Semaphore>,
+}
+
+impl Queue {
+    pub(crate) fn new(tx: mpsc::Sender<Message>) -> Self {
+        Self {
+            tx,
+            budget: Arc::new(Semaphore::new(QUEUE_BYTE_BUDGET)),
+        }
+    }
+
+    /// True once the connection's reader has gone away.
+    ///
+    /// What `reconcile_clients` prunes on: a task that panics or is aborted
+    /// never reaches its own cleanup, and would otherwise leave a dead entry
+    /// that makes the device look connected forever.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    /// Reserve the message's bytes, then queue it.
+    ///
+    /// Waiting on the budget and waiting on a full channel are the same
+    /// condition from the caller's point of view — the target is not accepting
+    /// — so both surface as `Sent`/`Closed` here and let the caller's timeout
+    /// decide how long to wait. A `Closed` return means the reservation has
+    /// already been given back.
+    pub(crate) async fn send(&self, message: Message) -> SendOutcome {
+        let units = budget_units(message.len());
+        // Never truncates and never yields 0: ingress is capped at
+        // `MAX_BINARY_SIZE`, well below `u32`, and `budget_units` returns at
+        // least 1.
+        let permit = match self.budget.clone().acquire_many_owned(units as u32).await {
+            Ok(permit) => permit,
+            // Only when the budget itself has been dropped, which means the
+            // connection is gone.
+            Err(_) => return SendOutcome::Closed,
+        };
+        match self.tx.send(message).await {
+            Ok(()) => {
+                // Forget rather than drop. The writer returns exactly these
+                // units when it dequeues, and dropping the permit here would
+                // return them a second time.
+                permit.forget();
+                SendOutcome::Sent
+            }
+            Err(_) => SendOutcome::Closed,
+        }
+    }
+
+    /// Give `len` bytes back. Called once per message by the writer, for every
+    /// message [`Queue::send`] accepted.
+    pub(crate) fn release(&self, len: usize) {
+        self.budget.add_permits(budget_units(len));
+    }
+}
+
+/// Units a message of `len` bytes costs.
+///
+/// A zero-length message reserves one rather than zero: both sides use this
+/// same function, so they agree either way, and it sidesteps having to reason
+/// about whether acquiring nothing is well-behaved.
+fn budget_units(len: usize) -> usize {
+    len.max(1)
+}
+
+pub(crate) type Clients = Arc<RwLock<HashMap<String, Queue>>>;
 
 pub(crate) struct ConnectionGuard {
     pub(crate) count: Arc<std::sync::atomic::AtomicUsize>,

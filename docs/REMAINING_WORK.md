@@ -1166,15 +1166,44 @@ they describe is gone and there is nothing to action).
 
 #### OPEN — reproduced in the current tree
 
-- [ ] **W6.1 (CRITICAL)** No size cap on binary frames.
-  `services/relay/src/connection.rs:465` handles `Message::Binary` with no
-  `MAX_TEXT_SIZE` check, unlike the two Text arms at `:109` and `:324`.
-  tungstenite 0.24's default `max_message_size` is 64 MiB, and the payload is
-  `to_vec()`'d into a 1024-deep queue with no byte budget — roughly **64 GiB per
-  target connection** from one authenticated client. `PROTOCOL.md:184` claims
-  the 1 MiB check bounds memory; for binary frames it does not exist.
-  *Left to do:* enforce a cap before `handle_binary_frame`; pass an explicit
-  `WebSocketConfig`; add a per-queue byte budget.
+- [x] **W6.1 (RESOLVED)** No size cap on binary frames. **Fixed, all three
+  halves.** Binary frames were accepted with no application-level check while
+  both Text arms enforced `MAX_TEXT_SIZE`, and the relay used `accept_async`
+  with no `WebSocketConfig` — so tungstenite's 64 MiB default was the only bound
+  in the entire path. The `to_vec()`'d payload then went into a 1024-deep queue
+  with no byte budget, giving roughly 64 GiB per target connection from one
+  authenticated client.
+
+  The fix is layered, and the layers are not redundant:
+
+  - **Read-time** — `accept_async_with_config` with
+    `max_message_size`/`max_frame_size` at `MAX_TEXT_SIZE`. This is the layer
+    that matters most: it refuses the frame *while it is being read*, before the
+    bytes are allocated. The application check arrives too late to save that.
+  - **Application** — `MAX_BINARY_SIZE` (`= MAX_TEXT_SIZE`) checked in both the
+    auth loop and the main loop, mirroring the Text arms, so the ceiling holds
+    even if the `WebSocketConfig` is ever changed. `SIZE_BUCKETS` already topped
+    out at exactly 1 MiB, so the metrics were built assuming this ceiling.
+  - **Queue** — `state::Queue` pairs each connection's `mpsc::Sender` with a
+    `Semaphore` of `QUEUE_BYTE_BUDGET` (16 MiB). Every message holds
+    `message.len()` permits while queued and the writer returns exactly those on
+    dequeue, so queued *bytes* are bounded however deep the channel runs. The
+    raw sender is deliberately not exposed: this accounting only holds if every
+    producer reserves, and a future `tx.send` that bypassed it would quietly
+    inflate the budget back towards unbounded.
+
+  Worst case per target connection went from ~64 GiB to 16 MiB.
+
+  Regression tests, each verified to fail with its fix removed: an e2e test
+  drives a `MAX_BINARY_SIZE + 1` frame through a real socket and asserts the
+  connection is dropped and the device deregistered (fails with both the
+  read-time and application caps reverted); two `Queue` tests assert the budget
+  refuses an over-ceiling frame while the channel still has free slots, and that
+  a release returns exactly one frame's worth and no more (both fail with the
+  reservation removed).
+
+  `packages/protocol/PROTOCOL.md` §2.5 documented the old behaviour — including
+  the claim that the relay passes no `WebSocketConfig` — and is updated.
 
 - [ ] **W6.6 (HIGH)** A read lock is held across `await`.
   `services/relay/src/route.rs:331` and `:387` take `state.clients.read().await`

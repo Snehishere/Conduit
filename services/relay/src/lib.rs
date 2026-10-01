@@ -108,7 +108,7 @@ pub(crate) use route::{
     Rejection, RejectionKind, forward_text, handle_binary_frame, validate_device_id,
 };
 #[cfg(test)]
-pub(crate) use state::{AppState, Clients, ConnectionGuard, reconcile_clients};
+pub(crate) use state::{AppState, Clients, ConnectionGuard, Queue, SendOutcome, reconcile_clients};
 
 /// Route-key resolution is part of the host-facing contract, because the host
 /// (not the relay) owns the device registry and therefore the keys.

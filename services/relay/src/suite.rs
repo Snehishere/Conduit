@@ -31,7 +31,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{RwLock, mpsc, watch};
 use tungstenite::Message;
 
-use crate::limits::{MAX_CONNECTIONS, MAX_TEXT_SIZE, MSG_BURST, MSG_RATE_PER_SEC, SIZE_BUCKETS};
+use crate::limits::{
+    MAX_BINARY_SIZE, MAX_CONNECTIONS, MAX_TEXT_SIZE, MSG_BURST, MSG_RATE_PER_SEC,
+    QUEUE_BYTE_BUDGET, SIZE_BUCKETS,
+};
 use crate::route::{VerifiedBinaryFrame, binary_mac_input, forward_text_with_timeout};
 use crate::tls::TlsParams;
 
@@ -927,6 +930,140 @@ fn max_text_size_is_1mb() {
     assert_eq!(MAX_TEXT_SIZE, 1024 * 1024);
 }
 
+#[test]
+fn binary_frames_are_capped_at_the_same_ceiling_as_text() {
+    // These are the same resource. A relay that caps one and not the other
+    // isn't capped, which is exactly the defect W6.1 described: both Text arms
+    // enforced MAX_TEXT_SIZE while `handle_binary_frame` was handed whatever
+    // the socket produced.
+    assert_eq!(
+        MAX_BINARY_SIZE, MAX_TEXT_SIZE,
+        "the two ceilings must be one ceiling"
+    );
+    // Both legs of the read-side bound, so an over-size frame is refused
+    // before it is allocated rather than after. A const block so this fails to
+    // compile rather than to run.
+    const {
+        assert!(MAX_BINARY_SIZE < QUEUE_BYTE_BUDGET);
+    }
+}
+
+/// The outbound queue bounds messages by count and bytes by budget.
+///
+/// Before the budget, `mpsc::channel(1024)` was the only bound on what a
+/// target connection could accumulate, and 1024 messages at the frame ceiling
+/// is 1 GiB — with no frame ceiling at all, tungstenite's 64 MiB default made
+/// it 64 GiB.
+#[tokio::test]
+async fn queued_bytes_are_bounded_by_the_budget_not_by_the_channel_depth() {
+    let (tx, _rx) = mpsc::channel(1024);
+    let queue = Queue::new(tx);
+
+    let message = || Message::Binary(vec![0u8; MAX_BINARY_SIZE]);
+    let full = QUEUE_BYTE_BUDGET / MAX_BINARY_SIZE;
+
+    // Fill the budget exactly, one frame at a time. The channel has 1024 slots
+    // and we only use `full` of them, so nothing here is stopped by depth —
+    // only by bytes.
+    for i in 0..full {
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), queue.send(message()))
+                .await
+                .expect("a send inside the budget must not time out"),
+            SendOutcome::Sent,
+            "message {i} of {full} must fit"
+        );
+    }
+
+    // One more frame crosses the budget. It must not be queued. The channel
+    // still has over a thousand free slots, so only the byte budget can be
+    // refusing it — which is the whole point.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), queue.send(message()))
+            .await
+            .is_err(),
+        "the frame past QUEUE_BYTE_BUDGET must be refused, not queued"
+    );
+
+    // Returning one frame's worth of bytes unblocks exactly one more.
+    queue.release(MAX_BINARY_SIZE);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), queue.send(message()))
+            .await
+            .expect("released bytes must be reusable"),
+        SendOutcome::Sent
+    );
+}
+
+/// The writer hands back exactly what the producer reserved.
+///
+/// Releasing more than was taken would inflate the budget back towards
+/// unbounded; releasing less would starve the connection of bytes it is owed.
+/// Both come from the two sides of this accounting disagreeing, so the test
+/// asserts the boundary in both directions.
+#[tokio::test]
+async fn release_returns_exactly_what_the_producer_reserved() {
+    let frame = 4096;
+    let full = QUEUE_BYTE_BUDGET / frame;
+    assert_eq!(
+        full * frame,
+        QUEUE_BYTE_BUDGET,
+        "the test needs the budget to divide evenly"
+    );
+
+    // Deeper than the budget so that hitting the ceiling can only ever be the
+    // byte budget talking. Otherwise a full *channel* would look identical to
+    // an exhausted budget and the test would prove nothing.
+    let (tx, _rx) = mpsc::channel(full + 1);
+    let queue = Queue::new(tx);
+
+    for _ in 0..full {
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                queue.send(Message::Binary(vec![0u8; frame]))
+            )
+            .await
+            .expect("a send inside the budget must not time out"),
+            SendOutcome::Sent
+        );
+    }
+
+    // Exactly exhausted, not nearly: even one byte must wait.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            queue.send(Message::Binary(vec![0u8; 1]))
+        )
+        .await
+        .is_err(),
+        "the budget must be exactly exhausted"
+    );
+
+    queue.release(frame);
+
+    // Exactly `frame` bytes came back: one frame of that size fits...
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            queue.send(Message::Binary(vec![0u8; frame]))
+        )
+        .await
+        .expect("the released bytes must cover one frame"),
+        SendOutcome::Sent
+    );
+    // ...and nothing beyond it.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            queue.send(Message::Binary(vec![0u8; 1]))
+        )
+        .await
+        .is_err(),
+        "release must return exactly one frame's worth, not a byte more"
+    );
+}
+
 // ---------------------------------------------------------------
 //  Config tests – empty / missing RELAY_TOKEN
 //  These must be serialised because they mutate process-wide env vars.
@@ -1140,7 +1277,10 @@ async fn message_routing_delivers_to_connected_client() {
     let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
     let (tx, mut rx) = mpsc::channel::<Message>(64);
 
-    clients.write().await.insert("target-device".into(), tx);
+    clients
+        .write()
+        .await
+        .insert("target-device".into(), Queue::new(tx));
 
     let msg = Message::Text(r#"{"hello":"world"}"#.to_string());
     let clients_read = clients.read().await;
@@ -1173,8 +1313,14 @@ async fn message_routing_multiple_clients_independent() {
     let (tx1, mut rx1) = mpsc::channel::<Message>(64);
     let (tx2, mut rx2) = mpsc::channel::<Message>(64);
 
-    clients.write().await.insert("device-a".into(), tx1);
-    clients.write().await.insert("device-b".into(), tx2);
+    clients
+        .write()
+        .await
+        .insert("device-a".into(), Queue::new(tx1));
+    clients
+        .write()
+        .await
+        .insert("device-b".into(), Queue::new(tx2));
 
     // Send to device-a only
     {
@@ -1198,7 +1344,10 @@ async fn message_routing_client_disconnect_removes_from_map() {
     let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
     let (tx, _rx) = mpsc::channel::<Message>(64);
 
-    clients.write().await.insert("leaving-device".into(), tx);
+    clients
+        .write()
+        .await
+        .insert("leaving-device".into(), Queue::new(tx));
     assert!(clients.read().await.contains_key("leaving-device"));
 
     clients.write().await.remove("leaving-device");
@@ -1443,7 +1592,7 @@ async fn connection_lifecycle_auth_register_and_deregister() {
     // Register
     {
         let mut lock = clients.write().await;
-        lock.insert("device-lifecycle".into(), tx);
+        lock.insert("device-lifecycle".into(), Queue::new(tx));
     }
     assert!(clients.read().await.contains_key("device-lifecycle"));
 
@@ -1462,10 +1611,16 @@ async fn connection_lifecycle_overwrite_replaces_sender() {
     let (tx2, mut rx2) = mpsc::channel::<Message>(64);
 
     // First connection
-    clients.write().await.insert("device-reconnect".into(), tx1);
+    clients
+        .write()
+        .await
+        .insert("device-reconnect".into(), Queue::new(tx1));
 
     // Reconnect with new sender (old sender dropped)
-    clients.write().await.insert("device-reconnect".into(), tx2);
+    clients
+        .write()
+        .await
+        .insert("device-reconnect".into(), Queue::new(tx2));
 
     // Old sender should be dropped → rx1 returns None
     assert!(rx1.recv().await.is_none(), "old channel should be closed");
@@ -1473,11 +1628,12 @@ async fn connection_lifecycle_overwrite_replaces_sender() {
     // New sender works
     {
         let lock = clients.read().await;
-        lock.get("device-reconnect")
+        let outcome = lock
+            .get("device-reconnect")
             .unwrap()
             .send(Message::Text("reconnected".to_string()))
-            .await
-            .unwrap();
+            .await;
+        assert_eq!(outcome, SendOutcome::Sent, "the new queue must accept");
     }
     let msg = rx2.recv().await.unwrap();
     match msg {
@@ -2771,6 +2927,51 @@ async fn e2e_oversized_message_drops_connection() {
     drop(relay);
 }
 
+/// Binary frames had no size check at all while Text had one at both of its
+/// arms, and the only bound in the whole path was tungstenite's 64 MiB default
+/// read cap. Over-ceiling frames were sized against that default.
+#[tokio::test]
+async fn e2e_oversized_binary_frame_drops_connection() {
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+
+    let mut ws = ws_client(relay.ws_addr).await;
+    authenticate(&mut ws, "b16", E2E_RELAY_TOKEN).await;
+
+    // The device has to be registered before the frame that knocks it off.
+    let mut registered = false;
+    for _ in 0..50 {
+        if state.clients.read().await.contains_key("b16") {
+            registered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(registered, "device must register before the frame");
+
+    // One byte past MAX_BINARY_SIZE — the same boundary Text has always used.
+    let _ = ws
+        .send(Message::Binary(vec![0u8; MAX_BINARY_SIZE + 1]))
+        .await;
+    let after = recv_text(&mut ws, 3).await;
+
+    let mut removed = false;
+    for _ in 0..50 {
+        if !state.clients.read().await.contains_key("b16") {
+            removed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        removed,
+        "an over-ceiling binary frame must drop the connection and deregister the device (recv got: {:?})",
+        after
+    );
+
+    drop(relay);
+}
+
 // ---------------------------------------------------------------
 //  E2E: binary frame routing
 // ---------------------------------------------------------------
@@ -3692,11 +3893,14 @@ async fn reconcile_clients_removes_dead_senders() {
     let clients: Clients = Arc::new(RwLock::new(HashMap::new()));
     {
         let (tx, rx) = mpsc::channel::<Message>(4);
-        clients.write().await.insert("aabb".into(), tx);
+        clients.write().await.insert("aabb".into(), Queue::new(tx));
         drop(rx);
     }
     let (tx_live, _rx_live) = mpsc::channel::<Message>(4);
-    clients.write().await.insert("ccdd".into(), tx_live);
+    clients
+        .write()
+        .await
+        .insert("ccdd".into(), Queue::new(tx_live));
     assert_eq!(clients.read().await.len(), 2);
 
     assert_eq!(reconcile_clients(&clients).await, 1);
@@ -3906,7 +4110,7 @@ async fn messages_dropped_timeout_is_wired_to_the_forward_path() {
         .clients
         .write()
         .await
-        .insert("tgt".to_string(), tx.clone());
+        .insert("tgt".to_string(), Queue::new(tx.clone()));
 
     let timeout = std::time::Duration::from_millis(50);
     forward_text_with_timeout(
@@ -3945,7 +4149,11 @@ async fn messages_dropped_timeout_is_wired_to_the_forward_path() {
 async fn forward_to_a_closed_target_counts_not_found() {
     let state = Arc::new(test_state(0, 0, 0, 0, 0));
     let (tx, rx) = mpsc::channel::<Message>(1);
-    state.clients.write().await.insert("dead".to_string(), tx);
+    state
+        .clients
+        .write()
+        .await
+        .insert("dead".to_string(), Queue::new(tx));
     drop(rx);
 
     forward_text(
