@@ -57,6 +57,17 @@ const String vectorFrameTruncated =
     '0230313233343536373839616263646566000000022129374e159f29fd2130c0bd1f17b'
     '616dee807e3994120f91bcbb0e35fcffb6178';
 
+/// A frame addressed to a real 36-character device id — the case the other
+/// vectors cannot reach. `53553065383430302d653239622d3431` is "550e8400-e29b-41",
+/// the id's first 16 bytes and nothing else, so this vector is also the pin on
+/// *what the 16-byte field means* (PROTOCOL.md §5.1.4), not just on the framing.
+///
+/// Pinned on both sides: `packages/protocol/src/types.rs::the_dart_client_builds_
+/// the_same_frames` asserts the same bytes from `build_binary_frame`.
+const String vectorFrameUuid =
+    '0235353065383430302d653239622d343100000009032b8e9c8245ecb70eac249da51aad2'
+    '851efb926aec7bd389496aa1ccd308c9066696c652d6368756e6b';
+
 List<int> _secret() => EncryptionService.hexToBytes(vectorSecret);
 
 Map<String, dynamic> _vectorMessage() => {
@@ -172,6 +183,21 @@ void main() {
           ),
         ),
         vectorFrameTruncated,
+      );
+      expect(
+        hexEncode(
+          buildBinaryFrame(
+            routeKey: key(),
+            fromDeviceId: 'deadbeef',
+            targetDeviceId: '550e8400-e29b-41d4-a716-446655440000',
+            sequence: seq(9),
+            payload: utf8.encode('file-chunk'),
+          ),
+        ),
+        vectorFrameUuid,
+        reason:
+            'a 36-character device id is carried as its 16-byte prefix, and the '
+            'Rust producer must write exactly the same bytes',
       );
     });
 
@@ -616,6 +642,71 @@ void main() {
         payload: utf8.encode('hello'),
       )..[0] = 0xFF;
       expect(() => parseBinaryFrame(frame), throwsA(isA<FormatException>()));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  //  The 16-byte target field
+  //
+  //  The field is 16 bytes and every device id the app mints is a 36-character
+  //  UUID, so what it carries is the id's *prefix* — the rule is defined once, in
+  //  `conduit_protocol::binary_target_field`, and pinned on both sides
+  //  (`packages/protocol/src/types.rs::the_dart_client_builds_the_same_frames`).
+  //  These assert what the field therefore is from this side, using only the
+  //  public API — including the consequence that keeps breaking receivers.
+  // -------------------------------------------------------------------------
+  group('the 16-byte target field', () {
+    const uuid = '550e8400-e29b-41d4-a716-446655440000';
+    const twin = '550e8400-e29b-41d4-b716-446655440000';
+    List<int> key() => deriveRouteKey(_secret(), 'deadbeef');
+    Uint32List seq(int n) => Uint32List.fromList([n]);
+    Uint8List addressedTo(String target) => buildBinaryFrame(
+      routeKey: key(),
+      fromDeviceId: 'deadbeef',
+      targetDeviceId: target,
+      sequence: seq(1),
+      payload: utf8.encode('x'),
+    );
+
+    test('holds the first 16 bytes of a 36-character id', () {
+      expect(
+        addressedTo(uuid).sublist(1, 1 + binaryDeviceIdLen),
+        ascii.encode('550e8400-e29b-41'),
+      );
+      expect(
+        addressedTo('b145d').sublist(1, 1 + binaryDeviceIdLen),
+        [...ascii.encode('b145d'), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        reason: 'a short id is the whole field, NUL-padded',
+      );
+    });
+
+    test('the parsed target is the prefix, not the device id', () {
+      // The defect, pinned from this side: a receiver that compares the parsed
+      // target against its own 36-character id (`websocket_service.dart`, before
+      // the fix) refuses every frame the relay correctly resolved to it. A
+      // receiver must compare the 16 bytes with this device's own canonical
+      // field — the same rule the relay's router and the desktop's
+      // `binary_target_matches` use.
+      final parsed = parseBinaryFrame(addressedTo(uuid));
+      expect(parsed.targetId, '550e8400-e29b-41');
+      expect(
+        parsed.targetId,
+        isNot(uuid),
+        reason: 'the field cannot hold the whole id, so this comparison is the bug',
+      );
+    });
+
+    test('two ids sharing those 16 bytes are indistinguishable on the wire', () {
+      // Nothing in the frame format can separate them. This is why the relay
+      // resolves the field to exactly one connected device and refuses it when
+      // two match, and why a receiver cannot be the one that catches it: it sees
+      // identical bytes either way.
+      expect(
+        addressedTo(uuid).sublist(1, 1 + binaryDeviceIdLen),
+        addressedTo(twin).sublist(1, 1 + binaryDeviceIdLen),
+      );
+      expect(uuid.substring(0, 16), twin.substring(0, 16));
+      expect(uuid, isNot(twin));
     });
   });
 

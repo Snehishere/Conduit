@@ -65,18 +65,51 @@ class WebSocketService extends ChangeNotifier {
   int _reconnectAttempts = 0;
   bool _isRelayConnection = false;
   String? _relayUrl;
-  String? _targetDeviceId;
   String? _apnsToken;
   String? _osVersion;
   String? _relayToken;
 
-  /// The v2 binary frame counter. Strictly increasing per connection, because
-  /// the relay drops a frame whose sequence does not advance — that is its
-  /// replay defence for file chunks, which carry no nonce to dedupe on.
+  /// The device every relayed message is addressed to, or null before pairing
+  /// has said who it is.
+  ///
+  /// This is the **desktop's own id**, learned at pairing as `hub_device_id`,
+  /// and not a per-peer id picked out of the device list:
+  ///
+  ///  * The relay's routing table is keyed by the id each connection
+  ///    authenticated with, and a message is delivered only to a table entry
+  ///    that exists. The desktop joins the relay it hosts under exactly the id
+  ///    it sends as `hub_device_id`.
+  ///  * A phone is paired with one hub and holds one shared secret with it, so
+  ///    the hub is also the only peer whose frames it can verify
+  ///    ([_handleRelayBinary]) — inbound and outbound already assume one peer.
+  ///  * The device list cannot bootstrap itself over a relay anyway: the entries
+  ///    arrive as `discovery/announce`, and that frame itself has to be routed,
+  ///    so it cannot be the source of the address it is routed to.
+  ///
+  /// It is deliberately **not** caller-supplied. `setRelayConfig` used to take a
+  /// target id and every production call site passed `null`, so the signing path
+  /// was unreachable, the phone emitted bare `encrypted` envelopes the relay
+  /// refuses outright, and nothing on the phone reported it.
+  String? get _relayTargetDeviceId => _relayPeerDeviceId;
+
+  /// The v2 binary frame counter. Strictly increasing, because the relay drops
+  /// a frame whose sequence does not advance — that is its replay defence for
+  /// file chunks, which carry no nonce to dedupe on.
+  ///
+  /// Deliberately **not** reset on reconnect: the relay's own guard is per
+  /// connection, so a fresh connection accepts anything, and continuing to count
+  /// up costs nothing and removes any chance of re-issuing a number that some
+  /// other guard has already seen.
   int _binarySequence = 0;
 
   /// Highest inbound binary sequence accepted from the current peer, for the
   /// same reason: a relayed chunk replayed at the client must not reappear.
+  ///
+  /// Reset where a connection is established. The relay **re-bases the outbound
+  /// sequence per connection** (`connection.rs`), so after any reconnect its
+  /// frames start again from 1; keeping the pre-reconnect high-water mark made
+  /// every inbound relayed frame fail the replay check for the rest of the
+  /// process's life.
   int? _lastInboundSequence;
 
   /// The desktop's own device id, learned at pairing.
@@ -101,8 +134,33 @@ class WebSocketService extends ChangeNotifier {
   /// agree with them.
   String? _pinnedCertSha256;
 
+  /// The same pin, for the **relay's** certificate, which is a different key
+  /// from the hub's: the desktop generates the relay's TLS material into its own
+  /// `relay-certs` directory.
+  ///
+  /// Held separately rather than as a second acceptable value on
+  /// [_pinnedCertSha256] so the two peers stay distinguished: accepting either
+  /// pin on either connection would mean a relay certificate satisfies the hub's
+  /// identity check, which is precisely the widening pinning exists to prevent.
+  String? _pinnedRelayCertSha256;
+
   /// Secure-storage key for the persisted certificate pin.
   static const String _pinStorageKey = 'pinned_cert_sha256';
+
+  /// Secure-storage key for the relay's certificate pin.
+  static const String _relayPinStorageKey = 'pinned_relay_cert_sha256';
+
+  /// Secure-storage keys for the relay endpoint and its bearer token.
+  ///
+  /// Both arrive in `pairing/accept` (see [_adoptRelayEndpoint]) and have to
+  /// survive a restart, because the relay is the fallback this app reaches for
+  /// at startup when the hub is not on the network — and the fallback has to
+  /// work before any screen has been built. The token is a credential every
+  /// relay client must present, so it goes in secure storage rather than in
+  /// preferences.
+  static const String _relayUrlStorageKey = 'relay_url';
+  static const String _relayTokenStorageKey = 'relay_token';
+
   static const String _urlStorageKey = 'last_connected_url';
 
   /// Secure-storage key for the id the desktop assigned us at pairing time.
@@ -124,6 +182,9 @@ class WebSocketService extends ChangeNotifier {
 
   /// Whether the persisted pin has been loaded from secure storage.
   bool _pinLoaded = false;
+
+  /// Whether the persisted relay configuration has been loaded.
+  bool _relayConfigLoaded = false;
 
   /// Whether to prefer WSS (WebSocket Secure) when connecting to LAN desktop.
   bool _preferLanWss = false;
@@ -153,6 +214,19 @@ class WebSocketService extends ChangeNotifier {
   /// disconnected case rather than being shown a plausible-looking default.
   String? get connectedAddress => _connectedUri?.toString();
 
+  /// The relay this app dials when the hub is unreachable, or null if none is
+  /// configured.
+  ///
+  /// Read through [ensureRelayConfigLoaded] first: the value normally comes
+  /// from the desktop's `pairing/accept` and is loaded from secure storage.
+  String? get relayUrl => _relayUrl;
+
+  /// The relay's bearer token, or null if none is configured.
+  String? get relayToken => _relayToken;
+
+  /// Whether the live connection is going through the relay.
+  bool get isRelayConnection => _isRelayConnection;
+
   String? Function()? getSharedSecret;
 
   WebSocketService();
@@ -169,13 +243,13 @@ class WebSocketService extends ChangeNotifier {
   void clearDeviceId() {
     if (_deviceId == null) return;
     _deviceId = null;
-    unawaited(_secureStorage.delete(key: _deviceIdStorageKey));
+    unawaited(_persistOrDelete(_deviceIdStorageKey, null));
     // The desktop's id goes with it: it is part of the same pairing, and a
     // re-pair may land on a different hub with a different id.
     _relayPeerDeviceId = null;
     _lastInboundSequence = null;
     _binarySequence = 0;
-    unawaited(_secureStorage.delete(key: _hubDeviceIdStorageKey));
+    unawaited(_persistOrDelete(_hubDeviceIdStorageKey, null));
   }
 
   void setDeviceInfo(String name, String osVersion) {
@@ -187,13 +261,106 @@ class WebSocketService extends ChangeNotifier {
     _apnsToken = token;
   }
 
-  void setRelayConfig(String? url, String? targetId) {
-    _relayUrl = url;
-    _targetDeviceId = targetId;
+  /// Point the relay fallback at [url], or clear it with null.
+  ///
+  /// There is deliberately **no** target-device parameter any more. It used to
+  /// take one, every production call site passed `null`, and a null target
+  /// silently disabled the entire signed-route path — so the phone emitted bare
+  /// `encrypted` envelopes that the relay refuses, and kept reporting
+  /// "Connected" while nothing it sent was routed. The address a relayed
+  /// message is sent to is not a preference: it is the paired hub's id, learned
+  /// at pairing, and [relayPeerDeviceId] is that value.
+  ///
+  /// Persisted, so the fallback still works after a restart.
+  void setRelayConfig(String? url) {
+    final trimmed = url?.trim();
+    final next = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+    if (_relayUrl == next) return;
+    _relayUrl = next;
+    unawaited(_persistOrDelete(_relayUrlStorageKey, next));
   }
 
+  /// The bearer token presented in `relay_auth`, or clear it with null.
+  ///
+  /// Persisted in secure storage: it is the one credential that decides whether
+  /// this device may use the relay at all, and a fallback that has to be typed
+  /// in again after every restart is a fallback nobody has.
   void setRelayToken(String? token) {
-    _relayToken = token;
+    final trimmed = token?.trim();
+    final next = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+    if (_relayToken == next) return;
+    _relayToken = next;
+    unawaited(_persistOrDelete(_relayTokenStorageKey, next));
+  }
+
+  /// Write [value], or delete the key when it is null.
+  Future<void> _persistOrDelete(String key, String? value) async {
+    try {
+      if (value == null) {
+        await _secureStorage.delete(key: key);
+      } else {
+        await _secureStorage.write(key: key, value: value);
+      }
+    } catch (e) {
+      debugPrint('WS: Failed to persist $key: $e');
+    }
+  }
+
+  /// Load the relay endpoint and token persisted by [setRelayConfig] /
+  /// [setRelayToken], once.
+  ///
+  /// Awaited at the top of [autoConnect] so a cold start with no reachable hub
+  /// still knows where the relay is. A read failure leaves the in-memory
+  /// configuration alone: this must never clear a working relay because secure
+  /// storage was briefly unhappy.
+  Future<void> ensureRelayConfigLoaded() async {
+    if (_relayConfigLoaded) return;
+    _relayConfigLoaded = true;
+    try {
+      final stored = await _secureStorage.read(key: _relayUrlStorageKey);
+      if (stored != null && stored.isNotEmpty && _relayUrl == null) {
+        _relayUrl = stored;
+      }
+      final token = await _secureStorage.read(key: _relayTokenStorageKey);
+      if (token != null && token.isNotEmpty && _relayToken == null) {
+        _relayToken = token;
+      }
+    } catch (e) {
+      debugPrint('WS: Failed to load the relay configuration: $e');
+      return;
+    }
+    if (_relayUrl != null) {
+      debugPrint('WS: Relay fallback configured: $_relayUrl');
+    }
+  }
+
+  /// Record the relay a `pairing/accept` named, if it named one.
+  ///
+  /// A desktop that hosts a relay knows both values — it generated the token
+  /// and it owns the listener — so pairing is enough to configure the fallback
+  /// and there is no manual step. Every field is optional: a desktop that does
+  /// not host a relay, or one older than this, simply omits them, and whatever
+  /// was configured before is left exactly as it was.
+  void _adoptRelayEndpoint(Map<String, dynamic> message) {
+    final url = message['relay_url'];
+    final token = message['relay_token'];
+    final pin = message['relay_cert_pin'];
+
+    if (url is String && url.trim().isNotEmpty) {
+      setRelayConfig(url);
+    }
+    if (token is String && token.trim().isNotEmpty) {
+      setRelayToken(token);
+    }
+    if (pin is String && pin.trim().isNotEmpty) {
+      // Without this the relay connection could never be established at all:
+      // the relay serves its own certificate, and verifying it against the
+      // hub's pin fails closed.
+      setRelayPinnedCertificate(pin.trim());
+    }
+    if (url is String && url.trim().isNotEmpty) {
+      debugPrint('WS: Learned the relay endpoint from the desktop');
+    }
   }
 
   /// Set the expected SPKI pin for certificate pinning.
@@ -209,12 +376,31 @@ class WebSocketService extends ChangeNotifier {
       _secureStorage
           .write(key: _pinStorageKey, value: sha256Fingerprint)
           .catchError((Object e) {
-            debugPrint('WS: Failed to persist certificate pin: $e');
-          }),
+        debugPrint('WS: Failed to persist certificate pin: $e');
+      }),
     );
   }
 
-  /// Load the certificate pin captured during a previous pairing.
+  /// Set the expected SPKI pin for the **relay's** certificate.
+  ///
+  /// Kept apart from [setPinnedCertificate] — see [_pinnedRelayCertSha256].
+  void setRelayPinnedCertificate(String sha256Fingerprint) {
+    _pinnedRelayCertSha256 = sha256Fingerprint;
+    _pinLoaded = true;
+    unawaited(
+      _secureStorage
+          .write(key: _relayPinStorageKey, value: sha256Fingerprint)
+          .catchError((Object e) {
+        debugPrint('WS: Failed to persist the relay certificate pin: $e');
+      }),
+    );
+  }
+
+  /// Load the certificate pins captured during a previous pairing.
+  ///
+  /// Both pins, because a single connection is verified against one of them
+  /// ([_verifyCertificatePin]) and the right one is not known until the dial is
+  /// under way.
   Future<void> _ensurePinLoaded() async {
     if (_pinLoaded) return;
     try {
@@ -224,6 +410,14 @@ class WebSocketService extends ChangeNotifier {
       }
     } catch (e) {
       debugPrint('WS: Failed to load certificate pin: $e');
+    }
+    try {
+      final relayPin = await _secureStorage.read(key: _relayPinStorageKey);
+      if (relayPin != null && relayPin.isNotEmpty) {
+        _pinnedRelayCertSha256 = relayPin;
+      }
+    } catch (e) {
+      debugPrint('WS: Failed to load the relay certificate pin: $e');
     }
     _pinLoaded = true;
   }
@@ -266,19 +460,23 @@ class WebSocketService extends ChangeNotifier {
     if (id == null || id.isEmpty || id == _deviceId) return;
     _deviceId = id;
     debugPrint('WS: Desktop assigned device id');
-    unawaited(_secureStorage.write(key: _deviceIdStorageKey, value: id));
+    // A storage failure must not become an unhandled async error: the id is
+    // already in memory and the pairing itself has succeeded.
+    unawaited(_persistOrDelete(_deviceIdStorageKey, id));
   }
 
   /// Record the desktop's own device id, and persist it for next launch.
   ///
   /// Sent alongside the assigned id in the same `pairing/accept`, and needed
   /// for the same reason from the other direction: verifying a relayed frame
-  /// means deriving the *sender's* route key, which is bound to the sender's id.
+  /// means deriving the *sender's* route key, which is bound to the sender's id,
+  /// and it is also the address every relayed message is sent to
+  /// ([_relayTargetDeviceId]).
   void _adoptHubDeviceId(String? id) {
     if (id == null || id.isEmpty || id == _relayPeerDeviceId) return;
     _relayPeerDeviceId = id;
     debugPrint('WS: Learned the desktop device id');
-    unawaited(_secureStorage.write(key: _hubDeviceIdStorageKey, value: id));
+    unawaited(_persistOrDelete(_hubDeviceIdStorageKey, id));
   }
 
   /// Enable or disable prefer WSS for LAN connections.
@@ -319,10 +517,18 @@ class WebSocketService extends ChangeNotifier {
   ///   handshake is the trust bootstrap — the user scanned the QR code or typed
   ///   the code, which is the out-of-band consent — so its pin is captured and
   ///   stored here. Any later connection is validated against that pin.
-  /// - On every non-pairing connection the pin MUST be present and MUST match.
+  /// - A relay connection ([isRelay]) is validated against the relay's own pin,
+  ///   which the desktop hands over in `pairing/accept`. It is a different
+  ///   certificate from the hub's and is deliberately not interchangeable with
+  ///   it.
+  /// - On every other connection the pin MUST be present and MUST match.
   ///   When no pin is configured the connection is **rejected**; there is no
   ///   path that accepts a certificate blindly.
-  bool _verifyCertificatePin(X509Certificate cert, {required bool isPairing}) {
+  bool _verifyCertificatePin(
+    X509Certificate cert, {
+    required bool isPairing,
+    required bool isRelay,
+  }) {
     String actualSha256;
     try {
       actualSha256 = computeSpkiPin(cert.der);
@@ -350,17 +556,21 @@ class WebSocketService extends ChangeNotifier {
       return true;
     }
 
-    if (_pinnedCertSha256 == null || _pinnedCertSha256!.isEmpty) {
+    final expected = isRelay ? _pinnedRelayCertSha256 : _pinnedCertSha256;
+    final peer = isRelay ? 'relay' : 'desktop';
+    if (expected == null || expected.isEmpty) {
       debugPrint(
-        'Certificate pin verification failed: no pin configured — rejecting connection',
+        'Certificate pin verification failed: no $peer pin configured — '
+        'rejecting connection',
       );
       return false; // Fail closed — never accept without a pin
     }
 
-    final expectedSha256 = _normalizePin(_pinnedCertSha256!);
+    final expectedSha256 = _normalizePin(expected);
     if (actualSha256 != expectedSha256) {
       debugPrint(
-        'Certificate pin mismatch: expected $expectedSha256, got $actualSha256',
+        'Certificate pin mismatch for the $peer: expected $expectedSha256, '
+        'got $actualSha256',
       );
       return false;
     }
@@ -380,6 +590,12 @@ class WebSocketService extends ChangeNotifier {
   /// Try connecting to the last known URL (called on startup)
   Future<void> autoConnect() async {
     try {
+      // The relay fallback is only usable if it is already known, and where it
+      // is comes from the desktop's `pairing/accept` — persisted, and normally
+      // not in memory at this point in the launch. Read it before deciding
+      // whether there is a fallback to try.
+      await ensureRelayConfigLoaded();
+
       final lastUrl = await _secureStorage.read(key: _urlStorageKey);
       if (lastUrl != null && lastUrl.isNotEmpty) {
         debugPrint('WS: Auto-connecting to saved URL: $lastUrl');
@@ -408,7 +624,7 @@ class WebSocketService extends ChangeNotifier {
   /// fingerprint when no pin exists yet.
   Future<void> connect(String url, {bool isPairing = false}) async {
     try {
-      // Load the pin captured during a previous pairing before verifying.
+      // Load the pins captured during a previous pairing before verifying.
       await _ensurePinLoaded();
 
       bool connectingToRelay = false;
@@ -439,10 +655,15 @@ class WebSocketService extends ChangeNotifier {
           ..badCertificateCallback =
               (X509Certificate cert, String host, int port) {
                 // Never accept blindly. The pin was captured and stored during
-                // pairing; every other connection must match it. If no pin is
+                // pairing; every other connection must match it — and the relay
+                // is held to the relay's own pin, not the hub's. If no pin is
                 // configured (and this is not the pairing handshake itself) the
                 // certificate is rejected.
-                return _verifyCertificatePin(cert, isPairing: isPairing);
+                return _verifyCertificatePin(
+                  cert,
+                  isPairing: isPairing,
+                  isRelay: connectingToRelay,
+                );
               };
 
         _channel = IOWebSocketChannel.connect(
@@ -464,6 +685,13 @@ class WebSocketService extends ChangeNotifier {
       _connectedUri = uri;
       _lastError = null;
       _reconnectAttempts = 0;
+      // Per *connection*, not per process: the relay numbers the frames it
+      // delivers from 1 again on every connection (it re-bases its outbound
+      // counter per recipient), so the high-water mark from a previous
+      // connection would refuse every frame on this one as a replay. Cleared
+      // here, where the connection is established, rather than only in
+      // `clearDeviceId`, which a reconnect never reaches.
+      _lastInboundSequence = null;
       _startHeartbeat();
       notifyListeners();
 
@@ -471,9 +699,7 @@ class WebSocketService extends ChangeNotifier {
         // Persist the *resolved* URI (post scheme/port upgrade), not the raw
         // input, so a later cold start reconnects to the same real endpoint
         // even if the prefer-LAN-WSS setting is not yet applied.
-        unawaited(
-          _secureStorage.write(key: _urlStorageKey, value: uri.toString()),
-        );
+        unawaited(_persistOrDelete(_urlStorageKey, uri.toString()));
       }
 
       if (_isRelayConnection) {
@@ -506,6 +732,22 @@ class WebSocketService extends ChangeNotifier {
 
             if (type == 'ping') {
               _sendMessage({'type': 'pong'});
+              return;
+            }
+
+            if (type == 'relay_auth_ok' || type == 'relay_auth_rejected') {
+              _handleRelayAuthAnswer(rawMessage);
+              return;
+            }
+
+            if (type == 'error') {
+              // The peer is refusing something, by name. Previously these fell
+              // through to `_handleMessage`, where nothing is registered for
+              // `error`, so every refusal — a rejected route, an unwrapped
+              // `encrypted` envelope, a rejected `relay_auth` — was dropped and
+              // the app kept reporting "Connected" while nothing worked. It is
+              // the only place the phone learns *why*.
+              _handlePeerError(rawMessage);
               return;
             }
 
@@ -576,6 +818,48 @@ class WebSocketService extends ChangeNotifier {
         _scheduleReconnect(url);
       }
     }
+  }
+
+  /// Record the relay's answer to our `relay_auth`.
+  ///
+  /// The relay writes a frame before it closes the socket on a bad token, so
+  /// without this the only symptom is a bare disconnect and an endless 3 s retry
+  /// loop with `_lastError` never set — the connection looks live right up
+  /// until it silently is not.
+  void _handleRelayAuthAnswer(Map<String, dynamic> message) {
+    if (message['type'] == 'relay_auth_ok') {
+      debugPrint('WS: Relay accepted this device');
+      return;
+    }
+    final reason = message['reason'] as String? ?? 'unknown';
+    debugPrint('WS: Relay rejected this device: $reason');
+    _surfaceSendError(
+      'The relay refused this device ($reason): ${switch (reason) {
+        'missing_token' =>
+          'it has no relay token. Pair again so the desktop can hand one over.',
+        'invalid_token' =>
+          'the relay token does not match. Pair again, or re-check the token in '
+              'Settings.',
+        _ => 'the relay gave no reason it will accept.',
+      }}',
+    );
+  }
+
+  /// Record a refusal frame from the peer, so a failure is visible rather than
+  /// silent.
+  ///
+  /// `code` is the peer's machine-readable reason and is kept verbatim — these
+  /// are the names the relay and the hub already publish, and paraphrasing them
+  /// would destroy the only thing that makes them searchable.
+  void _handlePeerError(Map<String, dynamic> message) {
+    final code = message['code'] as String? ?? 'unknown_error';
+    final detail = message['message'] as String? ?? '';
+    debugPrint(
+      'WS: peer refused a frame: $code${detail.isEmpty ? '' : ' — $detail'}',
+    );
+    _surfaceSendError(
+      detail.isEmpty ? 'Rejected by the other device: $code' : '$code: $detail',
+    );
   }
 
   /// Verify and handle a v2 binary frame the relay forwarded to us.
@@ -860,6 +1144,16 @@ class WebSocketService extends ChangeNotifier {
       // the *sender's* route key, and the sender's id is bound into the key's
       // derivation. Without it every relayed file chunk would be unverifiable.
       _adoptHubDeviceId(message['hub_device_id'] as String?);
+      // And, if it hosts one, the relay: its address, its bearer token and the
+      // pin of its certificate. Taking the relay from the pairing handshake is
+      // what makes "the hub is not on this network" recoverable with no manual
+      // step at all — the desktop generated that token and owns that listener,
+      // so it is the only party that can tell us both.
+      //
+      // Every field is optional and absent from a desktop that does not host a
+      // relay, or from one older than this. Nothing here is required to keep
+      // working on the LAN.
+      _adoptRelayEndpoint(message);
       final deviceInfo = message['device_info'] as Map<String, dynamic>?;
       if (deviceInfo != null) {
         final device = {
@@ -945,20 +1239,20 @@ class WebSocketService extends ChangeNotifier {
     return deriveRouteKey(hexToBytes(secretHex), deviceId);
   }
 
-  /// Wrap [message] in a signed `relay_route` addressed to [_targetDeviceId].
+  /// Wrap [message] in a signed `relay_route` addressed to the paired hub.
   ///
   /// Returns null when this device cannot sign, which the caller must treat as
   /// "do not send" rather than "send it unsigned": the relay rejects an
   /// unsigned route anyway, and quietly sending one hides the real fault.
   Map<String, dynamic>? _asSignedRoute(Object? message) {
-    final target = _targetDeviceId;
+    final target = _relayTargetDeviceId;
     final deviceId = _deviceId;
     final key = _routeKey();
     if (target == null || deviceId == null || key == null) {
       debugPrint(
         'WS: cannot route through the relay — '
         'missing ${target == null
-            ? 'target'
+            ? 'the paired hub\'s device id'
             : deviceId == null
             ? 'own device id'
             : 'pairing secret'}',
@@ -979,8 +1273,8 @@ class WebSocketService extends ChangeNotifier {
   void sendBinaryMessage(dynamic message) {
     if (_channel == null || !_isConnected) return;
 
-    if (_isRelayConnection && _targetDeviceId != null) {
-      final target = _targetDeviceId!;
+    if (_isRelayConnection && _relayTargetDeviceId != null) {
+      final target = _relayTargetDeviceId!;
       final deviceId = _deviceId;
       final key = _routeKey();
       if (deviceId == null || key == null) {
@@ -1033,11 +1327,24 @@ class WebSocketService extends ChangeNotifier {
       final type = message['type'] as String?;
       final isPairing = type == 'pairing';
       final isRelayAuth = type == 'relay_auth';
+      // `ping`/`pong` are properties of the *connection*, not of a peer: the
+      // relay answers a `ping` on this same socket and closes a connection that
+      // stops answering its own. Routing one would deliver a keep-alive to the
+      // desktop and leave the relay unanswered.
+      //
+      // Only on a relay connection. On the LAN the hub receives an encrypted
+      // envelope and decrypts it, so the frame stays exactly as it was; making
+      // it bare there would be a change to the LAN wire format.
+      final isRelayKeepalive =
+          _isRelayConnection && (type == 'ping' || type == 'pong');
       final sharedSecretHex = getSharedSecret?.call();
 
       Map<String, dynamic> payloadToSend = message;
 
-      if (!isPairing && !isRelayAuth && sharedSecretHex != null) {
+      if (!isPairing &&
+          !isRelayAuth &&
+          !isRelayKeepalive &&
+          sharedSecretHex != null) {
         try {
           final secretBytes = EncryptionService.hexToBytes(sharedSecretHex);
           final plaintext = jsonEncode(message);
@@ -1064,7 +1371,10 @@ class WebSocketService extends ChangeNotifier {
         }
       }
 
-      if (_isRelayConnection && _targetDeviceId != null && !isRelayAuth) {
+      if (_isRelayConnection &&
+          _relayTargetDeviceId != null &&
+          !isRelayAuth &&
+          !isRelayKeepalive) {
         // Signed with this device's own route key, never the bearer token: the
         // token authenticates the connection, the key proves which device is
         // speaking. Signing with the token let any paired phone forge a route

@@ -39,7 +39,10 @@ enum AudioOutputRoute { phone, desktop, bluetooth }
 /// Service for detecting call state and routing audio on Android.
 /// Uses EventChannel to receive real-time call state from native PhoneStateListener.
 class CallService extends ChangeNotifier {
-  static const _eventChannel = EventChannel('com.conduit.mobile/events');
+  /// The channel the native `PhoneStateListener` publishes on. One stream, one
+  /// channel — `receiveBroadcastStream` registers by channel *name* only, so a
+  /// name shared with another stream leaves every subscriber but the last dead.
+  static const _eventChannel = EventChannel('com.conduit.mobile/call_events');
 
   CallState _state = CallState.idle;
   CallEvent? _currentCall;
@@ -73,7 +76,7 @@ class CallService extends ChangeNotifier {
 
     try {
       // Listen for call events from native PhoneStateListener
-      _callSubscription = _eventChannel.receiveBroadcastStream('calls').listen(
+      _callSubscription = _eventChannel.receiveBroadcastStream().listen(
         (event) {
           if (event is Map) {
             final type = event['type'] as String?;

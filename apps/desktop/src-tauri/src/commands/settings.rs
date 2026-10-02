@@ -487,8 +487,8 @@ mod tests {
         keys
     }
 
-    #[test]
-    fn the_relay_is_on_by_default() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relay_is_on_by_default() {
         // The relay is a background part of this app, not something the user
         // deploys. A phone on another network must find it already running, so
         // the default cannot be off. This is also the one setting where
@@ -497,12 +497,74 @@ mod tests {
             ConduitSettings::default().relay_enabled,
             "the relay must default to running"
         );
+
+        // The path that actually matters. `main.rs` does not consult
+        // `ConduitSettings::default()` — it reads the settings *table*, and
+        // returns before `relay_host.start()` and `spawn_relay_client` when the
+        // result says false. `Storage::get_settings` had its own literal default
+        // for this key ("false"), so the two definitions of "the default"
+        // disagreed and a fresh install never started a relay. Asserting only the
+        // struct default above let that through; only this assertion fails.
+        let state = create_test_state();
+        let from_empty_db = state.storage.get_settings().await.unwrap();
+        assert!(
+            from_empty_db.relay_enabled,
+            "an empty database must read as relay_enabled = true — this is the \
+             value main.rs consults at startup"
+        );
+
+        // And an explicit "off" must still be honoured, so the default above is
+        // not just the absence of a check.
+        state
+            .storage
+            .save_setting("relay_enabled", "false")
+            .await
+            .unwrap();
+        assert!(
+            !state.storage.get_settings().await.unwrap().relay_enabled,
+            "a stored \"false\" must still turn the relay off"
+        );
+
         // And the frontend default must agree, or a fresh install would save
-        // the opposite value the first time the user touches any other setting.
+        // the opposite value the first time the user touches any other setting:
+        // Settings.tsx replaces DEFAULT_SETTINGS wholesale with the loaded
+        // result and then saves that object.
         let json = serde_json::json!({ "relay_port": 9529 });
         let parsed: ConduitSettings =
             serde_json::from_value(json).expect("a partial settings payload still deserialises");
         assert!(parsed.relay_enabled);
+        assert!(
+            frontend_default_settings_relay_enabled(),
+            "DEFAULT_SETTINGS in settingsTypes.ts must be relay_enabled: true"
+        );
+    }
+
+    /// Reads `relay_enabled` out of the `DEFAULT_SETTINGS` literal in
+    /// `settingsTypes.ts`.
+    ///
+    /// The hazard it guards is not hypothetical: the Rust side said "on" in two
+    /// places and "off" in `Storage::get_settings`, and the frontend default is a
+    /// fourth definition that nothing pinned. A one-line scan is enough — the
+    /// alternative is hand-transcribing a TS object into a Rust literal, which is
+    /// the same drift it would be checking for.
+    fn frontend_default_settings_relay_enabled() -> bool {
+        let ts_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/components/settings/settingsTypes.ts"
+        );
+        let source = std::fs::read_to_string(ts_path)
+            .unwrap_or_else(|e| panic!("cannot read {ts_path}: {e}"));
+        let start = source
+            .find("export const DEFAULT_SETTINGS")
+            .expect("settingsTypes.ts must declare `export const DEFAULT_SETTINGS`");
+        source[start..]
+            .lines()
+            .map(str::trim)
+            .find_map(|line| {
+                let value = line.strip_prefix("relay_enabled:")?.trim();
+                Some(value.trim_end_matches(',') == "true")
+            })
+            .expect("DEFAULT_SETTINGS must declare `relay_enabled`")
     }
 
     #[test]
@@ -636,6 +698,13 @@ mod tests {
         assert!(s.minimize_to_tray, "default_true fields must default true");
         assert!(s.notifications_enabled);
         assert_eq!(s.relay_url, DEFAULT_RELAY_URL);
+        assert!(
+            s.relay_enabled,
+            "empty database must default the relay on — this is the value \
+             main.rs reads before starting or joining the relay"
+        );
+        assert_eq!(s.relay_port, crate::relay::DEFAULT_RELAY_PORT);
+        assert_eq!(s.relay_health_port, crate::relay::DEFAULT_RELAY_HEALTH_PORT);
         assert_eq!(
             s.notification_apps,
             default_notification_apps(),

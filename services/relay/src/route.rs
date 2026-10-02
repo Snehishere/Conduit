@@ -10,6 +10,14 @@ use std::sync::Arc;
 
 use conduit_protocol::RelayRoute;
 use conduit_protocol::hmac::NonceCache;
+// The v2 binary-frame layout. These are the field widths and offsets the header
+// is parsed with, and `BINARY_DEVICE_ID_LEN` is also the size of the target field
+// that `resolve_binary_target` resolves — the whole reason that function exists
+// is that this is smaller than a device id.
+use conduit_protocol::{
+    BINARY_AUTHENTICATED_PREFIX_LEN, BINARY_DEVICE_ID_LEN, BINARY_FRAME_VERSION, BINARY_HEADER_LEN,
+    BINARY_TAG_LEN,
+};
 use log::warn;
 use serde_json::Value;
 use tokio::sync::RwLock;
@@ -31,6 +39,14 @@ pub(crate) enum RejectionKind {
     Integrity,
     /// Replayed nonce or stale timestamp / non-increasing binary sequence.
     Replay,
+    /// Verified, but the frame names no single deliverable device: its 16-byte
+    /// target field resolved to zero or to more than one connected device.
+    ///
+    /// Not `Integrity` — the frame is authentic, and the tag already said so.
+    /// Not `Replay` either. It is counted as a drop with nowhere to go, because
+    /// that is what happened: the sender asked for a device that is not there
+    /// (or is ambiguous), and nothing was forwarded.
+    Unroutable,
 }
 
 /// A refusal, carrying the machine-readable code sent in the `error` frame.
@@ -53,6 +69,14 @@ impl Rejection {
     pub(crate) fn replay(code: &'static str, reason: impl Into<String>) -> Self {
         Self {
             kind: RejectionKind::Replay,
+            code,
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn unroutable(code: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            kind: RejectionKind::Unroutable,
             code,
             reason: reason.into(),
         }
@@ -159,13 +183,28 @@ pub(crate) async fn handle_relay_route(
 }
 
 /// A verified, in-window binary relay frame.
+///
+/// `target_field` is the 16 wire bytes and is **not** a device id. A device id is
+/// up to 64 characters and these 16 are only its prefix, so this field has to be
+/// resolved against the routing table before it can name anybody — see
+/// [`resolve_binary_target`], which is what the forward path uses.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct VerifiedBinaryFrame<'a> {
-    pub(crate) target_id: String,
+    /// The target field exactly as it arrived, padding included.
+    pub(crate) target_field: [u8; BINARY_DEVICE_ID_LEN],
+    /// The same field as text with the NUL padding stripped. For logs and error
+    /// messages only — never route on this string, it is a prefix.
+    pub(crate) target_prefix: &'a str,
     pub(crate) payload: &'a [u8],
 }
 
 /// Verify a v2 binary relay frame: version, target id, HMAC tag and sequence.
+///
+/// Deliberately independent of the routing table. Verification answers "is this
+/// an authentic frame from the device on this connection"; routing answers "which
+/// single connected device does its target field name", and it is a separate
+/// step ([`resolve_binary_target`]) so that a frame which fails it is dropped
+/// rather than re-framed at a guessed target.
 ///
 /// `Ok(None)` is reserved for frames that are structurally valid but carry
 /// nothing to route (currently unreachable; kept so future "accept and ignore"
@@ -177,11 +216,6 @@ pub(crate) async fn handle_binary_frame<'a>(
     bytes: &'a [u8],
     last_seq: &mut Option<u32>,
 ) -> Result<Option<VerifiedBinaryFrame<'a>>, Rejection> {
-    use conduit_protocol::{
-        BINARY_AUTHENTICATED_PREFIX_LEN, BINARY_DEVICE_ID_LEN, BINARY_FRAME_VERSION,
-        BINARY_HEADER_LEN, BINARY_TAG_LEN,
-    };
-
     if bytes.len() < BINARY_HEADER_LEN {
         return Err(Rejection::integrity(
             "binary_frame_too_short",
@@ -204,21 +238,27 @@ pub(crate) async fn handle_binary_frame<'a>(
     }
 
     let target_end = 1 + BINARY_DEVICE_ID_LEN;
-    let target_id = std::str::from_utf8(&bytes[1..target_end])
-        .map_err(|_| {
-            Rejection::integrity(
+    let field_bytes = &bytes[1..target_end];
+    let target_field: [u8; BINARY_DEVICE_ID_LEN] = field_bytes
+        .try_into()
+        .expect("slice is exactly BINARY_DEVICE_ID_LEN bytes");
+    // Parsed from the frame rather than from the copy above, so the prefix
+    // borrows `bytes` and can be handed back with the frame's lifetime.
+    let target_prefix = match conduit_protocol::parse_binary_target_field(field_bytes) {
+        Ok(prefix) => prefix,
+        Err(conduit_protocol::BinaryTargetFieldError::NotUtf8) => {
+            return Err(Rejection::integrity(
                 "binary_target_id_invalid",
                 "target device id is not valid UTF-8",
-            )
-        })?
-        .trim_end_matches('\0')
-        .to_string();
-    if target_id.is_empty() {
-        return Err(Rejection::integrity(
-            "binary_target_id_empty",
-            "target device id is empty",
-        ));
-    }
+            ));
+        }
+        Err(conduit_protocol::BinaryTargetFieldError::Empty) => {
+            return Err(Rejection::integrity(
+                "binary_target_id_empty",
+                "target device id is empty",
+            ));
+        }
+    };
 
     let seq_start = target_end;
     let seq = u32::from_be_bytes([
@@ -251,15 +291,126 @@ pub(crate) async fn handle_binary_frame<'a>(
 
     *last_seq = Some(seq);
 
-    Ok(Some(VerifiedBinaryFrame { target_id, payload }))
+    Ok(Some(VerifiedBinaryFrame {
+        target_field,
+        target_prefix,
+        payload,
+    }))
+}
+
+/// What a v2 frame's 16-byte target field resolved to against the routing table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BinaryTarget {
+    /// Exactly one connected device has this canonical field. The String is that
+    /// device's **full** id, so callers can re-frame and route with it directly.
+    Unique(String),
+    /// No connected device does.
+    NotConnected,
+    /// Two or more connected devices do, and the field cannot say which.
+    Ambiguous {
+        /// A **lower bound**: the scan stops at the second match, because two is
+        /// already enough to refuse and the exact size changes nothing. Counted,
+        /// never named — the routing table is not something an authenticated peer
+        /// gets to enumerate.
+        candidates: usize,
+    },
+}
+
+/// Resolve a v2 frame's 16-byte target field to exactly one connected device.
+///
+/// This is the crux of the binary path. The field is 16 bytes
+/// ([`conduit_protocol::BINARY_DEVICE_ID_LEN`]) and a real device id is a
+/// 36-character UUID, so what arrives is a *prefix*, while
+/// [`crate::state::Clients`] is keyed by full ids. Comparing a prefix against a
+/// full id never matched, which is why the whole binary file path was dead in
+/// both directions.
+///
+/// The resolution is deliberately three-valued and fails closed on both
+/// non-unique answers:
+///
+/// * `NotConnected` — nobody is there. Dropped and counted; nothing is guessed.
+/// * `Ambiguous` — two or more connected devices have the same canonical field,
+///   so the bytes cannot say which one is meant. Dropped and counted, and
+///   **delivered to neither**. Picking either would hand a file to the wrong
+///   device, which is the one outcome worse than losing it.
+/// * `Unique` — the only answer that forwards.
+///
+/// A linear scan, not a reverse index: the cost is 16 bytes of comparison per
+/// connected device, against an HMAC over the payload and a copy of it that the
+/// same frame has already paid for, and `MAX_CONNECTIONS` bounds it at 10 000. An
+/// index would have to be kept in step with registration and deregistration,
+/// which is where this table's harder bugs already live (see
+/// [`crate::state::deregister_if_current`]). If that trade ever inverts, this is
+/// the function to replace — it is the only reader of the field.
+///
+/// The read guard is held for the scan only; the caller sends to the returned
+/// device through [`forward_binary`], which re-reads the table itself.
+pub(crate) async fn resolve_binary_target(
+    clients: &crate::state::Clients,
+    field: &[u8; BINARY_DEVICE_ID_LEN],
+) -> BinaryTarget {
+    let clients = clients.read().await;
+    let mut found: Option<&String> = None;
+    let mut candidates = 0usize;
+    for device_id in clients.keys() {
+        if !conduit_protocol::binary_target_matches(device_id, field) {
+            continue;
+        }
+        candidates += 1;
+        if candidates == 1 {
+            found = Some(device_id);
+        } else {
+            // Two is already ambiguous, and the third match changes no decision:
+            // `candidates` becomes a lower bound rather than a census.
+            break;
+        }
+    }
+    match (found, candidates) {
+        (Some(device_id), 1) => BinaryTarget::Unique(device_id.clone()),
+        (_, 0) => BinaryTarget::NotConnected,
+        _ => BinaryTarget::Ambiguous { candidates },
+    }
+}
+
+impl BinaryTarget {
+    /// The refusal for a target that is not [`BinaryTarget::Unique`], carrying
+    /// the code the sender is answered with.
+    ///
+    /// `Unique` has no refusal — it is the only value that forwards — and
+    /// returning one from here would be a bug, so it panics rather than
+    /// inventing a code. The reason text names the prefix and the count, never
+    /// the candidates: the routing table is not something an authenticated peer
+    /// gets to enumerate.
+    pub(crate) fn rejection(&self, from_device_id: &str, prefix: &str) -> Rejection {
+        match *self {
+            BinaryTarget::Unique(_) => {
+                panic!("a resolved binary target is not a rejection: {from_device_id} -> {prefix}")
+            }
+            BinaryTarget::NotConnected => Rejection::unroutable(
+                "binary_target_not_found",
+                format!(
+                    "no connected device is named by the target field {prefix:?} \
+                     (from {from_device_id})"
+                ),
+            ),
+            BinaryTarget::Ambiguous { candidates } => Rejection::unroutable(
+                "binary_target_ambiguous",
+                format!(
+                    "the target field {prefix:?} is shared by more than one connected \
+                     device (at least {candidates}) and cannot be resolved to one \
+                     recipient (from {from_device_id}); nothing was delivered"
+                ),
+            ),
+        }
+    }
 }
 
 /// Byte string the binary-frame tag is computed over:
 /// `from_device_id || 0x1F || frame[0..21] || payload`.
 ///
 /// Binding the sender id is what stops one authenticated client from replaying
-/// a frame it captured from another (the 16-byte header only names the
-/// *recipient*).
+/// a frame it captured from another (the 16-byte header names only the
+/// *recipient*, and only by prefix).
 pub(crate) fn binary_mac_input(
     authenticated_device_id: &str,
     header_and_payload: &[u8],
@@ -283,8 +434,6 @@ pub(crate) fn verify_binary_tag(
     payload: &[u8],
     tag: &[u8],
 ) -> bool {
-    use conduit_protocol::BINARY_AUTHENTICATED_PREFIX_LEN;
-
     let Some(secret) = route_keys.key_for(authenticated_device_id) else {
         warn!("Binary frame from unregistered device {authenticated_device_id}");
         return false;
@@ -398,6 +547,11 @@ pub(crate) async fn forward_text_with_timeout(
 }
 
 /// Forward a binary payload, updating the routing metrics.
+///
+/// `to_device_id` is a **full** device id, not a target field: callers resolve
+/// the field with [`resolve_binary_target`] first, so the `get` below is an exact
+/// hit and its `not_found` arm only covers the window between that resolution
+/// and this send (the target disconnected in between).
 pub(crate) async fn forward_binary(
     state: &Arc<AppState>,
     from_device_id: &str,

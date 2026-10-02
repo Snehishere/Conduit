@@ -39,46 +39,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _relayTokenController = TextEditingController();
 
   Future<void> _loadSettings() async {
-    final prefs = await SharedPreferences.getInstance();
+    // Read the service before the first await, so no `BuildContext` is used
+    // across an async gap, and the relay values come from the service rather
+    // than from these prefs — the desktop delivers them in `pairing/accept` and
+    // they are stored as the credential the token is.
     final ws = context.read<WebSocketService>();
+    final prefs = await SharedPreferences.getInstance();
+    await ws.ensureRelayConfigLoaded();
+    if (!mounted) return;
+
     setState(() {
       _syncNotifications = prefs.getBool('sync_notifications') ?? true;
       _syncClipboard = prefs.getBool('sync_clipboard') ?? true;
       _autoClipboardSync = prefs.getBool('auto_clipboard_sync') ?? true;
       _autoAnswerCalls = prefs.getBool('auto_answer_calls') ?? false;
       _crashReports = prefs.getBool('crash_reports') ?? true;
-      _relayUrlController.text = prefs.getString('relay_url') ?? '';
-      _relayTokenController.text = prefs.getString('relay_token') ?? '';
+      _relayUrlController.text = ws.relayUrl ?? '';
+      _relayTokenController.text = ws.relayToken ?? '';
       _initialized = true;
     });
-    
-    // Apply loaded relay config immediately
-    if (_relayUrlController.text.isNotEmpty || _relayTokenController.text.isNotEmpty) {
-      ws.setRelayConfig(
-        _relayUrlController.text.isNotEmpty ? _relayUrlController.text : null,
-        null // targetDeviceId is usually set during connection/pairing
-      );
-      ws.setRelayToken(_relayTokenController.text.isNotEmpty ? _relayTokenController.text : null);
-    }
+
+    _adoptLegacyRelayPrefs(prefs, ws);
   }
 
-  // Persists the relay URL/token and pushes them into WebSocketService.
-  // There is no Relay section in the UI yet, so this is only reachable from a
-  // previous build that had one; _loadSettings still applies what was stored
-  // then.
-  // ignore: unused_element
+  /// One-way move of any relay values a build that *had* a Relay section wrote
+  /// into preferences.
+  ///
+  /// Those keys were only ever written by a function nothing could reach, so
+  /// this is close to a formality; it is here so a device that does hold such a
+  /// value does not silently lose its only relay configuration the first time
+  /// it opens this screen after an upgrade. The service is the only place the
+  /// relay is stored from here on, so the old keys are read once and never
+  /// written again.
+  ///
+  /// Each field is adopted on its own: a stale address must never displace a
+  /// token that is already right, or the other way round.
+  void _adoptLegacyRelayPrefs(SharedPreferences prefs, WebSocketService ws) {
+    if (ws.relayUrl == null) ws.setRelayConfig(prefs.getString('relay_url'));
+    if (ws.relayToken == null) ws.setRelayToken(prefs.getString('relay_token'));
+  }
+
+  /// Persist the relay URL/token and push them into [WebSocketService].
+  ///
+  /// This is the manual path, and an override: the desktop normally hands both
+  /// values over in `pairing/accept`, so pairing alone is enough and there is
+  /// nothing to type here. It exists for the case pairing cannot cover — a relay
+  /// the desktop does not host, such as an operator's own behind a tunnel.
+  ///
+  /// Empty fields clear the value rather than storing an empty string, so
+  /// "fall back to the hub" is a reachable state.
   Future<void> _saveRelaySettings() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('relay_url', _relayUrlController.text);
-    await prefs.setString('relay_token', _relayTokenController.text);
-    
+    final ws = context.read<WebSocketService>();
+    ws.setRelayConfig(_relayUrlController.text);
+    ws.setRelayToken(_relayTokenController.text);
+
     if (mounted) {
-      final ws = context.read<WebSocketService>();
-      ws.setRelayConfig(
-        _relayUrlController.text.isNotEmpty ? _relayUrlController.text : null,
-        null
-      );
-      ws.setRelayToken(_relayTokenController.text.isNotEmpty ? _relayTokenController.text : null);
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Relay settings saved')),
       );
@@ -317,6 +332,87 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     _saveSetting('crash_reports', v);
                   }
                 : null,
+          ),
+        ]),
+
+        // ── Relay ──
+        // The relay is the path to the hub when this phone is not on its
+        // network. Its address and token normally arrive in `pairing/accept`,
+        // so this section only has to *show* what pairing configured and offer
+        // an override for a relay the desktop does not host.
+        _buildSection('Relay', colors, [
+          Consumer<WebSocketService>(
+            builder: (_, ws, _) => ListTile(
+              leading: Icon(Icons.hub, color: colors.accent),
+              title: Text('Relay', style: TextStyle(color: colors.text1)),
+              subtitle: Text(
+                ws.isRelayConnection
+                    ? 'Connected through the relay'
+                    : ws.relayUrl ??
+                        'Not configured — pair with a desktop hosting one',
+                style: TextStyle(color: colors.text2, fontSize: 12),
+              ),
+              trailing: Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: ws.isRelayConnection ? colors.success : colors.text3,
+                ),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+            child: TextField(
+              controller: _relayUrlController,
+              enabled: _initialized,
+              autocorrect: false,
+              keyboardType: TextInputType.url,
+              style: TextStyle(color: colors.text1, fontSize: 13),
+              decoration: InputDecoration(
+                labelText: 'Relay address',
+                hintText: 'wss://relay.example.com:9529',
+                labelStyle: TextStyle(color: colors.text3),
+                hintStyle: TextStyle(color: colors.text3),
+                border: const OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: TextField(
+              controller: _relayTokenController,
+              enabled: _initialized,
+              autocorrect: false,
+              obscureText: true,
+              style: TextStyle(color: colors.text1, fontSize: 13),
+              decoration: InputDecoration(
+                labelText: 'Relay token',
+                labelStyle: TextStyle(color: colors.text3),
+                border: const OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: TextButton(
+                onPressed: _initialized ? _saveRelaySettings : null,
+                child: const Text('Save relay settings'),
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Text(
+              'Leave both blank to reach the desktop only on this network. '
+              'Pairing normally fills these in for you.',
+              style: TextStyle(color: colors.text3, fontSize: 11),
+            ),
           ),
         ]),
 

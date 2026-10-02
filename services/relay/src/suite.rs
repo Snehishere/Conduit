@@ -35,7 +35,10 @@ use crate::limits::{
     MAX_BINARY_SIZE, MAX_CONNECTIONS, MAX_TEXT_SIZE, MSG_BURST, MSG_RATE_PER_SEC,
     QUEUE_BYTE_BUDGET, SIZE_BUCKETS,
 };
-use crate::route::{VerifiedBinaryFrame, binary_mac_input, forward_text_with_timeout};
+use crate::route::{
+    BinaryTarget, VerifiedBinaryFrame, binary_mac_input, forward_text_with_timeout,
+    resolve_binary_target, verify_binary_tag,
+};
 use crate::tls::TlsParams;
 
 // ---------------------------------------------------------------
@@ -677,6 +680,11 @@ fn prometheus_output_default_zero_values() {
 
 /// Run the production binary-frame verifier over `bytes` on behalf of
 /// `sender`, tracking the sequence number in `last_seq`.
+///
+/// The routing table behind this state is empty and does not matter:
+/// verification and routing are separate steps (see
+/// [`resolve_binary_target`]), and every test that needs the second one builds
+/// its own table.
 async fn verify_binary<'a>(
     sender: &str,
     bytes: &'a [u8],
@@ -695,7 +703,7 @@ async fn binary_frame_valid_target_id() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "device-1");
+    assert_eq!(parsed.target_prefix, "device-1");
     assert_eq!(parsed.payload, b"payload");
     assert_eq!(seq, Some(1));
 }
@@ -708,7 +716,7 @@ async fn binary_frame_valid_16_char_id() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "abcdefghijklmnop");
+    assert_eq!(parsed.target_prefix, "abcdefghijklmnop");
     assert!(parsed.payload.is_empty());
 }
 
@@ -784,7 +792,7 @@ async fn binary_frame_payload_extracted_correctly() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "dev");
+    assert_eq!(parsed.target_prefix, "dev");
     assert_eq!(parsed.payload, payload);
     assert_eq!(seq, Some(3));
 }
@@ -1791,7 +1799,7 @@ async fn binary_frame_exactly_header_len_bytes_minimal_valid() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "a");
+    assert_eq!(parsed.target_prefix, "a");
     assert!(parsed.payload.is_empty());
 }
 
@@ -1808,7 +1816,7 @@ async fn binary_frame_16_byte_id_with_trailing_zeros() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "test");
+    assert_eq!(parsed.target_prefix, "test");
 }
 
 #[tokio::test]
@@ -1834,22 +1842,248 @@ async fn binary_frame_v2_with_large_payload() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(parsed.target_id, "big-payload");
+    assert_eq!(parsed.target_prefix, "big-payload");
     assert_eq!(parsed.payload, &payload[..]);
 }
 
 #[tokio::test]
-async fn binary_frame_target_longer_than_16_bytes_is_truncated_not_accepted() {
-    let frame = binary_frame("aa", "0123456789abcdefEXTRA", 1, b"x");
+async fn binary_frame_target_longer_than_16_bytes_is_canonicalised_not_accepted() {
+    // This assertion used to read "a real device id fits in it". That was the
+    // defect written down as documentation: **no** real device id fits — every
+    // one the app mints is a 36-character UUID — and the frame is not delivered
+    // on the strength of this field either way. Truncation is the field's
+    // definition (PROTOCOL.md §5.1.4), the tag covers exactly those bytes, and
+    // whether they name one connected device is `resolve_binary_target`'s job.
+    let target = "0123456789abcdefEXTRA";
+    let frame = binary_frame("aa", target, 1, b"x");
     let mut seq = None;
     let parsed = verify_binary("aa", &frame, &mut seq)
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(parsed.target_prefix, "0123456789abcdef");
     assert_eq!(
-        parsed.target_id, "0123456789abcdef",
-        "the 16-byte field truncates; a real device id fits in it"
+        parsed.target_field,
+        conduit_protocol::binary_target_field(target),
+        "the field is the canonical prefix of the full id, not a lossy copy of it"
     );
+}
+
+// ---------------------------------------------------------------
+//  Binary target resolution: a 16-byte field against 36-character ids
+//
+//  The field is 16 bytes and every id the app mints is a 36-character
+//  UUID, so the router receives a prefix while the routing table is
+//  keyed by full ids. These tests use real UUIDs throughout: an id short
+//  enough to fit the field passes every check below without exercising
+//  any of them.
+// ---------------------------------------------------------------
+
+/// An [`AppState`] whose routing table holds `devices`, each with its own queue.
+async fn state_with_connected(devices: &[&str]) -> Arc<AppState> {
+    let state = Arc::new(test_state(0, 0, 0, 0, 0));
+    for device in devices {
+        let (tx, _rx) = mpsc::channel::<Message>(64);
+        state
+            .clients
+            .write()
+            .await
+            .insert((*device).to_string(), Queue::new(tx));
+    }
+    state
+}
+
+/// The 16 bytes a frame addressed to `device_id` carries.
+fn target_field_of(device_id: &str) -> [u8; conduit_protocol::BINARY_DEVICE_ID_LEN] {
+    conduit_protocol::binary_target_field(device_id)
+}
+
+/// Two real UUIDs that agree on their first 16 bytes and differ afterwards.
+const TWIN_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+const TWIN_B: &str = "550e8400-e29b-41d4-b716-446655440000";
+
+#[test]
+fn the_twin_ids_really_do_share_a_field() {
+    // Guards the test below: if these ever stopped sharing their first 16 bytes
+    // the ambiguity case would silently become a routing case and pass for the
+    // wrong reason.
+    assert_eq!(TWIN_A.len(), 36);
+    assert_eq!(TWIN_B.len(), 36);
+    assert_ne!(TWIN_A, TWIN_B);
+    assert_eq!(&TWIN_A[..16], &TWIN_B[..16]);
+    assert_eq!(target_field_of(TWIN_A), target_field_of(TWIN_B));
+}
+
+#[tokio::test]
+async fn a_uuid_target_field_resolves_to_the_connected_device() {
+    let desktop = "550e8400-e29b-41d4-a716-446655440000";
+    let phone = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    let state = state_with_connected(&[desktop, phone]).await;
+
+    // The exact lookup this path used to do could never hit: the table is keyed
+    // by a 36-character id and the wire carries 16 bytes.
+    let field = target_field_of(phone);
+    let prefix = conduit_protocol::parse_binary_target_field(&field).expect("ASCII field");
+    assert_eq!(prefix, "3f2504e0-4f89-11", "16 bytes of a 36-character id");
+    assert!(
+        !state.clients.read().await.contains_key(prefix),
+        "the routing table is keyed by the full id, which is why the field has to \
+         be resolved rather than looked up"
+    );
+
+    // Resolution is what turns the field back into a device.
+    assert_eq!(
+        resolve_binary_target(&state.clients, &field).await,
+        BinaryTarget::Unique(phone.to_string())
+    );
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of(desktop)).await,
+        BinaryTarget::Unique(desktop.to_string())
+    );
+
+    // And it is exactly one: adding a second device that does *not* share the
+    // field changes nothing.
+    let state = state_with_connected(&[desktop, phone, "b145d"]).await;
+    assert_eq!(
+        resolve_binary_target(&state.clients, &field).await,
+        BinaryTarget::Unique(phone.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_uuid_target_field_nobody_is_connected_for_is_not_routed() {
+    let sender = "550e8400-e29b-41d4-a716-446655440000";
+    let absent = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    let state = state_with_connected(&[sender]).await;
+
+    let resolved = resolve_binary_target(&state.clients, &target_field_of(absent)).await;
+    assert_eq!(resolved, BinaryTarget::NotConnected);
+
+    let rejection = resolved.rejection(sender, "3f2504e0-4f89-11");
+    assert_eq!(rejection.code, "binary_target_not_found");
+    assert_eq!(rejection.kind, RejectionKind::Unroutable);
+}
+
+#[tokio::test]
+async fn two_connected_devices_sharing_a_uuid_prefix_are_ambiguous() {
+    // The security-relevant case. Both devices are connected and both are named by
+    // the same 16 bytes, so the field cannot choose. Delivering to either would put
+    // a file in front of the wrong device, which is worse than dropping it.
+    let state = state_with_connected(&[TWIN_A, TWIN_B]).await;
+
+    let resolved = resolve_binary_target(&state.clients, &target_field_of(TWIN_A)).await;
+    assert_eq!(
+        resolved,
+        BinaryTarget::Ambiguous { candidates: 2 },
+        "a shared field must not resolve to either device"
+    );
+
+    // The refusal names the prefix and the count, and neither candidate: the
+    // routing table is not something an authenticated sender may enumerate.
+    let rejection = resolved.rejection("aa", "550e8400-e29b-41");
+    assert_eq!(rejection.code, "binary_target_ambiguous");
+    assert_eq!(rejection.kind, RejectionKind::Unroutable);
+    assert!(
+        rejection.reason.contains("550e8400-e29b-41") && !rejection.reason.contains(TWIN_A),
+        "the reason carries the prefix, not a device: {rejection:?}"
+    );
+
+    // Disconnecting one twin makes the same frame routable again — proof that
+    // the refusal is about the table, not about the id.
+    state.clients.write().await.remove(TWIN_B);
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of(TWIN_A)).await,
+        BinaryTarget::Unique(TWIN_A.to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_short_device_id_still_routes_and_is_not_a_wildcard() {
+    // Backward compatibility, both directions. Ids of 16 bytes or fewer are the
+    // whole field, so the rule leaves every short-id client working — including
+    // the ids in the rest of this suite.
+    let state = state_with_connected(&["device-1", "b145d"]).await;
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of("device-1")).await,
+        BinaryTarget::Unique("device-1".to_string())
+    );
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of("b145d")).await,
+        BinaryTarget::Unique("b145d".to_string())
+    );
+
+    // And because the comparison is equality on the padded field rather than a
+    // substring test, a short id does not also match a longer id beginning with
+    // it — `device-1` is a device, not a prefix.
+    let state = state_with_connected(&["device-1", "device-10"]).await;
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of("device-1")).await,
+        BinaryTarget::Unique("device-1".to_string())
+    );
+    assert_eq!(
+        resolve_binary_target(&state.clients, &target_field_of("device-10")).await,
+        BinaryTarget::Unique("device-10".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_uuid_frame_survives_verification_resolution_and_the_relay_reframe() {
+    // Producer -> relay -> receiver, with a 36-character id on both ends and the
+    // MAC checked on each side. This is the whole path the 16-byte field used to
+    // break: it verified, and then named a device nobody was.
+    let desktop = "550e8400-e29b-41d4-a716-446655440000";
+    let phone = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    let keys = TestRouteKeys;
+    let state = state_with_connected(&[desktop, phone]).await;
+    let payload = b"chunk-0-of-a-relayed-file";
+
+    // Producer: the phone signs with its own route key and names the desktop by
+    // its full id.
+    let inbound = binary_frame(phone, desktop, 1, payload);
+    let mut seq = None;
+    let verified = handle_binary_frame(&state, &keys, phone, &inbound, &mut seq)
+        .await
+        .expect("a well-formed frame from an authenticated device")
+        .expect("a frame with a payload has something to route");
+    assert_eq!(verified.payload, payload);
+
+    // Relay: the field resolves to the one connected device it names.
+    let target_id = match resolve_binary_target(&state.clients, &verified.target_field).await {
+        BinaryTarget::Unique(id) => id,
+        other => panic!("a 36-character target must resolve to one device, got {other:?}"),
+    };
+    assert_eq!(target_id, desktop);
+
+    // Relay: re-framed for the recipient, tagged with the sender it authenticated.
+    let reframed =
+        conduit_protocol::build_binary_frame(&e2e_route_key(phone), phone, &target_id, 1, payload);
+    assert_eq!(
+        &reframed[conduit_protocol::BINARY_HEADER_LEN..],
+        payload,
+        "the payload rides through the re-frame unchanged"
+    );
+
+    // Recipient: the field is its own canonical field, and nobody else's. This is
+    // the check that used to compare 16 bytes with a 36-character id and refuse.
+    let field: [u8; conduit_protocol::BINARY_DEVICE_ID_LEN] = reframed
+        [1..1 + conduit_protocol::BINARY_DEVICE_ID_LEN]
+        .try_into()
+        .expect("16 bytes");
+    assert!(conduit_protocol::binary_target_matches(desktop, &field));
+    assert!(
+        !conduit_protocol::binary_target_matches(phone, &field),
+        "the sender must not accept its own target field either"
+    );
+
+    // Recipient: and the tag verifies under the sender's route key, which is what
+    // it does with the frame before using a byte of the payload.
+    assert!(verify_binary_tag(
+        &keys,
+        phone,
+        &reframed,
+        payload,
+        &reframed[conduit_protocol::BINARY_TAG_OFFSET..conduit_protocol::BINARY_HEADER_LEN],
+    ));
 }
 
 // ---------------------------------------------------------------
@@ -2306,31 +2540,24 @@ async fn http_get_bearer(port: u16, path: &str, token: Option<&str>) -> (u16, St
 /// Build a v2 binary relay frame:
 /// `[0x02][target 16B][seq u32 BE][HMAC tag 32B][payload]`
 ///
-/// The tag is computed exactly as the relay computes it, including the
-/// sender-id binding, so these frames really are authenticated.
+/// Delegates to [`conduit_protocol::build_binary_frame`] — the same producer the
+/// relay re-frames with and the only definition of the 16-byte target field —
+/// rather than laying the bytes out here. It used to build the header itself,
+/// which meant the suite could only ever prove the suite agreed with itself: a
+/// test frame and a production frame were two independent implementations of the
+/// same layout, and nothing here would have noticed a rule changing in one of
+/// them. The tag is therefore real too, including the sender-id binding, so
+/// these frames really are authenticated.
 fn binary_frame(from_device: &str, target: &str, seq: u32, payload: &[u8]) -> Vec<u8> {
-    use conduit_protocol::{
-        BINARY_AUTHENTICATED_PREFIX_LEN, BINARY_DEVICE_ID_LEN, BINARY_FRAME_VERSION,
-        BINARY_HEADER_LEN, BINARY_TAG_LEN,
-    };
+    use conduit_protocol::BINARY_HEADER_LEN;
 
-    let mut frame = Vec::with_capacity(BINARY_HEADER_LEN + payload.len());
-    frame.push(BINARY_FRAME_VERSION);
-    let mut id = [0u8; BINARY_DEVICE_ID_LEN];
-    let bytes = target.as_bytes();
-    let n = bytes.len().min(BINARY_DEVICE_ID_LEN);
-    id[..n].copy_from_slice(&bytes[..n]);
-    frame.extend_from_slice(&id);
-    frame.extend_from_slice(&seq.to_be_bytes());
-
-    let mut authenticated = Vec::with_capacity(BINARY_AUTHENTICATED_PREFIX_LEN + payload.len());
-    authenticated.extend_from_slice(&frame[..BINARY_AUTHENTICATED_PREFIX_LEN]);
-    authenticated.extend_from_slice(payload);
-    let mac_input = binary_mac_input(from_device, &authenticated);
-    let tag = hmac::compute_hmac(&e2e_route_key(from_device), &hex::encode(&mac_input));
-    debug_assert_eq!(tag.len(), BINARY_TAG_LEN * 2, "tag must be 32 raw bytes");
-    frame.extend_from_slice(&hex::decode(&tag).expect("hex tag decodes"));
-    frame.extend_from_slice(payload);
+    let frame = conduit_protocol::build_binary_frame(
+        &e2e_route_key(from_device),
+        from_device,
+        target,
+        seq,
+        payload,
+    );
     debug_assert_eq!(
         frame.len(),
         BINARY_HEADER_LEN + payload.len(),
@@ -3081,6 +3308,234 @@ async fn e2e_binary_frame_routed_to_target_device() {
         .await,
         "binary route should count as messages_routed"
     );
+
+    drop(relay);
+}
+
+/// Assert nothing binary reaches `ws` for `secs`, and say who was watching.
+async fn assert_no_binary(ws: &mut WsClient, secs: u64, who: &str) {
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while tokio::time::Instant::now() < end {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => panic!(
+                "{who} received a {}-byte binary frame: the frame was delivered to a \
+                 device it must not have reached",
+                bytes.len()
+            ),
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => panic!("{who} connection failed: {e:?}"),
+            Ok(None) => panic!("{who} connection closed"),
+            Err(_) => continue,
+        }
+    }
+}
+
+#[tokio::test]
+async fn e2e_a_uuid_binary_frame_is_routed_to_the_recipient() {
+    // The end-to-end form of the 16-byte-field defect: 36-character ids on both
+    // ends, the same relay, a real socket. Nothing here fits in the target field.
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+    let desktop = "550e8400-e29b-41d4-a716-446655440000";
+    let phone = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+    let mut sender = ws_client(relay.ws_addr).await;
+    let mut recipient = ws_client(relay.ws_addr).await;
+    assert!(
+        authenticate(&mut sender, phone, E2E_RELAY_TOKEN)
+            .await
+            .unwrap_or_default()
+            .contains("relay_auth_ok")
+    );
+    assert!(
+        authenticate(&mut recipient, desktop, E2E_RELAY_TOKEN)
+            .await
+            .unwrap_or_default()
+            .contains("relay_auth_ok")
+    );
+
+    sender
+        .send(Message::Binary(binary_frame(
+            phone,
+            desktop,
+            1,
+            b"relayed-chunk",
+        )))
+        .await
+        .expect("send binary");
+
+    let end = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut got: Option<Vec<u8>> = None;
+    while tokio::time::Instant::now() < end && got.is_none() {
+        match tokio::time::timeout(std::time::Duration::from_secs(1), recipient.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => got = Some(bytes),
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    let bytes = got.expect("the named device must receive the frame");
+
+    // The recipient's own check: the field is its canonical field, and the tag
+    // names the sender the relay authenticated.
+    let field: [u8; conduit_protocol::BINARY_DEVICE_ID_LEN] = bytes
+        [1..1 + conduit_protocol::BINARY_DEVICE_ID_LEN]
+        .try_into()
+        .expect("16 bytes");
+    assert!(
+        conduit_protocol::binary_target_matches(desktop, &field),
+        "the frame must carry this device's canonical target field"
+    );
+    assert_eq!(
+        &bytes[conduit_protocol::BINARY_HEADER_LEN..],
+        b"relayed-chunk",
+        "the payload rides through unchanged"
+    );
+    let sender_key = state.route_keys.key_for(phone).expect("sender key");
+    let mut authenticated = Vec::new();
+    authenticated.extend_from_slice(&bytes[..conduit_protocol::BINARY_AUTHENTICATED_PREFIX_LEN]);
+    authenticated.extend_from_slice(&bytes[conduit_protocol::BINARY_HEADER_LEN..]);
+    let mac_input = hex::encode(conduit_protocol::binary_mac_input(phone, &authenticated));
+    let tag = hex::encode(
+        &bytes[conduit_protocol::BINARY_TAG_OFFSET..conduit_protocol::BINARY_HEADER_LEN],
+    );
+    assert!(
+        crate::hmac::verify_hmac(&sender_key, &mac_input, &tag),
+        "the relayed frame's tag must verify under the authenticated sender's key"
+    );
+
+    assert!(
+        wait_until(2000, || {
+            state.metrics.messages_routed.load(Ordering::Relaxed) >= 1
+        })
+        .await,
+        "a resolvable UUID target counts as messages_routed"
+    );
+
+    drop(relay);
+}
+
+#[tokio::test]
+async fn e2e_an_ambiguous_uuid_target_is_dropped_counted_and_delivered_to_neither() {
+    // Two connected devices whose ids agree on their first 16 bytes, and a frame
+    // naming both. The relay must refuse it, count it, and tell the sender —
+    // delivering it to either device would hand a file to the wrong one.
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+    let sender_id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+    let mut sender = ws_client(relay.ws_addr).await;
+    let mut twin_a = ws_client(relay.ws_addr).await;
+    let mut twin_b = ws_client(relay.ws_addr).await;
+    for (ws, id) in [
+        (&mut sender, sender_id),
+        (&mut twin_a, TWIN_A),
+        (&mut twin_b, TWIN_B),
+    ] {
+        let ok = authenticate(ws, id, E2E_RELAY_TOKEN)
+            .await
+            .unwrap_or_default();
+        assert!(
+            ok.contains("relay_auth_ok"),
+            "{id} failed to authenticate: {ok}"
+        );
+    }
+
+    sender
+        .send(Message::Binary(binary_frame(
+            sender_id,
+            TWIN_A,
+            1,
+            b"for-either-of-us",
+        )))
+        .await
+        .expect("send binary");
+
+    // Neither device may see it. Checked before the sender's error frame on
+    // purpose: this is the assertion that matters, and a relay that guessed
+    // would fail here rather than at the diagnostic below.
+    assert_no_binary(&mut twin_a, 1, TWIN_A).await;
+    assert_no_binary(&mut twin_b, 1, TWIN_B).await;
+
+    let answered =
+        recv_text_matching(&mut sender, 5, |t| t.contains("binary_target_ambiguous")).await;
+    let answered = answered.expect("the sender must be told the target is ambiguous");
+    assert!(
+        !answered.contains(TWIN_A) && !answered.contains(TWIN_B),
+        "the error may name the prefix, not a device: {answered}"
+    );
+
+    let counted = wait_until(2000, || {
+        state
+            .metrics
+            .messages_dropped_not_found
+            .load(Ordering::Relaxed)
+            >= 1
+    })
+    .await;
+    assert!(counted, "an ambiguous target must be counted as a drop");
+    assert_eq!(
+        state.metrics.messages_routed.load(Ordering::Relaxed),
+        0,
+        "nothing may be routed when the target is ambiguous"
+    );
+
+    drop(relay);
+}
+
+#[tokio::test]
+async fn e2e_an_unmatched_uuid_target_is_dropped_and_counted() {
+    // A field that resolves to nothing is dropped and counted too, and the sender
+    // is told — silently discarding an authentic frame is how the original defect
+    // hid for so long.
+    let state = e2e_state(1000);
+    let relay = spawn_relay(state.clone()).await;
+    let sender_id = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    let nobody = "00000000-0000-4000-8000-000000000000";
+
+    let mut sender = ws_client(relay.ws_addr).await;
+    let mut other = ws_client(relay.ws_addr).await;
+    assert!(
+        authenticate(&mut sender, sender_id, E2E_RELAY_TOKEN)
+            .await
+            .unwrap_or_default()
+            .contains("relay_auth_ok")
+    );
+    assert!(
+        authenticate(&mut other, TWIN_A, E2E_RELAY_TOKEN)
+            .await
+            .unwrap_or_default()
+            .contains("relay_auth_ok")
+    );
+
+    sender
+        .send(Message::Binary(binary_frame(
+            sender_id,
+            nobody,
+            1,
+            b"for-nobody",
+        )))
+        .await
+        .expect("send binary");
+
+    let answered = recv_text_matching(&mut sender, 5, |t| t.contains("binary_target_not_found"))
+        .await
+        .expect("the sender must be told its target is not connected");
+    assert!(
+        answered.contains("00000000-0000-4"),
+        "the error names the prefix that was looked up: {answered}"
+    );
+
+    assert_no_binary(&mut other, 1, TWIN_A).await;
+    let counted = wait_until(2000, || {
+        state
+            .metrics
+            .messages_dropped_not_found
+            .load(Ordering::Relaxed)
+            >= 1
+    })
+    .await;
+    assert!(counted, "an unresolvable target must be counted as a drop");
+    assert_eq!(state.metrics.messages_routed.load(Ordering::Relaxed), 0);
 
     drop(relay);
 }

@@ -25,15 +25,15 @@ const int nativeScreenCaptureMaxFrameBytes = 4 * 1024 * 1024;
 /// When the desktop asks to see a phone, the hub forwards `screen_mirror/
 /// start` to that phone, the phone starts native capture (`MediaProjection`
 /// on Android, `ReplayKit` on iOS) and the native side then pushes JPEG frames
-/// onto `EventChannel('com.conduit.mobile/events')` with the argument
-/// `screen_mirror` — see `ScreenMirrorService.kt:152-165` and
-/// `AppDelegate.swift:305-312`.
+/// onto `EventChannel('com.conduit.mobile/screen_mirror_events')` — see
+/// `ScreenMirrorService.kt:152-165` and `AppDelegate.swift:399`.
 ///
-/// Nothing on the Dart side read that stream. `notifications` and `calls` were
-/// the only two subscribers of the shared channel, so every frame the native
-/// capture produced was produced and discarded: capture started, the desktop's
-/// canvas stayed empty, and `handle_start` on the hub had already registered a
-/// viewer it never heard from again.
+/// Nothing on the Dart side read that stream. It was the third subscriber of a
+/// `com.conduit.mobile/events` channel shared with notifications and calls, and
+/// because `EventChannel` delivers to one sink per channel *name*, subscribing
+/// here registered last and silently killed the other two: every frame the
+/// native capture produced was produced and discarded, and so were every
+/// notification and call event. Each stream now owns its own channel name.
 ///
 /// # What it does *not* do
 ///
@@ -45,12 +45,11 @@ const int nativeScreenCaptureMaxFrameBytes = 4 * 1024 * 1024;
 /// in the `encrypted` envelope the hub verifies. This only supplies the
 /// missing reader.
 class NativeScreenCapture {
-  /// The channel the phone's native side publishes on. Shared with
-  /// notifications and calls; [streamArgument] is what keeps them apart.
-  static const EventChannel _channel = EventChannel('com.conduit.mobile/events');
-
-  /// The argument that selects this sink out of the shared channel.
-  static const String streamArgument = 'screen_mirror';
+  /// The channel the phone's native side publishes frames on. Dedicated to this
+  /// stream: see the class doc for why it must not be shared.
+  static const EventChannel _channel = EventChannel(
+    'com.conduit.mobile/screen_mirror_events',
+  );
 
   void Function(Map<String, dynamic>)? _sendMessage;
   StreamSubscription<dynamic>? _subscription;
@@ -81,7 +80,7 @@ class NativeScreenCapture {
   void attach() {
     if (_attached) return;
     _attached = true;
-    _subscription = _channel.receiveBroadcastStream(streamArgument).listen(
+    _subscription = _channel.receiveBroadcastStream().listen(
       _onNativeEvent,
       onError: (Object error) {
         debugPrint('Screen capture stream error: $error');
@@ -120,9 +119,9 @@ class NativeScreenCapture {
   ///    field speaks it, and a reader that rejects it drops every frame from
   ///    that build with no error anywhere.
   ///
-  /// Everything else is dropped. The channel is shared with notifications and
-  /// calls, and a screen frame is the user's screen: an event this reader does
-  /// not recognise is not something to guess at.
+  /// Everything else is dropped. The channel carries screen frames and nothing
+  /// else, and a frame is the user's screen: an event this reader does not
+  /// recognise is not something to guess at.
   static Map<String, dynamic>? normalizeNativeFrame(Object? event) {
     if (event is! Map) return null;
     final msg = Map<String, dynamic>.from(event);

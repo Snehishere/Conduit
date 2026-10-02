@@ -47,8 +47,8 @@ const REFUSAL_LINGER: std::time::Duration = std::time::Duration::from_millis(500
 
 use super::limits::{MAX_BINARY_SIZE, MAX_TEXT_SIZE, MessageRateLimiter, QUEUE_DEPTH};
 use super::route::{
-    NOT_WRAPPED_MSG, RejectionKind, forward_binary, forward_text, handle_binary_frame,
-    handle_relay_route, validate_device_id,
+    BinaryTarget, NOT_WRAPPED_MSG, RejectionKind, forward_binary, forward_text,
+    handle_binary_frame, handle_relay_route, resolve_binary_target, validate_device_id,
 };
 use super::state::{AppState, Queue, deregister_if_current};
 
@@ -567,6 +567,18 @@ pub(crate) async fn handle_connection<S>(
                                                     .messages_dropped_hmac_failed
                                                     .fetch_add(1, Ordering::Relaxed);
                                             }
+                                            // Unreachable here: a `relay_route`
+                                            // names its target by full device id,
+                                            // and it is `forward_text` that finds
+                                            // the table entry missing. Kept
+                                            // exhaustive so a new rejection kind
+                                            // cannot be added here by accident.
+                                            RejectionKind::Unroutable => {
+                                                state
+                                                    .metrics
+                                                    .messages_dropped_not_found
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
                                         }
                                         let _ = queue
                                             .send(error_frame(rejection.code, rejection.reason))
@@ -659,45 +671,86 @@ pub(crate) async fn handle_connection<S>(
                         .await
                         {
                             Ok(Some(frame)) => {
-                                // Re-frame rather than forward the stripped payload.
-                                //
-                                // The incoming frame was addressed to the recipient and
-                                // tagged for this connection's sender, which is exactly
-                                // right for verification but useless to the recipient:
-                                // the header the far end parses is gone, and the tag was
-                                // computed over a MAC input naming a sender it cannot
-                                // check. Building a fresh v2 frame here means the
-                                // recipient gets a well-formed frame whose tag names the
-                                // sender the relay actually authenticated.
-                                //
-                                // The sequence is re-based per recipient, which is what
-                                // the receiver's replay guard expects: it is monotonic per
-                                // sending connection, and this is a new connection from
-                                // the recipient's point of view.
-                                match state.route_keys.key_for(&my_id) {
-                                    Some(key) => {
-                                        delivery_seq = delivery_seq.wrapping_add(1);
-                                        let reframed = conduit_protocol::build_binary_frame(
-                                            &key,
-                                            &my_id,
-                                            &frame.target_id,
-                                            delivery_seq,
-                                            frame.payload,
-                                        );
-                                        forward_binary(&state, &my_id, &frame.target_id, &reframed)
-                                            .await;
+                                // The 16-byte target field is a *prefix* of a
+                                // device id, not a device id. Resolve it before
+                                // anything is re-framed or forwarded, so the
+                                // frame can only ever be built for a device that
+                                // was proved to be the one and only match.
+                                match resolve_binary_target(&state.clients, &frame.target_field)
+                                    .await
+                                {
+                                    BinaryTarget::Unique(target_id) => {
+                                        // Re-frame rather than forward the stripped payload.
+                                        //
+                                        // The incoming frame was addressed to the recipient and
+                                        // tagged for this connection's sender, which is exactly
+                                        // right for verification but useless to the recipient:
+                                        // the header the far end parses is gone, and the tag was
+                                        // computed over a MAC input naming a sender it cannot
+                                        // check. Building a fresh v2 frame here means the
+                                        // recipient gets a well-formed frame whose tag names the
+                                        // sender the relay actually authenticated.
+                                        //
+                                        // Naming the *resolved full* id is safe and does not
+                                        // change a byte of the header: the field is that id's
+                                        // first 16 bytes by construction, so re-encoding it
+                                        // here reproduces the field that just verified. That
+                                        // is the property that keeps the re-framed tag valid.
+                                        //
+                                        // The sequence is re-based per recipient, which is what
+                                        // the receiver's replay guard expects: it is monotonic per
+                                        // sending connection, and this is a new connection from
+                                        // the recipient's point of view.
+                                        match state.route_keys.key_for(&my_id) {
+                                            Some(key) => {
+                                                delivery_seq = delivery_seq.wrapping_add(1);
+                                                let reframed = conduit_protocol::build_binary_frame(
+                                                    &key,
+                                                    &my_id,
+                                                    &target_id,
+                                                    delivery_seq,
+                                                    frame.payload,
+                                                );
+                                                forward_binary(
+                                                    &state, &my_id, &target_id, &reframed,
+                                                )
+                                                .await;
+                                            }
+                                            None => {
+                                                // Unreachable: the tag verified under this
+                                                // device's key a moment ago.
+                                                warn!(
+                                                    "Dropping binary frame from {my_id}: route key \
+                                                     vanished mid-connection"
+                                                );
+                                                state
+                                                    .metrics
+                                                    .messages_dropped_hmac_failed
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
-                                    None => {
-                                        // Unreachable: the tag verified under this
-                                        // device's key a moment ago.
-                                        warn!(
-                                            "Dropping binary frame from {my_id}: route key \
-                                             vanished mid-connection"
-                                        );
+                                    // Zero matches, or more than one. Counted and
+                                    // answered, delivered to nobody: an ambiguous
+                                    // field is the case where guessing would put
+                                    // a file in front of the wrong device.
+                                    //
+                                    // The sequence number has already advanced
+                                    // (the frame was authentic, so it is not a
+                                    // replay), which is what stops a sender that
+                                    // keeps aiming at a missing device from
+                                    // re-sending one sequence number forever.
+                                    unroutable => {
+                                        let rejection =
+                                            unroutable.rejection(&my_id, frame.target_prefix);
+                                        warn!("Dropping binary frame: {}", rejection.reason);
                                         state
                                             .metrics
-                                            .messages_dropped_hmac_failed
+                                            .messages_dropped_not_found
                                             .fetch_add(1, Ordering::Relaxed);
+                                        let _ = queue
+                                            .send(error_frame(rejection.code, rejection.reason))
+                                            .await;
                                     }
                                 }
                             }
@@ -718,6 +771,22 @@ pub(crate) async fn handle_connection<S>(
                                         state
                                             .metrics
                                             .messages_dropped_hmac_failed
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    // The frame verified and there is simply no
+                                    // single device to hand it to. Counted with
+                                    // the other "nowhere to go" drops, which is
+                                    // what it is; a dedicated
+                                    // `messages_dropped_ambiguous` would read
+                                    // better but needs a new counter in
+                                    // `metrics.rs`, which does not exist. Note
+                                    // that a resolution failure never reaches
+                                    // here — it is answered in the `Ok` arm
+                                    // above — so this arm is defensive.
+                                    RejectionKind::Unroutable => {
+                                        state
+                                            .metrics
+                                            .messages_dropped_not_found
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                 }

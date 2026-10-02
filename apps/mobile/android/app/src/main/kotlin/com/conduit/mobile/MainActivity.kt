@@ -31,10 +31,11 @@ import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
     private val CHANNEL = "com.conduit.mobile/native"
-    private val EVENT_CHANNEL = "com.conduit.mobile/events"
+    private val NOTIFICATION_EVENT_CHANNEL = "com.conduit.mobile/notification_events"
+    private val CALL_EVENT_CHANNEL = "com.conduit.mobile/call_events"
+    private val SCREEN_MIRROR_EVENT_CHANNEL = "com.conduit.mobile/screen_mirror_events"
+    private val REMOTE_INPUT_EVENT_CHANNEL = "com.conduit.mobile/remote_input_events"
     private val SMS_EVENT_CHANNEL = "com.conduit.mobile/sms_events"
-    private val SCREEN_MIRROR_CHANNEL = "com.conduit.mobile/screen_mirror"
-    private val REMOTE_INPUT_CHANNEL = "com.conduit.mobile/remote_input"
     private val PERMISSION_REQUEST_CODE = 1001
     private val MEDIA_PROJECTION_REQUEST = 10001
 
@@ -100,35 +101,74 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        // Event Channel — streaming events (notifications, calls, screen mirror, remote input)
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
-            object : EventChannel.StreamHandler {
+        // --- Event Channels -------------------------------------------------
+        //
+        // One channel per stream, because the channel *name* is the only thing
+        // that can route an event. Dart registers its incoming handler by name
+        // alone (`channel_buffers.dart`: "Only one listener may be set at a
+        // time. Setting a new listener clears the previous one.") and
+        // `EventChannel.IncomingStreamRequestHandler` keeps one `activeSink` per
+        // name, so every stream on one shared name but the last to subscribe was
+        // dead: `notificationEventSink` and `callEventSink` were overwritten by
+        // the screen-mirror subscriber and every notification and call event was
+        // dropped before encoding.
+        //
+        // The listen argument is therefore not consulted. Each handler below
+        // touches only its own sink field, so a cancel on one channel can never
+        // take down a stream that is still live on another.
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, NOTIFICATION_EVENT_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
-                    val type = arguments as? String
-                    when (type) {
-                        "notifications" -> notificationEventSink = events
-                        "calls" -> callEventSink = events
-                        "screen_mirror" -> screenMirrorEventSink = events
-                        "remote_input" -> remoteInputEventSink = events
-                    }
+                    notificationEventSink = events
                     startListening()
                 }
 
                 override fun onCancel(arguments: Any?) {
-                    // Only tear down the stream that was actually cancelled.
-                    when (arguments as? String) {
-                        "notifications" -> notificationEventSink = null
-                        "calls" -> callEventSink = null
-                        "screen_mirror" -> screenMirrorEventSink = null
-                        "remote_input" -> remoteInputEventSink = null
-                        else -> {
-                            // Unknown — do not nuke all sinks; log only.
-                            android.util.Log.w("MainActivity", "EventChannel onCancel with unknown args: $arguments")
-                        }
-                    }
+                    // This sink only, and deliberately no stopListening(): the
+                    // notification receiver is shared with the call channel.
+                    // startListening() is guarded by `listeningStarted`, so the
+                    // next onListen re-uses the registration instead of adding a
+                    // second receiver.
+                    notificationEventSink = null
                 }
-            }
-        )
+            })
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, CALL_EVENT_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    callEventSink = events
+                    // Idempotent: whichever of the notification and call channels
+                    // subscribes first brings the shared listeners up.
+                    startListening()
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    callEventSink = null
+                }
+            })
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, SCREEN_MIRROR_EVENT_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    screenMirrorEventSink = events
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    screenMirrorEventSink = null
+                }
+            })
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, REMOTE_INPUT_EVENT_CHANNEL)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    remoteInputEventSink = events
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    remoteInputEventSink = null
+                }
+            })
 
         // SMS Event Channel — streaming incoming SMS to Flutter
         EventChannel(flutterEngine.dartExecutor.binaryMessenger, SMS_EVENT_CHANNEL).setStreamHandler(

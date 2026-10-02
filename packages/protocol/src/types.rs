@@ -1338,7 +1338,8 @@ pub struct AutomationActionPayload {
 ///
 /// ```text
 /// Byte  0:              version (0x02)
-/// Bytes 1..=16:         target device ID, ASCII, zero-padded to 16 bytes
+/// Bytes 1..=16:         target device ID: the id's first 16 bytes, NUL-padded
+///                        — exactly [`binary_target_field`], nothing else
 /// Bytes 17..=20:        sequence number, u32 big-endian
 ///                        (strictly increasing per sender connection)
 /// Bytes 21..=52:        HMAC-SHA256 tag (32 raw bytes) — see below
@@ -1366,7 +1367,18 @@ pub struct AutomationActionPayload {
 /// The relay rejects a frame whose tag does not verify, whose version is not
 /// `0x02`, whose target id is empty/invalid, or whose sequence number is not
 /// strictly greater than the previous accepted one on that connection.
+///
+/// The target id is a *prefix* of the full device id, so "whose target id is
+/// invalid" means "whose 16-byte field is not a UTF-8, non-empty id prefix", and
+/// a frame that verifies is not yet deliverable: the receiver of the bytes still
+/// has to resolve that prefix. See [`binary_target_field`].
 pub const BINARY_FRAME_VERSION: u8 = 0x02;
+/// Width of the target device id field, in bytes.
+///
+/// Sixteen, which is **smaller than every device id this protocol produces** — a
+/// `device_id` is a 36-character UUID. The field therefore holds the id's first
+/// sixteen bytes, and what that means for routing is defined by
+/// [`binary_target_field`], not by this constant.
 pub const BINARY_DEVICE_ID_LEN: usize = 16;
 /// Sequence-number field length (u32 big-endian).
 pub const BINARY_SEQ_LEN: usize = 4;
@@ -1378,6 +1390,138 @@ pub const BINARY_TAG_OFFSET: usize = 1 + BINARY_DEVICE_ID_LEN + BINARY_SEQ_LEN; 
 pub const BINARY_AUTHENTICATED_PREFIX_LEN: usize = BINARY_TAG_OFFSET; // 21
 /// Total fixed header: version + target id + sequence + tag.
 pub const BINARY_HEADER_LEN: usize = BINARY_TAG_OFFSET + BINARY_TAG_LEN; // 53
+
+/// Why a v2 frame's 16-byte target field could not be read back as a device id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryTargetFieldError {
+    /// The field is not valid UTF-8 — the producer split a multi-byte character.
+    NotUtf8,
+    /// The field was nothing but NUL padding.
+    Empty,
+}
+
+/// The 16 wire bytes that name `device_id` in a v2 binary frame.
+///
+/// **The rule, in one sentence:** the first [`BINARY_DEVICE_ID_LEN`] bytes of the
+/// id's UTF-8 encoding, NUL-padded, with no hashing, case folding, separator
+/// removal or length field.
+///
+/// This is the *only* definition of that field. The producer
+/// ([`build_binary_frame`]), the relay's router ([`binary_target_matches`]) and
+/// every receiver's identity check call it, so the four parties cannot disagree
+/// about what those 16 bytes mean. Truncation is by **byte**, not by character,
+/// matching the Dart implementation (`relay_route.dart`), which truncates
+/// `utf8.encode(targetDeviceId)`.
+///
+/// # Why a prefix at all
+///
+/// A `device_id` is a 36-character UUID (`Uuid::new_v4().to_string()` on the
+/// desktop; the per-connection UUID the pairing handshake falls back to on a
+/// phone) and 36 does not fit in 16. Widening the field is not available: the
+/// layout is already deployed and is pinned by tests in three languages, and
+/// those bytes are inside the MAC input, so a wider field would invalidate every
+/// tag in flight. The alternative considered and rejected — a truncated hash of
+/// the id — is a wire break in all but name, and is argued against below.
+///
+/// The prefix is not an authentication or routing decision on its own. The tag
+/// covers these exact 16 bytes (`frame[0..21]`), and the relay resolves the
+/// prefix to exactly one connected device before forwarding anything. A prefix
+/// that matches no connected device is dropped; one that matches two is dropped
+/// as ambiguous. Neither is ever delivered to a guess.
+///
+/// # What happens when two ids share a prefix
+///
+/// Nothing, and that is the point: two ids agreeing on their first 16 bytes are
+/// **identical on the wire**, so no encoding of 16 bytes could tell them apart.
+/// The consequences are therefore all in the resolver, not here:
+///
+/// * A frame naming a shared prefix resolves to *both* devices, so the relay
+///   must fail closed on ambiguity — count it and drop it — rather than pick one.
+///   Delivering it would hand a file to the wrong device.
+/// * A receiver whose own id is one of the two accepts the frame, so the relay
+///   is the only place that can enforce "exactly one"; that is why the drop has
+///   to happen before the re-frame, not after.
+/// * An id of 16 bytes or fewer is *never* ambiguous against a different id: the
+///   field is then the whole id, and NUL padding distinguishes `device-1` from
+///   `device-10`. Ambiguity needs ids longer than 16 bytes.
+///
+/// For a hyphenated UUIDv4 the first 16 characters carry 14 hex digits — 56 bits
+/// of the version's randomness — so a collision is not expected in practice
+/// (roughly `5e-11` across 10 000 devices, from the birthday bound), which is
+/// why resolution can be exact rather than merely likely.
+///
+/// # Why a prefix and not a hash of the id
+///
+/// A 128-bit digest of the id would make collisions astronomically unlikely
+/// rather than merely unlikely. It buys nothing here and costs three things:
+///
+/// * **Compatibility.** Truncation is what every deployed producer already
+///   writes — [`build_binary_frame`] on the relay's re-frame path,
+///   `buildBinaryFrame` on the phone. Redefining those same 16 bytes to be a
+///   digest would leave every in-flight and already-built frame unresolvable: a
+///   wire break dressed as a semantic one, with no version byte to announce it.
+/// * **The field's type.** It is NUL-padded ASCII and is read back as UTF-8 with
+///   trailing NULs stripped ([`parse_binary_target_field`]); a raw digest would
+///   change what the field *is*, not just what it means.
+/// * **Legibility.** In a hex dump the recipient's id is simply there — the first
+///   16 characters, readable. A digest identifies nobody without recomputing it
+///   against every registered device, which is exactly what an operator reading
+///   a packet capture at 3am does not want.
+///
+/// And the security case for a hash does not apply: ambiguity is handled fail
+/// closed by the resolver, and the tag authenticates the bytes regardless. The
+/// leading 14 hex digits of a UUIDv4 are not a secret either — the full id is
+/// already in the clear in `relay_auth`.
+pub fn binary_target_field(device_id: &str) -> [u8; BINARY_DEVICE_ID_LEN] {
+    let mut field = [0u8; BINARY_DEVICE_ID_LEN];
+    let bytes = device_id.as_bytes();
+    let n = bytes.len().min(BINARY_DEVICE_ID_LEN);
+    field[..n].copy_from_slice(&bytes[..n]);
+    field
+}
+
+/// Read a v2 frame's 16-byte target field back as the id prefix it carries:
+/// trailing NUL padding removed, nothing else.
+///
+/// The inverse of [`binary_target_field`] up to the loss of the padding, and the
+/// only place the padding is stripped. Both rejection modes fail closed: a field
+/// that is not UTF-8 cannot have come from a device id (see the doc comment on
+/// [`binary_target_field`]), and an all-NUL field names nothing.
+///
+/// Takes a slice rather than a fixed-size array so the result borrows from the
+/// caller's *frame*, not from a local copy of the field, which is what lets
+/// [`VerifiedBinaryFrame`](crate::VerifiedBinaryFrame)-style verifiers hand the
+/// prefix back with the frame's lifetime.
+pub fn parse_binary_target_field(field: &[u8]) -> Result<&str, BinaryTargetFieldError> {
+    let text = std::str::from_utf8(field).map_err(|_| BinaryTargetFieldError::NotUtf8)?;
+    let trimmed = text.trim_end_matches('\0');
+    if trimmed.is_empty() {
+        return Err(BinaryTargetFieldError::Empty);
+    }
+    Ok(trimmed)
+}
+
+/// Whether a v2 frame's target field names `device_id`.
+///
+/// The receiver-side identity check, and the same predicate the relay's router
+/// applies to every connected device: the field is a device's name if and only if
+/// it is byte-for-byte that device's [`binary_target_field`]. Because the
+/// comparison is equality on the canonical field rather than a substring test, a
+/// short id is not a wildcard — `device-1` does not match `device-10`, and a
+/// frame naming `device-1` does not match a longer id that begins with it.
+///
+/// Compared without early exit. Nothing secret is on either side of this (the
+/// target of a frame is public to everyone the relay routes between), so the
+/// timing is not the reason; it is one line either way and this way cannot grow
+/// one.
+pub fn binary_target_matches(device_id: &str, field: &[u8; BINARY_DEVICE_ID_LEN]) -> bool {
+    let expected = binary_target_field(device_id);
+    let mut diff = 0u8;
+    for (want, got) in expected.iter().zip(field.iter()) {
+        diff |= want ^ got;
+    }
+    diff == 0
+}
 
 /// Build a v2 binary frame addressed to `target_device_id` and tagged for
 /// `from_device_id`.
@@ -1398,12 +1542,12 @@ pub fn build_binary_frame(
     let mut frame = vec![0u8; BINARY_HEADER_LEN + payload.len()];
     frame[0] = BINARY_FRAME_VERSION;
 
-    // A 16-byte field cannot hold an arbitrarily long id. Truncation is safe
-    // here: the far side either matches on the full id or drops the frame, and
-    // the tag still covers the bytes actually sent.
-    let target = target_device_id.as_bytes();
-    let n = target.len().min(BINARY_DEVICE_ID_LEN);
-    frame[1..1 + n].copy_from_slice(&target[..n]);
+    // The target field is the canonical prefix of the full id, so an over-long
+    // id is *canonicalised* rather than rejected: the field holds its first 16
+    // bytes, the tag covers exactly those bytes, and the relay resolves them back
+    // to one connected device. See [`binary_target_field`] for why truncation is
+    // the rule and what two ids sharing a prefix mean.
+    frame[1..1 + BINARY_DEVICE_ID_LEN].copy_from_slice(&binary_target_field(target_device_id));
     frame[1 + BINARY_DEVICE_ID_LEN..1 + BINARY_DEVICE_ID_LEN + BINARY_SEQ_LEN]
         .copy_from_slice(&sequence.to_be_bytes());
 
@@ -1920,10 +2064,222 @@ mod tests {
     }
 
     #[test]
-    fn chunk_constants() {
-        assert_eq!(CHUNK_NONCE_LEN, 24);
-        assert_eq!(CHUNK_LEN_FIELD, 4);
-        assert_eq!(CHUNK_HEADER_LEN, 28);
+    fn the_dart_client_builds_the_same_frames() {
+        // The other half of the Dart suite's
+        // `binary frame interop with the Rust producer` group: those constants
+        // live in `apps/mobile/test/services/relay_route_test.dart` and were, until
+        // this test, a one-way pin — the Dart side could only prove it matched a
+        // value nobody on this side ever checked, so a change to the producer or to
+        // the target-field rule would have broken the phone with a green build here.
+        //
+        // `cafebabe`/`0123456789abcdef` fit the field, the 36-character UUID does
+        // not, and the last two are the branches that matter for the target rule:
+        // an id too long for the field, and a real device id.
+        let secret: Vec<u8> = (0u8..32).collect();
+        let key = crate::hmac::derive_route_key(&secret, "deadbeef");
+        let built = |target: &str, seq: u32, payload: &[u8]| {
+            hex::encode(build_binary_frame(&key, "deadbeef", target, seq, payload))
+        };
+
+        assert_eq!(
+            built("cafebabe", 7, b"hello"),
+            "026361666562616265000000000000000000000007b721e258479b9f7c7b4b0ca343acde53f\
+             1a495b884cb568297114c7dca056c5f68656c6c6f"
+                .replace(' ', ""),
+            "a short target id is NUL-padded to 16 bytes"
+        );
+        assert_eq!(
+            built("cafebabe", 1, b""),
+            "026361666562616265000000000000000000000001138f68922f828ce72b7573213db3e\
+             2f798245c651512f1155623ce3aeb7ee865"
+                .replace(' ', ""),
+            "an empty payload is the 53-byte minimum"
+        );
+        assert_eq!(
+            built("0123456789abcdef", 0x01020304, b"the quick brown fox"),
+            "02303132333435363738396162636465660102030475dcdfbaa081e2127b1d6df93df6de\
+             99614b28792e84b5e40baedfa4a1d826b874686520717569636b2062726f776e20666f78"
+                .replace(' ', ""),
+            "a full 16-byte target id is not padded"
+        );
+        assert_eq!(
+            built("0123456789abcdefEXTRA", 2, b"x"),
+            "0230313233343536373839616263646566000000022129374e159f29fd2130c0bd1f17b\
+             616dee807e3994120f91bcbb0e35fcffb6178"
+                .replace(' ', ""),
+            "an over-long id is canonicalised to its first 16 bytes"
+        );
+        // The vector that made this a defect rather than an edge case: a real
+        // device id, 36 characters, addressed by a 16-byte field. `35353065383430
+        // 302d653239622d3431` is "550e8400-e29b-41" — the id's first 16 bytes and
+        // nothing else.
+        assert_eq!(
+            built("550e8400-e29b-41d4-a716-446655440000", 9, b"file-chunk"),
+            "0235353065383430302d653239622d343100000009032b8e9c8245ecb70eac249da51aad2\
+             851efb926aec7bd389496aa1ccd308c9066696c652d6368756e6b"
+                .replace(' ', ""),
+            "a 36-character UUID is carried as its 16-byte prefix"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    //  The 16-byte target field
+    //
+    //  One definition, four parties: the producer below, the relay's router
+    //  (`resolve_binary_target`), and both receivers' identity checks. These
+    //  tests use 36-character UUIDs, because an id short enough to fit the field
+    //  cannot tell any of this apart.
+    // ---------------------------------------------------------------
+
+    const DESKTOP: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const PHONE: &str = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+
+    #[test]
+    fn the_target_field_is_the_first_sixteen_bytes_nul_padded() {
+        assert_eq!(
+            binary_target_field(PHONE).to_vec(),
+            b"3f2504e0-4f89-11".to_vec(),
+            "a 36-character UUID fills the field exactly: 16 characters, 16 bytes"
+        );
+        assert_eq!(
+            binary_target_field("b145d"),
+            [b'b', b'1', b'4', b'5', b'd', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "a short id is the whole field, NUL-padded"
+        );
+        assert_eq!(
+            binary_target_field(""),
+            [0u8; BINARY_DEVICE_ID_LEN],
+            "an empty id is all padding, which no reader accepts"
+        );
+    }
+
+    #[test]
+    fn the_target_field_is_the_same_every_time() {
+        // It has to be: the relay resolves the field against a routing table it
+        // reads whenever a device connects, and the sender computes it whenever a
+        // chunk is built. A rule that depended on time, length or ordering would
+        // make those two disagree.
+        assert_eq!(binary_target_field(DESKTOP), binary_target_field(DESKTOP));
+    }
+
+    #[test]
+    fn truncating_the_field_again_is_a_no_op() {
+        // The relay re-frames with the *resolved full* id, so the field it writes
+        // must come out byte-identical to the field it verified — otherwise the
+        // tag it stamps covers bytes the recipient never sees.
+        let field = binary_target_field(DESKTOP);
+        let prefix = parse_binary_target_field(&field).expect("a UUID prefix is UTF-8");
+        assert_eq!(binary_target_field(prefix), field);
+    }
+
+    #[test]
+    fn two_ids_sharing_a_prefix_produce_the_same_field() {
+        // The case the resolver has to fail closed on. Nothing here can separate
+        // them: they are the same 16 bytes.
+        let other = "550e8400-e29b-41d4-b716-446655440000";
+        assert_ne!(DESKTOP, other);
+        assert_eq!(&DESKTOP[..16], &other[..16]);
+        assert_eq!(binary_target_field(DESKTOP), binary_target_field(other));
+        assert!(binary_target_matches(DESKTOP, &binary_target_field(other)));
+        assert!(binary_target_matches(other, &binary_target_field(DESKTOP)));
+    }
+
+    #[test]
+    fn a_target_field_matches_only_its_own_device() {
+        assert!(binary_target_matches(
+            DESKTOP,
+            &binary_target_field(DESKTOP)
+        ));
+        assert!(binary_target_matches(PHONE, &binary_target_field(PHONE)));
+        assert!(
+            !binary_target_matches(PHONE, &binary_target_field(DESKTOP)),
+            "a frame addressed to the desktop is not this phone's"
+        );
+        // NUL padding is part of the comparison, so a short id is a device and not
+        // a prefix: `device-1` does not also claim `device-10`.
+        assert!(binary_target_matches(
+            "device-1",
+            &binary_target_field("device-1")
+        ));
+        assert!(!binary_target_matches(
+            "device-10",
+            &binary_target_field("device-1")
+        ));
+        assert!(!binary_target_matches(
+            "device-1",
+            &binary_target_field("device-10")
+        ));
+    }
+
+    #[test]
+    fn reading_a_field_back_strips_only_the_padding() {
+        assert_eq!(
+            parse_binary_target_field(&binary_target_field(PHONE)).expect("UTF-8"),
+            "3f2504e0-4f89-11"
+        );
+        assert_eq!(
+            parse_binary_target_field(&binary_target_field("b145d")).expect("UTF-8"),
+            "b145d"
+        );
+        assert_eq!(
+            parse_binary_target_field(&[0u8; BINARY_DEVICE_ID_LEN]),
+            Err(BinaryTargetFieldError::Empty)
+        );
+        assert_eq!(
+            parse_binary_target_field(&binary_target_field(DESKTOP)),
+            Ok("550e8400-e29b-41"),
+            "36 characters do not fit; the field reads back as the prefix"
+        );
+    }
+
+    #[test]
+    fn a_non_ascii_id_is_not_silently_mangled() {
+        // Byte truncation can split a multi-byte character, and the resulting field
+        // is not UTF-8. Every reader refuses it, which is the point: such a device
+        // cannot be named, and the frame fails closed instead of naming something
+        // else. (A `device_id` is hex and hyphens, so this cannot arise in
+        // practice — it is here so the failure mode is pinned rather than assumed.)
+        let id = "日本語のデバイス名です";
+        let bytes = id.as_bytes();
+        assert!(
+            bytes.len() > BINARY_DEVICE_ID_LEN && BINARY_DEVICE_ID_LEN % 3 == 1,
+            "byte {} of this id must land inside a 3-byte character for the test to \
+             mean anything",
+            BINARY_DEVICE_ID_LEN
+        );
+        let field = binary_target_field(id);
+        assert_eq!(field.to_vec(), bytes[..BINARY_DEVICE_ID_LEN].to_vec());
+        assert_eq!(
+            parse_binary_target_field(&field),
+            Err(BinaryTargetFieldError::NotUtf8),
+            "a split code point must not decode to a shorter id"
+        );
+    }
+
+    #[test]
+    fn the_field_is_covered_by_the_tag() {
+        // Retargeting a frame without re-signing it must fail, and the reason it
+        // does is that these bytes are inside the MAC input.
+        let secret: Vec<u8> = (0u8..32).collect();
+        let key = crate::hmac::derive_route_key(&secret, "deadbeef");
+        let mut frame = build_binary_frame(&key, "deadbeef", DESKTOP, 1, b"payload");
+        assert!(binary_target_matches(
+            DESKTOP,
+            frame[1..1 + BINARY_DEVICE_ID_LEN]
+                .try_into()
+                .expect("16 bytes")
+        ));
+        frame[1..1 + BINARY_DEVICE_ID_LEN].copy_from_slice(&binary_target_field(PHONE));
+
+        let payload = &frame[BINARY_HEADER_LEN..];
+        let tag = hex::encode(&frame[BINARY_TAG_OFFSET..BINARY_HEADER_LEN]);
+        let mut authenticated = frame[..BINARY_AUTHENTICATED_PREFIX_LEN].to_vec();
+        authenticated.extend_from_slice(payload);
+        let expected = crate::hmac::compute_hmac(
+            &key,
+            &hex::encode(binary_mac_input("deadbeef", &authenticated)),
+        );
+        assert_ne!(tag, expected, "a retargeted frame must not verify");
     }
 
     // ---------------------------------------------------------------

@@ -8,49 +8,42 @@ import ReplayKit
 
 // MARK: - FlutterStreamHandler
 
-/// A unified stream handler that routes events by the argument passed from
-/// `EventChannel.receiveBroadcastStream(arguments)`.
+/// A stream handler for a channel that carries exactly one stream.
 ///
-/// Each call to `receiveBroadcastStream('notifications')`, `('calls')`, etc.
-/// triggers a separate `onListen` invocation with the corresponding argument.
+/// This used to hold one sink *per listen argument*, which is not a thing the
+/// platform offers: Dart registers its incoming handler by channel name alone
+/// (`channel_buffers.dart`: "Only one listener may be set at a time. Setting a
+/// new listener clears the previous one.") and `FlutterEventChannel` keeps a
+/// single sink per name, so three streams sharing `com.conduit.mobile/events`
+/// left only the last subscriber alive. Each stream now owns its channel, and
+/// the argument is ignored rather than treated as a routing key.
 class ConduitStreamHandler: NSObject, FlutterStreamHandler {
-    /// Maps argument strings to their active EventSinks.
-    private var sinks: [String: FlutterEventSink] = [:]
+    /// The single active sink for this channel, or nil when nothing listens.
+    private var sink: FlutterEventSink?
     private let lock = NSLock()
 
     func onListen(arguments: Any?, events: @escaping FlutterEventSink?) -> FlutterError? {
-        guard let type = arguments as? String else {
-            return FlutterError(code: "INVALID_ARGS",
-                                message: "Stream argument must be a string",
-                                details: nil)
-        }
         lock.lock()
-        sinks[type] = events
+        sink = events
         lock.unlock()
         return nil
     }
 
     func onCancel(arguments: Any?) -> FlutterError? {
-        guard let type = arguments as? String else { return nil }
         lock.lock()
-        sinks.removeValue(forKey: type)
+        sink = nil
         lock.unlock()
         return nil
     }
 
-    /// Send an event to a specific stream type.
-    func send(type: String, event: Any) {
+    /// Send an event to this channel's sink, if one is listening.
+    func send(event: Any) {
         lock.lock()
-        let sink = sinks[type]
+        let target = sink
         lock.unlock()
         DispatchQueue.main.async {
-            sink?(event)
+            target?(event)
         }
-    }
-
-    /// Convenience: send a dictionary event.
-    func send(type: String, data: [String: Any]) {
-        send(type: type, event: data)
     }
 }
 
@@ -63,8 +56,10 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
     private let callObserver = CXCallObserver()
     private var lastCallState: [String: Any] = ["state": "idle"]
 
-    // Event channels
-    private var mainStreamHandler: ConduitStreamHandler!
+    // Event channels, one handler (and therefore one sink) each.
+    private var notificationStreamHandler: ConduitStreamHandler!
+    private var callStreamHandler: ConduitStreamHandler!
+    private var screenMirrorStreamHandler: ConduitStreamHandler!
     private var smsStreamHandler: ConduitStreamHandler!
 
     // Screen mirror state
@@ -87,8 +82,14 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
         let messenger = controller.binaryMessenger
 
         // ── Stream Handlers ──────────────────────────────────────────────
-        mainStreamHandler = ConduitStreamHandler()
-        smsStreamHandler   = ConduitStreamHandler()
+        // One per EventChannel. These must not be shared or pooled: a
+        // FlutterEventChannel delivers every event to one sink, so a shared
+        // handler would give the streams the same sink and only the last
+        // subscription would see anything.
+        notificationStreamHandler = ConduitStreamHandler()
+        callStreamHandler       = ConduitStreamHandler()
+        screenMirrorStreamHandler = ConduitStreamHandler()
+        smsStreamHandler        = ConduitStreamHandler()
 
         // ── Method Channel ───────────────────────────────────────────────
         let nativeChannel = FlutterMethodChannel(name: "com.conduit.mobile/native", binaryMessenger: messenger)
@@ -156,9 +157,19 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
         }
 
         // ── Event Channels ───────────────────────────────────────────────
-        // Main events: notifications, calls, screen_mirror
-        EventChannel(name: "com.conduit.mobile/events", binaryMessenger: messenger)
-            .setStreamHandler(mainStreamHandler)
+        // One channel per stream; the name is what routes an event. The
+        // Dart side reads `notification_events` in NotificationService,
+        // `call_events` in CallService and `screen_mirror_events` in
+        // NativeScreenCapture. Android registers the same three names in
+        // MainActivity.kt.
+        EventChannel(name: "com.conduit.mobile/notification_events", binaryMessenger: messenger)
+            .setStreamHandler(notificationStreamHandler)
+
+        EventChannel(name: "com.conduit.mobile/call_events", binaryMessenger: messenger)
+            .setStreamHandler(callStreamHandler)
+
+        EventChannel(name: "com.conduit.mobile/screen_mirror_events", binaryMessenger: messenger)
+            .setStreamHandler(screenMirrorStreamHandler)
 
         // SMS events (Android-only on iOS; handler exists for API symmetry)
         EventChannel(name: "com.conduit.mobile/sms_events", binaryMessenger: messenger)
@@ -262,7 +273,7 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
             "state": state,
             "number": call.handle.value
         ]
-        mainStreamHandler.send(type: "calls", data: event)
+        callStreamHandler.send(event: event)
     }
 
     // MARK: - Screen Mirror (ReplayKit)
@@ -385,7 +396,7 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
                 "height": Int(newSize.height),
                 "timestamp": Int(Date().timeIntervalSince1970 * 1000)
             ]
-            self.mainStreamHandler.send(type: "screen_mirror", data: event)
+            self.screenMirrorStreamHandler.send(event: event)
         }, completionHandler: { [weak self] error in
             DispatchQueue.main.async {
                 guard let self = self else {
@@ -532,7 +543,7 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
             "body": content.body,
             "timestamp": Int(notification.date.timeIntervalSince1970)
         ]
-        mainStreamHandler.send(type: "notifications", data: event)
+        notificationStreamHandler.send(event: event)
 
         // Also show the notification banner as normal
         completionHandler([.banner, .sound])
@@ -547,7 +558,7 @@ extension AppDelegate: UNUserNotificationCenterDelegate {
             "action": "open",
             "id": response.notification.request.identifier
         ]
-        mainStreamHandler.send(type: "notifications", data: event)
+        notificationStreamHandler.send(event: event)
         completionHandler()
     }
 }

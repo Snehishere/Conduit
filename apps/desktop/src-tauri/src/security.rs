@@ -146,20 +146,61 @@ impl TypeLimitConfig {
 ///
 /// Each top-level `type` field gets its own bucket with limits tuned to the
 /// expected throughput of that feature area.
+///
+/// # How the pair of numbers is chosen
+///
+/// `max_messages` is only meaningful *together with* `window`; either number on
+/// its own is noise. The pair is the budget, and the two shapes of budget below
+/// exist for two different kinds of traffic:
+///
+/// * **Continuous media** (`screen_mirror`, `audio`) gets a **one-second**
+///   window. A stream is not bursty, it is *sustained*, so the only budget that
+///   can admit one is measured per second. A 60 s window cannot admit a stream
+///   at all: it admits the first second and then refuses for the remaining 59.
+///   This is what `60, 60` used to say for both types — 60 messages per
+///   *minute* against a documented need of ~60 messages per *second*, so a
+///   mirror died after one second of frames and audio after two.
+/// * **Everything else** keeps a **10–60 s** window. These features genuinely
+///   arrive in bursts — a paste, a backlog of notifications, a run of 64 KiB
+///   chunks — and a long window is what lets the burst through while still
+///   bounding the sustained average.
+///
+/// Raising a streaming type's `max_messages` while leaving its window at 60 s
+/// would not fix that: it only makes the first minute's burst larger before the
+/// same starvation. The window is the fix.
 fn type_limit_for(msg_type: &str) -> TypeLimitConfig {
     match msg_type {
-        // Security — prevent brute-force pairing attempts
+        // Security — prevent brute-force pairing attempts. Deliberately tiny:
+        // this is the one budget whose job is to be small, because
+        // `pairing/request` carries a *guessed* token and 5/min is what makes
+        // guessing useless. It is the only pairing action charged here — the
+        // actions that complete or tear down a handshake are control actions
+        // (see `is_control_action`), so a user who mistypes a token is not then
+        // locked out of retrying it for a minute.
         "pairing" => TypeLimitConfig::new(5, 60),
-        // High throughput for large file transfers (chunks, progress, etc.)
-        "file" => TypeLimitConfig::new(500, 60),
-        // Screen mirror frames: ~30 fps × 2 msgs each
-        "screen_mirror" => TypeLimitConfig::new(60, 60),
-        // Audio streaming: 48 kHz mono ≈ ~30 msgs/sec
-        "audio" => TypeLimitConfig::new(60, 60),
-        // Clipboard sync — typing speed
-        "clipboard" => TypeLimitConfig::new(30, 60),
-        // Notification batches
-        "notification" => TypeLimitConfig::new(100, 60),
+        // High throughput for large file transfers (chunks, progress, etc.).
+        // 64 KiB chunks: the byte budget in `RateLimitConfig::default` is sized
+        // for the ~3 MB/s such a stream needs, which is ~2800 chunks/min — so
+        // 500/min throttled a phone→desktop push to a fifth of its rate and the
+        // transfer stalled. 3000 per 60 s admits the documented stream with
+        // headroom. The window stays long because chunks arrive in bursts
+        // around each read, not smoothly.
+        "file" => TypeLimitConfig::new(3_000, 60),
+        // Screen mirror frames: ~30 fps × 2 msgs each = ~60 msgs/sec sustained,
+        // and 15–30 frames/sec measured inbound. One-second window, budget 2×
+        // the documented peak.
+        "screen_mirror" => TypeLimitConfig::new(120, 1),
+        // Audio streaming: 48 kHz mono ≈ ~30 msgs/sec documented, 10–50/sec
+        // measured. One-second window, budget above the measured peak.
+        "audio" => TypeLimitConfig::new(100, 1),
+        // Clipboard sync — one frame per copy. The desktop's own watcher polls
+        // at 1 Hz, so a sender's ceiling is 1/s; 30 per 10 s absorbs a
+        // paste-heavy burst without letting a peer flood the history table.
+        // (This used to be annotated "typing speed", which is not what it is:
+        // nothing is sent per keystroke, only on a change of clipboard content.)
+        "clipboard" => TypeLimitConfig::new(30, 10),
+        // Notification batches — bursts when an app syncs its backlog.
+        "notification" => TypeLimitConfig::new(100, 10),
         // Automation triggers — low frequency
         "automation" => TypeLimitConfig::new(20, 60),
         // Status updates — heartbeats + battery
@@ -169,15 +210,86 @@ fn type_limit_for(msg_type: &str) -> TypeLimitConfig {
     }
 }
 
+/// Bucket-key suffix for the ordinary (data) frames of a message type.
+const DATA_BUCKET: &str = "d";
+/// Bucket-key suffix for the control actions of a message type.
+const CONTROL_BUCKET: &str = "c";
+
+/// Message-cap and window for the control bucket, which is keyed
+/// `(client_id, msg_type, "c")` and so is independent of the data bucket for
+/// the same type.
+///
+/// Generous on purpose. These are the handful of frames per session that start,
+/// stop or settle something, so this budget exists to keep them **bounded**, not
+/// to refuse them. It shares the 60 s shape of the other long-window budgets.
+const CONTROL_MAX_MESSAGES: u32 = 60;
+const CONTROL_WINDOW_SECS: u64 = 60;
+
+/// Whether `action` on `msg_type` is a **control action**: a frame that starts,
+/// stops or settles a stream or a transfer, or a handshake/teardown step whose
+/// loss cannot be recovered by retrying the same frame.
+///
+/// # Why these need a budget of their own
+///
+/// The bucket key is `(client_id, msg_type)`, so every action of a type shares
+/// one budget. That is the right default — it is what stops a `file/chunk`
+/// flood from spending the `pairing` budget — but it has a failure mode that no
+/// larger number can fix: **a stream starves the frame that ends it.** After 60
+/// `screen_mirror/frame` messages the `(peer, screen_mirror)` bucket is spent,
+/// so the `screen_mirror/stop` that arrives next is refused: the stream cannot
+/// be stopped and the session only ends when the peer disconnects. Charging
+/// control actions to a separate bucket removes the coupling while leaving the
+/// data budget exactly as tight as it was.
+///
+/// # What is deliberately not exempt
+///
+/// * `pairing/request` — the brute-force vector, and the whole reason the
+///   `pairing` budget is 5/min. `pairing/accept` and `pairing/local_auth` *are*
+///   exempt because they are authenticated by something the sender must already
+///   hold (a one-time token, the per-launch local capability), so they cannot be
+///   used to guess anything.
+/// * `file/chunk`, `file/progress`, `audio/stream_data`,
+///   `audio/playback_data`, `screen_mirror/frame` — the payload. These are
+///   exactly what the data budget exists to bound.
+fn is_control_action(msg_type: &str, action: &str) -> bool {
+    match msg_type {
+        // Start/stop the stream, and the stream's own goodbye.
+        "screen_mirror" => matches!(action, "start" | "stop" | "capture_stopped"),
+        // Start/stop capture and playback, plus the two acks that answer them.
+        "audio" => matches!(
+            action,
+            "stream_start"
+                | "stream_stop"
+                | "stream_started"
+                | "playback_start"
+                | "playback_stop"
+                | "playback_started"
+        ),
+        // Everything that settles a transfer's lifecycle. `file/chunk` and
+        // `file/progress` are the data and stay in the data bucket.
+        "file" => matches!(action, "accept" | "cancel" | "complete" | "resume"),
+        // Complete or tear down an authenticated handshake. `request` is
+        // excluded on purpose — see above.
+        "pairing" => matches!(action, "accept" | "local_auth" | "revoke"),
+        // Forgetting a peer.
+        "discovery" => action == "remove",
+        _ => false,
+    }
+}
+
 /// Per-message-type rate limiter.
 ///
 /// Maintains a separate sliding-window bucket for every `(client_id, msg_type)`
 /// pair.  This prevents high-throughput types (e.g. `file/chunk`) from
 /// starving low-volume types (e.g. `pairing`) and vice-versa.
 ///
+/// A message type has **two** buckets, not one: the ordinary per-type bucket,
+/// and a control bucket for the actions listed in [`is_control_action`]. The
+/// control bucket is what stops a stream from starving its own stop frame.
+///
 /// Usage:
 /// ```ignore
-/// if !per_type_limiter.check_type_limit(client_id, msg_type).await {
+/// if !per_type_limiter.check_type_action_limit(client_id, msg_type, action).await {
 ///     warn!("Per-type rate limited");
 ///     return;
 /// }
@@ -208,9 +320,42 @@ impl PerTypeRateLimiter {
 
     /// Returns `true` if the message is allowed, `false` if the per-type
     /// limit has been exceeded.
+    ///
+    /// The action-less form of [`Self::check_type_action_limit`]: a frame with
+    /// no action is never a control action, so this charges the ordinary
+    /// `(client_id, msg_type)` bucket. It exists for the type-level tests —
+    /// including the handler tests that exercise a *type's* budget without
+    /// caring which action spends it — while the dispatcher uses the
+    /// action-aware form, which is what exempts control actions.
+    #[cfg(test)]
     pub async fn check_type_limit(&self, client_id: &str, message_type: &str) -> bool {
-        let limit = type_limit_for(message_type);
-        let bucket_key = format!("{}:{}", client_id, message_type);
+        self.check_type_action_limit(client_id, message_type, "")
+            .await
+    }
+
+    /// Action-aware form of [`Self::check_type_limit`].
+    ///
+    /// A control action is charged to `(client_id, msg_type, "c")` with its own
+    /// budget, so a stream of `screen_mirror/frame` cannot spend the budget of
+    /// the `screen_mirror/stop` that follows it. Every other frame shares the
+    /// ordinary per-type bucket, unchanged.
+    pub async fn check_type_action_limit(
+        &self,
+        client_id: &str,
+        message_type: &str,
+        action: &str,
+    ) -> bool {
+        let control = is_control_action(message_type, action);
+        let limit = if control {
+            TypeLimitConfig::new(CONTROL_MAX_MESSAGES, CONTROL_WINDOW_SECS)
+        } else {
+            type_limit_for(message_type)
+        };
+        let bucket_key = format!(
+            "{}:{message_type}:{}",
+            client_id,
+            if control { CONTROL_BUCKET } else { DATA_BUCKET }
+        );
         let mut buckets = self.buckets.write().await;
         let now = Instant::now();
 
@@ -1306,8 +1451,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_per_type_high_throughput_file_limit() {
         let limiter = PerTypeRateLimiter::new();
-        // "file" allows 500 per 60s — 500 should all pass
-        for i in 0..500 {
+        // Driven off the configured budget rather than a literal, because this
+        // test used to pin the number 500 in two places: when `file` was raised
+        // to a budget that admits a real 64 KiB chunk stream, only the
+        // configuration test failed, and this one kept asserting a throughput
+        // the product no longer claimed. The limit is still enforced; the
+        // *value* now has exactly one home.
+        let budget = type_limit_for("file").max_messages;
+        for i in 0..budget {
             assert!(
                 limiter.check_type_limit("client1", "file").await,
                 "file message {} should be allowed",
@@ -1316,7 +1467,8 @@ mod tests {
         }
         assert!(
             !limiter.check_type_limit("client1", "file").await,
-            "501st file message should be rate-limited",
+            "message {} of file should be rate-limited",
+            budget + 1,
         );
     }
 
@@ -1379,18 +1531,343 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_type_limit_config_values() {
-        // Verify the configuration map has the expected limits
+    /// The configured budgets, as `(max_messages, window_secs)` pairs.
+    ///
+    /// Both numbers are pinned because only pinning `max_messages` is what let
+    /// this table drift in the first place: every streaming type was configured
+    /// as 60 messages per **60 seconds** while the comment beside it claimed a
+    /// need of ~60 messages per **second**, and a test that only compared
+    /// `max_messages` could not see the difference. `screen_mirror` at
+    /// `(60, 60)` and at `(120, 1)` differ by a factor of 120 in sustained
+    /// throughput and the old assertion was happy with both.
+    #[test]
+    fn test_type_limit_config_values() {
+        // pairing — brute-force protection, deliberately tiny and unchanged.
         assert_eq!(type_limit_for("pairing").max_messages, 5);
-        assert_eq!(type_limit_for("file").max_messages, 500);
-        assert_eq!(type_limit_for("screen_mirror").max_messages, 60);
-        assert_eq!(type_limit_for("audio").max_messages, 60);
+        assert_eq!(type_limit_for("pairing").window, Duration::from_secs(60));
+        // file — a 64 KiB chunk stream is ~2800 chunks/min (~3 MB/s, the rate
+        // `RateLimitConfig::default`'s byte budget is sized for).
+        assert_eq!(type_limit_for("file").max_messages, 3_000);
+        assert_eq!(type_limit_for("file").window, Duration::from_secs(60));
+        // screen_mirror — ~30 fps x 2 msgs = ~60/s, so a 1 s window at 2x.
+        assert_eq!(type_limit_for("screen_mirror").max_messages, 120);
+        assert_eq!(
+            type_limit_for("screen_mirror").window,
+            Duration::from_secs(1)
+        );
+        // audio — ~30 msgs/s documented, 10-50/s measured.
+        assert_eq!(type_limit_for("audio").max_messages, 100);
+        assert_eq!(type_limit_for("audio").window, Duration::from_secs(1));
+        // clipboard — a sender's ceiling is one frame per copy (1 Hz poller).
         assert_eq!(type_limit_for("clipboard").max_messages, 30);
+        assert_eq!(type_limit_for("clipboard").window, Duration::from_secs(10));
+        // notification — bursty backlog syncs.
         assert_eq!(type_limit_for("notification").max_messages, 100);
+        assert_eq!(
+            type_limit_for("notification").window,
+            Duration::from_secs(10)
+        );
         assert_eq!(type_limit_for("automation").max_messages, 20);
+        assert_eq!(type_limit_for("automation").window, Duration::from_secs(60));
         assert_eq!(type_limit_for("status").max_messages, 60);
+        assert_eq!(type_limit_for("status").window, Duration::from_secs(60));
         assert_eq!(type_limit_for("default_unknown").max_messages, 100); // default
+        assert_eq!(
+            type_limit_for("default_unknown").window,
+            Duration::from_secs(60)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming budgets and control-action exemption
+    //
+    // A stream's rate is a *sustained* rate, so it can only be admitted by a
+    // budget measured per second. Every test below sends its whole burst with
+    // no sleeping at all, which is strictly harder than the real traffic it
+    // models: the old `60, 60` configuration refused all of them.
+    // -----------------------------------------------------------------------
+
+    /// REGRESSION: a sustained `screen_mirror` stream is admitted.
+    ///
+    /// ~30 fps x 2 messages each is ~60/s, so a one-second budget of 120 has to
+    /// admit 120 frames sent back-to-back. The count is absolute rather than
+    /// read from `type_limit_for` on purpose: this asserts the *documented
+    /// throughput*, so restoring the old `(60, 60)` budget makes it fail at the
+    /// 61st frame instead of quietly re-asserting whatever is configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sustained_screen_mirror_stream_is_admitted() {
+        let limiter = PerTypeRateLimiter::new();
+        for i in 0..120 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "screen_mirror", "frame")
+                    .await,
+                "screen_mirror frame {} of a ~60/s stream must be admitted",
+                i + 1
+            );
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("phone", "screen_mirror", "frame")
+                .await,
+            "and the budget must still have an upper edge"
+        );
+    }
+
+    /// REGRESSION: a sustained `audio` stream is admitted, at the measured peak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sustained_audio_stream_is_admitted() {
+        let limiter = PerTypeRateLimiter::new();
+        for i in 0..100 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "audio", "stream_data")
+                    .await,
+                "audio stream_data {} of a 10-50/s stream must be admitted",
+                i + 1
+            );
+        }
+    }
+
+    /// A realistic phone->desktop push: a 64 KiB chunk stream is ~2800
+    /// chunks/min. The old 500/min budget refused it at the fifth of a minute.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_realistic_file_chunk_stream_is_admitted() {
+        let limiter = PerTypeRateLimiter::new();
+        let chunks_in_a_minute = 2_800;
+        for i in 0..chunks_in_a_minute {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "file", "chunk")
+                    .await,
+                "file chunk {} of a 64 KiB stream must be admitted",
+                i + 1
+            );
+        }
+    }
+
+    /// REGRESSION: a stream must not starve the frame that ends it.
+    ///
+    /// The bucket key is `(client_id, msg_type)`, so with a single bucket
+    /// `screen_mirror/stop` competed with `screen_mirror/frame`: after the frame
+    /// budget was spent, the stop was refused and the mirroring session could not
+    /// be ended by the peer at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stream_cannot_starve_the_action_that_stops_it() {
+        let limiter = PerTypeRateLimiter::new();
+        for i in 0..120 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "screen_mirror", "frame")
+                    .await,
+                "frame {} must be admitted, or the starvation below proves nothing",
+                i + 1
+            );
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("phone", "screen_mirror", "frame")
+                .await,
+            "the data budget must actually be spent for this test to mean anything"
+        );
+        assert!(
+            limiter
+                .check_type_action_limit("phone", "screen_mirror", "stop")
+                .await,
+            "the frame that ends the stream must not be refused by the stream"
+        );
+    }
+
+    /// The same for file transfers: the `cancel` that aborts a transfer must
+    /// survive a chunk flood, since that is exactly when a peer wants to abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chunk_flood_cannot_starve_a_transfer_cancel() {
+        let limiter = PerTypeRateLimiter::new();
+        // A realistic push first: ~2800 64 KiB chunks a minute, which the old
+        // 500/min budget refused part-way through.
+        for i in 0..2_800 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "file", "chunk")
+                    .await,
+                "chunk {} must be admitted",
+                i + 1
+            );
+        }
+        // Then keep going until the budget really is spent, so the assertion
+        // below is about starvation rather than about a budget we miscounted.
+        let mut sent = 2_800;
+        while limiter
+            .check_type_action_limit("phone", "file", "chunk")
+            .await
+        {
+            sent += 1;
+            assert!(sent <= 5_000, "the chunk budget must not be unbounded");
+        }
+        assert!(
+            limiter
+                .check_type_action_limit("phone", "file", "cancel")
+                .await,
+            "a transfer must remain cancellable mid-stream"
+        );
+    }
+
+    /// The exemption must not become a hole in the brute-force protection:
+    /// `pairing/request` carries a guessed token and stays at 5/min, while
+    /// `pairing/accept` — which needs a token this desktop issued — is not
+    /// rationed against it. Same client id throughout, because separate clients
+    /// have separate buckets and would prove nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_request_stays_brute_force_limited_while_accept_is_not_starved() {
+        let limiter = PerTypeRateLimiter::new();
+        for _ in 0..5 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "pairing", "request")
+                    .await
+            );
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("phone", "pairing", "request")
+                .await,
+            "token guessing must still be capped at 5/min"
+        );
+        assert!(
+            limiter
+                .check_type_action_limit("phone", "pairing", "accept")
+                .await,
+            "completing a pairing must not be rationed by the request budget"
+        );
+    }
+
+    /// Control actions are bounded too — the exemption removes the coupling to
+    /// the stream, it does not make them unlimited. Uses `file/cancel`, whose
+    /// old shared budget (500/min) was far larger than the control budget, so
+    /// this also pins that `cancel` really moved off the chunk bucket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_actions_are_bounded_by_their_own_budget() {
+        let limiter = PerTypeRateLimiter::new();
+        for _ in 0..CONTROL_MAX_MESSAGES {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "file", "cancel")
+                    .await
+            );
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("phone", "file", "cancel")
+                .await,
+            "control actions are separated, not unaccounted"
+        );
+        assert!(
+            limiter
+                .check_type_action_limit("phone", "file", "chunk")
+                .await,
+            "and the independence goes both ways: a spent control budget must not \
+             refuse data"
+        );
+    }
+
+    /// The streaming window really is one second, so a client that is
+    /// legitimately streaming cannot be permanently locked out by its own
+    /// history. This is the behavioural counterpart to the `.window` assertions
+    /// in `test_type_limit_config_values`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_streaming_budget_refills_within_its_window() {
+        let limiter = PerTypeRateLimiter::new();
+        for _ in 0..100 {
+            assert!(
+                limiter
+                    .check_type_action_limit("phone", "audio", "stream_data")
+                    .await
+            );
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("phone", "audio", "stream_data")
+                .await,
+            "exhausted within the window"
+        );
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        assert!(
+            limiter
+                .check_type_action_limit("phone", "audio", "stream_data")
+                .await,
+            "a one-second window must have refilled by now; a 60 s window would \
+             still be refusing, which is the bug"
+        );
+    }
+
+    /// The action classifier itself, so the exempt list cannot grow or shrink
+    /// silently.
+    #[test]
+    fn control_actions_are_classified_by_type_and_action() {
+        for (ty, action) in [
+            ("screen_mirror", "start"),
+            ("screen_mirror", "stop"),
+            ("screen_mirror", "capture_stopped"),
+            ("audio", "stream_start"),
+            ("audio", "stream_stop"),
+            ("audio", "playback_start"),
+            ("audio", "playback_stop"),
+            ("file", "accept"),
+            ("file", "cancel"),
+            ("file", "complete"),
+            ("file", "resume"),
+            ("pairing", "accept"),
+            ("pairing", "local_auth"),
+            ("pairing", "revoke"),
+            ("discovery", "remove"),
+        ] {
+            assert!(
+                is_control_action(ty, action),
+                "{ty}/{action} should be a control action"
+            );
+        }
+        for (ty, action) in [
+            ("screen_mirror", "frame"),
+            ("screen_mirror", "touch"),
+            ("screen_mirror", "key"),
+            ("audio", "stream_data"),
+            ("audio", "playback_data"),
+            ("file", "chunk"),
+            ("file", "progress"),
+            ("file", "request"),
+            ("clipboard", "sync"),
+            ("notification", "post"),
+            ("remote_input", "click"),
+            // The brute-force vector stays in the data bucket on purpose.
+            ("pairing", "request"),
+            ("discovery", "announce"),
+            ("unknown_type", "whatever"),
+            ("unknown_type", ""),
+        ] {
+            assert!(
+                !is_control_action(ty, action),
+                "{ty}/{action} must not be exempt from the data budget"
+            );
+        }
+    }
+
+    /// `check_type_limit` (no action) and the action-aware form must charge the
+    /// *same* bucket, or the action-less helper would silently hand out a second
+    /// budget for every type.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_action_less_form_shares_the_data_bucket() {
+        let limiter = PerTypeRateLimiter::new();
+        let budget = type_limit_for("automation").max_messages;
+        for _ in 0..budget {
+            assert!(limiter.check_type_limit("client1", "automation").await);
+        }
+        assert!(
+            !limiter
+                .check_type_action_limit("client1", "automation", "triggered")
+                .await,
+            "an action-aware call must draw on the same budget the \
+             action-less form already spent"
+        );
     }
 
     // -----------------------------------------------------------------------

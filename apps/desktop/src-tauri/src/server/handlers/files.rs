@@ -13,6 +13,10 @@ use super::{WsContext, broadcast_to_others};
 /// asserted: a frame naming any other sender cannot verify, because the tag was
 /// computed with the sender's id inside the MAC input.
 ///
+/// The 16-byte target field is checked against this desktop's own *canonical
+/// field* — its id's first 16 bytes — because that is all a field of that width
+/// can carry for a 36-character id (PROTOCOL.md §5.1.4).
+///
 /// Returns `Err` with a human-readable reason so the caller can log why.
 async fn unwrap_relay_binary_frame(
     bytes: &[u8],
@@ -26,19 +30,34 @@ async fn unwrap_relay_binary_frame(
     }
 
     let target_end = 1 + BINARY_DEVICE_ID_LEN;
-    let target_id = std::str::from_utf8(&bytes[1..target_end])
-        .map_err(|_| "target device id is not valid UTF-8".to_string())?
-        .trim_end_matches('\0')
-        .to_string();
-    if target_id.is_empty() {
-        return Err("target device id is empty".to_string());
-    }
+    let target_field: [u8; BINARY_DEVICE_ID_LEN] = bytes[1..target_end]
+        .try_into()
+        .expect("slice is exactly BINARY_DEVICE_ID_LEN bytes");
+    let target_id = match parse_binary_target_field(&target_field) {
+        Ok(prefix) => prefix,
+        Err(BinaryTargetFieldError::NotUtf8) => {
+            return Err("target device id is not valid UTF-8".to_string());
+        }
+        Err(BinaryTargetFieldError::Empty) => {
+            return Err("target device id is empty".to_string());
+        }
+    };
 
     // The relay routes only to the named recipient, so a frame naming anyone
     // else means the routing table and the wire disagree.
+    //
+    // The comparison is against the *canonical field*, not the full id: this
+    // desktop's own id is a 36-character UUID and the field is 16 bytes, so it
+    // can only ever carry the id's prefix. Comparing the field to the whole id
+    // refused every correctly-addressed frame, which is the same defect the relay
+    // had on its side. `binary_target_matches` is the single definition both use
+    // (PROTOCOL.md §5.1.4), so the receiver accepts exactly the frames the relay
+    // resolved to this device.
     let local = ctx.device_id.as_str();
-    if target_id != local {
-        return Err(format!("addressed to {target_id}, not this desktop"));
+    if !binary_target_matches(local, &target_field) {
+        return Err(format!(
+            "target field names {target_id:?}, which is not this desktop ({local})"
+        ));
     }
 
     // The relay re-stamps the tag with the authenticated sender, but the frame
@@ -395,8 +414,9 @@ async fn auto_accept_files_enabled(ctx: &WsContext) -> bool {
 mod tests {
     use super::*;
     use crate::server::handlers::test_helpers::{
-        add_test_client, add_test_client_mapped, create_test_ctx,
+        add_test_client, add_test_client_mapped, add_test_paired_client, create_test_ctx,
     };
+    use std::sync::Arc;
 
     // ── handle_file_request tests ─────────────────────────────────────────────
 
@@ -647,6 +667,124 @@ mod tests {
         handle_binary_message(bytes, "c1", &ctx).await;
     }
 
+    // ── unwrap_relay_binary_frame: the 16-byte target field ───────────────────
+    //
+    //  The frame's target field is 16 bytes and this desktop's own id is a
+    //  36-character UUID, so the identity check has to compare the *field* with
+    //  the first 16 bytes of this device's id. It used to compare the field with
+    //  the whole id, which refused every correctly-addressed relayed frame — the
+    //  same defect the relay had on its side.
+
+    /// A receiver-side context: this desktop is `device_id` and one phone is
+    /// paired, which is the state a relayed frame arrives in.
+    async fn relay_receiving_ctx(device_id: &str) -> (WsContext, String) {
+        let mut ctx = create_test_ctx();
+        ctx.device_id = Arc::new(device_id.to_string());
+        let phone = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+        add_test_paired_client(&ctx, "relay-peer", phone).await;
+        (ctx, phone.to_string())
+    }
+
+    /// A relayed frame from `sender` addressed to `target`, built by the one
+    /// producer the relay re-frames with.
+    fn relayed_frame(sender: &str, target: &str) -> Vec<u8> {
+        conduit_protocol::build_binary_frame(b"a-test-route-key", sender, target, 1, b"chunk")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_frame_naming_this_desktops_uuid_passes_the_identity_check() {
+        let desktop = "550e8400-e29b-41d4-a716-446655440000";
+        let (ctx, phone) = relay_receiving_ctx(desktop).await;
+
+        // The tag cannot verify here — no route key is registered in this test's
+        // keyring — so the assertion is about *how far* the frame got: past the
+        // address check, and no further.
+        let err = unwrap_relay_binary_frame(&relayed_frame(&phone, desktop), &ctx)
+            .await
+            .expect_err("the frame cannot be attributed without a registered route key");
+        assert!(
+            !err.contains("target field names"),
+            "a frame addressed to this desktop by its own 36-char id must pass the \
+             identity check, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_frame_naming_another_device_is_refused() {
+        let desktop = "550e8400-e29b-41d4-a716-446655440000";
+        let other = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+        let (ctx, phone) = relay_receiving_ctx(desktop).await;
+
+        let err = unwrap_relay_binary_frame(&relayed_frame(&phone, other), &ctx)
+            .await
+            .expect_err("a frame for another device must be refused");
+        assert!(
+            err.contains("target field names") && err.contains("3f2504e0-4f89-11"),
+            "the refusal must name the field that was looked up, got: {err}"
+        );
+        assert!(
+            !err.contains("tag did not verify"),
+            "it must be refused as misaddressed, before any tag work: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_frame_naming_a_twin_uuid_still_passes_here() {
+        // The limit of a receiver-side check, pinned deliberately. Two ids sharing
+        // their first 16 bytes are the same field, so a receiver holding one of
+        // them cannot tell the frame from one addressed to the other — the
+        // identical bytes arrive either way. Refusing here would mean refusing
+        // every frame for this device whenever a twin id existed, which is why the
+        // relay's `resolve_binary_target` is the place that fails closed on
+        // ambiguity: only it can see both devices at once.
+        let desktop = "550e8400-e29b-41d4-a716-446655440000";
+        let twin = "550e8400-e29b-41d4-b716-446655440000";
+        assert_ne!(desktop, twin);
+        let (ctx, phone) = relay_receiving_ctx(desktop).await;
+
+        let err = unwrap_relay_binary_frame(&relayed_frame(&phone, twin), &ctx)
+            .await
+            .expect_err("the frame is not attributable in this test's keyring");
+        assert!(
+            !err.contains("target field names"),
+            "a shared 16-byte prefix is indistinguishable to the receiver, so the \
+             relay must be what refuses it; got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_frame_with_an_empty_target_field_is_refused() {
+        let desktop = "550e8400-e29b-41d4-a716-446655440000";
+        let (ctx, phone) = relay_receiving_ctx(desktop).await;
+
+        let mut frame = relayed_frame(&phone, desktop);
+        frame[1..1 + BINARY_DEVICE_ID_LEN].fill(0);
+        let err = unwrap_relay_binary_frame(&frame, &ctx)
+            .await
+            .expect_err("an all-padding target field names nobody");
+        assert_eq!(err, "target device id is empty");
+
+        // And a field that is not UTF-8 at all, which a split code point produces.
+        frame[1..1 + BINARY_DEVICE_ID_LEN].fill(0xFF);
+        let err = unwrap_relay_binary_frame(&frame, &ctx)
+            .await
+            .expect_err("a non-UTF-8 target field is not a device id");
+        assert_eq!(err, "target device id is not valid UTF-8");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_frame_for_a_short_device_id_still_passes_the_identity_check() {
+        // Backward compatibility for the ids that fit the field whole.
+        let (ctx, phone) = relay_receiving_ctx("device-1").await;
+        let err = unwrap_relay_binary_frame(&relayed_frame(&phone, "device-1"), &ctx)
+            .await
+            .expect_err("the frame cannot be attributed without a registered route key");
+        assert!(
+            !err.contains("target field names"),
+            "a device id that fits the field must still be accepted, got: {err}"
+        );
+    }
+
     // ── handle_file_accept tests ──────────────────────────────────────────────
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -866,16 +1004,28 @@ mod tests {
         let ctx = create_test_ctx();
         let _tx = add_test_client(&ctx, "c1").await;
 
-        // File type allows 500 messages per 60s
-        for _ in 0..500 {
-            assert!(
-                ctx.per_type_limiter.check_type_limit("c1", "file").await,
-                "file messages within limit should pass"
-            );
+        // Deliberately does not repeat the budget: it is a value in
+        // `security.rs` (`type_limit_for`), pinned there by
+        // `security::tests::test_type_limit_config_values` and
+        // `test_per_type_high_throughput_file_limit`, and this test used to
+        // hard-code 500 — so raising the limit broke this assertion instead of
+        // any assertion about the limiter. What is worth pinning here is the
+        // property: the `file` bucket is finite, and it is finite *for one
+        // client* rather than globally.
+        const PROBE_CEILING: u32 = 10_000;
+        let mut allowed = 0;
+        while allowed < PROBE_CEILING && ctx.per_type_limiter.check_type_limit("c1", "file").await {
+            allowed += 1;
         }
         assert!(
-            !ctx.per_type_limiter.check_type_limit("c1", "file").await,
-            "501st file message should be rate-limited"
+            allowed < PROBE_CEILING,
+            "the file bucket accepted {PROBE_CEILING} messages in one window; it is not bounded"
+        );
+
+        // And a second client is unaffected by the first one's spending.
+        assert!(
+            ctx.per_type_limiter.check_type_limit("c2", "file").await,
+            "one client exhausting its file budget must not limit another's"
         );
     }
 }

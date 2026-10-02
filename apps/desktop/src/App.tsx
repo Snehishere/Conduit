@@ -149,12 +149,16 @@ function AppInner() {
     getCallerName, getCallDuration, timeAgo: callTimeAgo,
   } = useCalls(sendMessage, sendSensitive);
 
-  const { clipboardItems, copyItem, pinItem, deleteItem, clearAll } = useClipboardState(activeView);
+  const { clipboardItems, refreshClipboard, copyItem, pinItem, deleteItem, clearAll } = useClipboardState(activeView);
 
   const { isMonitoring, startMonitoring, stopMonitoring, handleIncoming } = useClipboard({
     sendMessage,
     deviceId,
-    onSynced: () => refreshDevices(),
+    // Refresh the *clipboard* when one is synced in. This pointed at
+    // `refreshDevices()` — so an inbound sync re-read the device list, which is
+    // unaffected by a copy, and `clipboardItems` (built solely from
+    // `get_clipboard_history`) was only ever refetched on navigation.
+    onSynced: () => refreshClipboard(),
   });
 
   useMessageHandlers({

@@ -6,7 +6,16 @@ import '../models/conduit_notification.dart';
 import 'database_service.dart';
 
 class NotificationService extends ChangeNotifier {
-  static const _eventChannel = EventChannel('com.conduit.mobile/events');
+  /// The channel the native `NotificationListenerService` bridge publishes on.
+  ///
+  /// One stream, one channel. `EventChannel.receiveBroadcastStream` registers
+  /// its Dart handler by channel *name* only, and the native side keeps one sink
+  /// per name, so sharing a name between streams left every subscriber but the
+  /// last one permanently dead. Do not merge this with another stream's name.
+  static const _eventChannel = EventChannel(
+    'com.conduit.mobile/notification_events',
+  );
+
   static const _channel = MethodChannel('com.conduit.mobile/native');
 
   final FlutterLocalNotificationsPlugin _notifications =
@@ -17,7 +26,8 @@ class NotificationService extends ChangeNotifier {
   DatabaseService? _db;
   void Function(Map<String, dynamic>)? _send;
 
-  List<ConduitNotification> get notifications => List.unmodifiable(_notificationsList);
+  List<ConduitNotification> get notifications =>
+      List.unmodifiable(_notificationsList);
 
   /// Inject the database service. Must be called before [initialize].
   void setDatabase(DatabaseService db) {
@@ -31,7 +41,9 @@ class NotificationService extends ChangeNotifier {
   Future<void> initialize() async {
     if (_initialized) return;
 
-    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    const androidSettings = AndroidInitializationSettings(
+      '@mipmap/ic_launcher',
+    );
     const initSettings = InitializationSettings(android: androidSettings);
 
     await _notifications.initialize(
@@ -45,7 +57,7 @@ class NotificationService extends ChangeNotifier {
     _initialized = true;
 
     // Listen for notifications from native NotificationListenerService
-    _notificationSubscription = _eventChannel.receiveBroadcastStream('notifications').listen(
+    _notificationSubscription = _eventChannel.receiveBroadcastStream().listen(
       (event) {
         if (event is Map) {
           final type = event['type'] as String?;
@@ -53,12 +65,16 @@ class NotificationService extends ChangeNotifier {
           if (type == 'notification') {
             if (action == 'post') {
               final notification = ConduitNotification(
-                id: (event['id'] as String?) ?? 'notif_${DateTime.now().millisecondsSinceEpoch}',
+                id:
+                    (event['id'] as String?) ??
+                    'notif_${DateTime.now().millisecondsSinceEpoch}',
                 deviceId: (event['device_id'] as String?) ?? 'phone',
                 app: (event['app'] as String?) ?? 'unknown',
                 title: (event['title'] as String?) ?? '',
                 body: (event['body'] as String?) ?? '',
-                timestamp: (event['timestamp'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch ~/ 1000,
+                timestamp:
+                    (event['timestamp'] as num?)?.toInt() ??
+                    DateTime.now().millisecondsSinceEpoch ~/ 1000,
                 actions: null,
               );
               addNotification(notification);
@@ -88,9 +104,13 @@ class NotificationService extends ChangeNotifier {
 
     // Check if notification listener is enabled
     try {
-      final enabled = await _channel.invokeMethod<bool>('isNotificationListenerEnabled');
+      final enabled = await _channel.invokeMethod<bool>(
+        'isNotificationListenerEnabled',
+      );
       if (enabled != true) {
-        debugPrint('NotificationListenerService not enabled. Prompting user...');
+        debugPrint(
+          'NotificationListenerService not enabled. Prompting user...',
+        );
         await _channel.invokeMethod('openNotificationListenerSettings');
       }
     } catch (e) {
@@ -120,7 +140,9 @@ class NotificationService extends ChangeNotifier {
         _notificationsList.add(ConduitNotification.fromMap(row));
       }
       if (_notificationsList.isNotEmpty) {
-        debugPrint('[NotificationService] Loaded ${_notificationsList.length} notifications from DB');
+        debugPrint(
+          '[NotificationService] Loaded ${_notificationsList.length} notifications from DB',
+        );
         notifyListeners();
       }
     } catch (e) {

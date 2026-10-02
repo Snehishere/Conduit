@@ -1029,7 +1029,22 @@ impl Storage {
                     "relay_url",
                     crate::commands::DEFAULT_RELAY_URL,
                 )?,
-                relay_enabled: Self::setting_or_default(&conn, "relay_enabled", "false")? == "true",
+                // The default is taken from `ConduitSettings::default()` rather
+                // than spelled out here, for the reason the app cares about:
+                // `main.rs` reads this struct and, when `relay_enabled` is false,
+                // returns *before* both `relay_host.start()` and
+                // `spawn_relay_client`. This literal used to be "false", which no
+                // migration seeds and nothing writes before that read — so on a
+                // fresh install the relay never started and the desktop never
+                // joined its own relay, while `ConduitSettings::default()` and
+                // `settingsTypes.ts`'s `DEFAULT_SETTINGS` both said "on".
+                relay_enabled: Self::setting_or_default(
+                    &conn,
+                    "relay_enabled",
+                    &crate::commands::ConduitSettings::default()
+                        .relay_enabled
+                        .to_string(),
+                )? == "true",
                 relay_port: Self::setting_or_default(
                     &conn,
                     "relay_port",
@@ -2354,12 +2369,87 @@ mod tests {
         assert!(settings.auto_accept_files);
         assert!(settings.notifications_enabled);
         assert_eq!(settings.relay_url, "ws://127.0.0.1:9531");
+        assert!(
+            settings.relay_enabled,
+            "an empty database must read as relay_enabled = true"
+        );
+        assert_eq!(settings.relay_port, crate::relay::DEFAULT_RELAY_PORT);
+        assert_eq!(
+            settings.relay_health_port,
+            crate::relay::DEFAULT_RELAY_HEALTH_PORT
+        );
         assert_eq!(
             settings.notification_apps,
             crate::commands::default_notification_apps()
         );
         assert!(settings.default_download_folder.is_empty());
         assert!(settings.last_version.is_empty());
+    }
+
+    /// REGRESSION — `get_settings` read a missing `relay_enabled` row as the
+    /// literal `"false"`, contradicting `ConduitSettings::default()`, the
+    /// `#[serde(default = "default_true")]` attribute and
+    /// `settingsTypes.ts`'s `DEFAULT_SETTINGS`, which all say "on".
+    ///
+    /// Nothing seeded the row: `migrations/001_initial.sql` is DDL with no
+    /// `INSERT`s, and no writer runs before `main.rs`'s startup read. `main.rs`
+    /// then returns early on a false `relay_enabled`, skipping *both*
+    /// `relay_host.start()` and `spawn_relay_client` — so on a fresh install the
+    /// relay never started and the desktop never joined its own relay.
+    ///
+    /// This reads the function `main.rs` actually calls. Asserting
+    /// `ConduitSettings::default()` alone did not catch the defect, because the
+    /// struct default and this read are two different definitions of one thing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_settings_fresh_install_starts_the_relay() {
+        let storage = create_test_storage();
+
+        let settings = storage.get_settings().await.unwrap();
+        assert!(
+            settings.relay_enabled,
+            "a fresh install must read relay_enabled = true; main.rs skips \
+             relay_host.start() and spawn_relay_client when it is false"
+        );
+        assert_eq!(
+            storage.get_setting("relay_enabled").await,
+            None,
+            "no migration seeds this key — the value comes from the default, \
+             which is the whole point of the test"
+        );
+        // The relay must actually start from the settings `get_settings` returns,
+        // not merely be present in the struct.
+        assert!(
+            settings.relay_port == crate::relay::DEFAULT_RELAY_PORT
+                && settings.relay_health_port == crate::relay::DEFAULT_RELAY_HEALTH_PORT,
+            "a fresh install must read the ports the in-process relay binds"
+        );
+    }
+
+    /// Structural guard for the drift above: every default `get_settings`
+    /// applies to an empty database must be the one `ConduitSettings::default()`
+    /// documents, for the whole struct and not one hand-picked field.
+    ///
+    /// `device_name` is excluded because it has *three* separate definitions
+    /// (`ConduitSettings::default()` → `""`, this read → `gethostname()`,
+    /// `DEFAULT_SETTINGS` → `"Desktop"`). Rather than bless any one of them, the
+    /// test carries its actual value through, so it neither hides nor pins that
+    /// drift — but it fails on any *other* field disagreeing, which is what
+    /// catches `relay_enabled`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_settings_defaults_match_conduit_settings_default() {
+        let storage = create_test_storage();
+
+        let fresh = storage.get_settings().await.unwrap();
+        let expected = crate::commands::ConduitSettings {
+            device_name: fresh.device_name.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            fresh, expected,
+            "Storage::get_settings' empty-database defaults have drifted from \
+             ConduitSettings::default(); every field must agree except device_name"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

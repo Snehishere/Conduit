@@ -309,7 +309,26 @@ impl WsServer {
         }
     }
 
-    /// Encrypt one outbound frame for `client_id`, if that peer has a secret.
+    /// Encrypt one outbound frame for the peer behind `client_id`, if that peer
+    /// has a secret.
+    ///
+    /// Thin wrapper over [`Self::seal_for_device`]: it resolves the connection
+    /// to a stable device id and applies the same rules. Both egresses go
+    /// through the *same* function so the LAN socket writer and the relay route
+    /// cannot drift apart — that drift is what left every directed frame
+    /// travelling to an off-LAN phone in the clear while the LAN copy of the
+    /// identical frame was sealed.
+    async fn seal_for_peer(ctx: &WsContext, client_id: &str, msg_text: &str) -> String {
+        match handlers::paired_device_id(ctx, client_id).await {
+            Some(stable_id) => Self::seal_for_device(ctx, &stable_id, msg_text).await,
+            // Unpaired: should be unreachable for anything but a reply to this
+            // peer's own request, but never leak a fan-out if it happens.
+            None => msg_text.to_string(),
+        }
+    }
+
+    /// Encrypt one outbound frame for a **stable device id**, if that device
+    /// has a secret.
     ///
     /// **Exactly one encryption layer, applied here and only here.** Two rules
     /// make that hold:
@@ -324,21 +343,20 @@ impl WsServer {
     ///    the secret; encrypting it would make it undecryptable at the peer.
     ///
     /// A peer with no shared secret — the desktop's own webview
-    /// (`local_desktop`), which has no key pair — receives plaintext by
-    /// necessity. That is sound because reaching that state requires the
-    /// per-launch capability, and because broadcasts are filtered on pairing, so
-    /// a stranger never gets here.
-    async fn seal_for_peer(ctx: &WsContext, client_id: &str, msg_text: &str) -> String {
+    /// (`local_desktop`), which has no key pair, or a device id that is not in
+    /// the registry at all — receives plaintext by necessity. That is sound
+    /// because reaching the first state requires the per-launch capability, and
+    /// because broadcasts are filtered on pairing, so a stranger never gets
+    /// here.
+    ///
+    /// Keyed by device id rather than connection id because one caller has no
+    /// connection: `send_to`'s relay egress addresses a device that is by
+    /// definition not on this LAN.
+    async fn seal_for_device(ctx: &WsContext, stable_id: &str, msg_text: &str) -> String {
         if message_type_is(msg_text, "pairing") || message_type_is(msg_text, "encrypted") {
             return msg_text.to_string();
         }
-        let stable_id = match handlers::paired_device_id(ctx, client_id).await {
-            Some(id) => id,
-            // Unpaired: should be unreachable for anything but a reply to this
-            // peer's own request, but never leak a fan-out if it happens.
-            None => return msg_text.to_string(),
-        };
-        let Some(client) = ctx.sync_engine.read().await.get_client(&stable_id).cloned() else {
+        let Some(client) = ctx.sync_engine.read().await.get_client(stable_id).cloned() else {
             return msg_text.to_string();
         };
         match ctx.encryption.encrypt(&client.shared_secret, msg_text) {
@@ -353,7 +371,7 @@ impl WsServer {
                     nonce: hex::encode(nonce),
                     hmac: hmac_hex,
                     data: data_hex,
-                    source_device: Some(stable_id.clone()),
+                    source_device: Some(stable_id.to_string()),
                     protocol_version: Some(PROTOCOL_VERSION),
                 };
                 serde_json::to_string(&envelope).expect("EncryptedEnvelope serializes")
@@ -363,7 +381,7 @@ impl WsServer {
                 // have a secret for.
                 error!(
                     "Failed to encrypt outbound message for {}: {}",
-                    client_id, e
+                    stable_id, e
                 );
                 drop_message(msg_text)
             }
@@ -856,12 +874,20 @@ impl WsServer {
 
         // Per-message-type rate limiting — prevents high-throughput types
         // (e.g. file/chunk) from starving low-volume types (e.g. pairing).
+        //
+        // The action matters, and not only for accounting: a control action (a
+        // stream's own `stop`, a transfer's `complete`, a pairing's `accept`) is
+        // charged to a bucket the stream's own frames cannot exhaust, so a peer
+        // can always stop what it started. See `security::is_control_action`.
         if !ctx
             .per_type_limiter
-            .check_type_limit(client_id, msg_type)
+            .check_type_action_limit(client_id, msg_type, action)
             .await
         {
-            warn!("Per-type rate limited: {} (type: {})", client_id, msg_type);
+            warn!(
+                "Per-type rate limited: {} (type: {}, action: {})",
+                client_id, msg_type, action
+            );
             let err_resp = ErrorMessage {
                 msg_type: "error".into(),
                 code: "rate_limited".into(),
@@ -907,6 +933,15 @@ impl WsServer {
                     .await;
             }
             ("clipboard", "sync") => {
+                // Persist the *received* content before relaying it. This arm
+                // used to be a bare fan-out, and `clipboard_history` therefore
+                // only ever got a row from the `sync_clipboard` Tauri command —
+                // which the webview never calls, because `useClipboard` posts a
+                // raw `clipboard/sync` frame instead. The history table was
+                // consequently always empty: the UI showed "Your clipboard is
+                // empty" permanently, the Clear button could not render, and
+                // the dock badge never left 0.
+                persist_inbound_clipboard(ctx, client_id, &processed_msg).await;
                 broadcast_to_others(ctx, client_id, &processed_msg.to_string()).await;
             }
             ("file", "request") => {
@@ -1171,20 +1206,10 @@ impl WsServer {
                 return false;
             };
 
-            let route = RelayRoute::signed_with(
-                &from_device_id,
-                &route_key,
-                from_device_id.clone(),
-                device_id,
-                serde_json::from_str::<serde_json::Value>(&message)
-                    .unwrap_or(serde_json::Value::Null),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as i64,
-                uuid::Uuid::new_v4().to_string(),
-            );
-            let relay_msg_str = serde_json::to_string(&route).unwrap_or_default();
+            // Sealed for the recipient exactly as the LAN writer seals it.
+            let relay_msg_str = self
+                .sealed_relay_route(device_id, &message, &route_key)
+                .await;
             if let Err(e) = relay_tx.send(relay_msg_str).await {
                 warn!("Failed to route message through relay: {}", e);
                 return false;
@@ -1192,6 +1217,54 @@ impl WsServer {
             return true;
         }
         false
+    }
+
+    /// Build the signed `relay_route` that carries one directed frame to
+    /// `to_device_id`, with the payload sealed exactly as the LAN socket writer
+    /// would have sealed it.
+    ///
+    /// # Why the sealing has to happen here
+    ///
+    /// The LAN egress seals in the *per-connection writer*
+    /// ([`Self::seal_for_peer`], called from `handle_client`), and the relay
+    /// socket's writer sends whatever it is handed verbatim. So before this
+    /// existed, `send_to`'s two paths behaved differently: a frame destined for
+    /// a device on the LAN arrived wrapped in an `encrypted` envelope, and the
+    /// *same* frame destined for the same device through the relay arrived as
+    /// raw JSON. `send_to` is the only desktop→relay egress (`relay_tx` has one
+    /// reader), so every directed frame it carries was affected —
+    /// `commands::file`'s `file/request` and `file/chunk` (base64 payload
+    /// included) and `commands::pairing`'s pre-built envelope.
+    ///
+    /// Scope: this seals *exactly* what the LAN path seals and no more.
+    /// `sms`, `file`, `notification`, `clipboard`, `screen_mirror`,
+    /// `remote_input` and `audio` are plaintext-by-decision in
+    /// `PROTOCOL.md` §6.4, and this does not change that decision — it applies
+    /// the desktop's existing, already-per-connection policy to the second
+    /// transport instead of inventing a second policy. An `encrypted` frame is
+    /// still passed through unwrapped, so `send_encrypted_message` does not
+    /// gain a second layer.
+    async fn sealed_relay_route(
+        &self,
+        to_device_id: &str,
+        message: &str,
+        route_key: &[u8],
+    ) -> String {
+        let sealed = Self::seal_for_device(&self.ctx, to_device_id, message).await;
+        let from_device_id = self.ctx.device_id.as_str();
+        let route = RelayRoute::signed_with(
+            from_device_id,
+            route_key,
+            from_device_id,
+            to_device_id,
+            serde_json::from_str::<serde_json::Value>(&sealed).unwrap_or(serde_json::Value::Null),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64,
+            uuid::Uuid::new_v4().to_string(),
+        );
+        serde_json::to_string(&route).unwrap_or_default()
     }
 
     /// Dial a relay and keep the connection up.
@@ -1342,6 +1415,99 @@ impl WsServer {
             .await
             .retain(|_, v| v.as_str() != device_id);
         info!("Device {} disconnected (revoked)", device_id);
+    }
+}
+
+/// How far ahead of this desktop's own clock a peer's `timestamp` may be before
+/// it is treated as unusable.
+///
+/// `save_clipboard` prunes by `ORDER BY timestamp DESC`, so the column is load
+/// bearing for retention, not just display. A phone whose clock is hours fast
+/// would otherwise pin its own entries at the top of every device's history for
+/// as long as they stayed pinned — so a future timestamp is refused in favour of
+/// the arrival time, which is monotonic by construction.
+const CLIPBOARD_CLOCK_SKEW_TOLERANCE_SECS: i64 = 300;
+
+/// Write one inbound `clipboard/sync` into `clipboard_history`, attributed to
+/// the device that sent it.
+///
+/// Returns whether a row was written. This is the inbound counterpart of
+/// `commands::notifications::sync_clipboard`, and it exists because of a wiring
+/// gap: that command had exactly one caller in the whole repository and nothing
+/// in the webview ever invoked it, so the only path into the table was dead code.
+/// The live path is `useClipboard`'s raw `clipboard/sync` frame, which arrives
+/// here — and used to leave without being stored.
+///
+/// # Attribution
+///
+/// `source_device` is the **connection's registered identity**, never the
+/// frame's own `source_device` field. A socket's identity was written by the
+/// hub at pairing time from a one-time token, so it cannot be forged; a field
+/// inside the payload can. This is the same rule `resolve_sender_secret` and
+/// `seal_for_peer` already apply, and it is why a relayed frame — whose
+/// `client_id` is the device the relay authenticated, with no pairing-registry
+/// entry at all — falls back to using that id directly.
+///
+/// The one substitution is [`LOCAL_DESKTOP_ID`], which is a *transport* alias
+/// for the desktop's own webview and not a device: the row records
+/// `ctx.device_id`, the id the rest of the app and the wire both use, which is
+/// also what the sender put in the frame.
+///
+/// # `pinned`
+///
+/// Left at the column default (`0`). A pinned row survives
+/// `clear_clipboard_history`, so letting a remote peer pin rows would give any
+/// paired phone a way to make content on this desktop undeletable from the UI.
+/// Pinning stays a local, deliberate act (`toggle_clipboard_pin`).
+async fn persist_inbound_clipboard(ctx: &WsContext, client_id: &str, msg: &Value) -> bool {
+    // `validate_clipboard_message` treats `content` as optional, so a frame can
+    // legitimately reach here with nothing to store. Relaying it is still right;
+    // storing an empty row is not.
+    let Some(content) = msg.get("content").and_then(Value::as_str) else {
+        return false;
+    };
+    if content.is_empty() {
+        return false;
+    }
+    let mime = msg
+        .get("mime")
+        .and_then(Value::as_str)
+        .unwrap_or("text/plain");
+
+    let stable_id = handlers::paired_device_id(ctx, client_id)
+        .await
+        // A relayed sender has no LAN socket, so there is no entry to resolve
+        // and the id the relay vouched for is already the stable one.
+        .unwrap_or_else(|| client_id.to_string());
+    let source_device = if stable_id == handlers::LOCAL_DESKTOP_ID {
+        ctx.device_id.as_str().to_string()
+    } else {
+        stable_id
+    };
+
+    // The sender's clock is used when it is usable, so a shared clipboard sorts
+    // the same way on every device; arrival time is the fallback. See
+    // `CLIPBOARD_CLOCK_SKEW_TOLERANCE_SECS` for why a future stamp is refused.
+    let now = chrono::Utc::now().timestamp();
+    let timestamp = msg
+        .get("timestamp")
+        .and_then(Value::as_i64)
+        .filter(|t| *t > 0 && *t <= now + CLIPBOARD_CLOCK_SKEW_TOLERANCE_SECS)
+        .unwrap_or(now);
+
+    match ctx
+        .storage
+        .save_clipboard(content, mime, &source_device, timestamp)
+        .await
+    {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                "Failed to persist clipboard entry from {}: {}",
+                client_id, e
+            );
+            false
+        }
     }
 }
 
@@ -3322,5 +3488,423 @@ mod tests {
             !handlers::is_trusted_peer(&ctx, RELAY_CLIENT_ID).await,
             "the relay socket must not be able to send protected messages as itself"
         );
+    }
+
+    // -----------------------------------------------------------------
+    //  Clipboard history is written on the way in
+    //
+    //  `clipboard_history` had exactly one production writer, the
+    //  `sync_clipboard` Tauri command, and the webview never calls it:
+    //  `useClipboard` posts a raw `clipboard/sync` frame instead. The dispatch
+    //  arm was a bare fan-out, so the table stayed empty forever — the UI's
+    //  `clipboardItems` comes only from `get_clipboard_history`, which meant a
+    //  permanent "Your clipboard is empty", no Clear button, and a dock badge
+    //  stuck at 0.
+    // -----------------------------------------------------------------
+
+    /// REGRESSION: a `clipboard/sync` from a paired peer is stored, attributed
+    /// to that peer, and still relayed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_inbound_clipboard_sync_is_stored_for_the_sending_device() {
+        let ctx = create_test_ctx();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let other = add_test_paired_client(&ctx, "ws_tablet", "dev_tablet").await;
+        let mut other_rx = other.subscribe();
+
+        let text = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync",
+            "content": "copied on the phone",
+            "mime": "text/plain",
+            // A lie: attribution must not come from the payload.
+            "source_device": "dev_somebody_else",
+            "timestamp": 1_700_000_000
+        }))
+        .unwrap();
+
+        WsServer::handle_message(&text, "ws_phone", &ctx).await;
+
+        let rows = ctx.storage.get_clipboard_history(10).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "an inbound clipboard sync must be persisted, not only relayed"
+        );
+        assert_eq!(rows[0].content, "copied on the phone");
+        assert_eq!(rows[0].mime, "text/plain");
+        assert_eq!(
+            rows[0].source_device, "dev_phone",
+            "source_device must come from the pairing registry, not the frame"
+        );
+        assert!(
+            !rows[0].pinned,
+            "a remote peer must not be able to pin a row that 'Clear clipboard' \
+             then refuses to remove"
+        );
+        assert_eq!(
+            rows[0].timestamp, 1_700_000_000,
+            "a sane sender timestamp is kept, so every device sorts the shared \
+             clipboard the same way"
+        );
+
+        // Persisting must not have replaced relaying.
+        let relayed = tokio::time::timeout(std::time::Duration::from_millis(500), other_rx.recv())
+            .await
+            .expect("the other peer must still receive the sync")
+            .unwrap();
+        assert!(relayed.contains("copied on the phone"));
+    }
+
+    /// REGRESSION, relay path: the same frame from a phone on another network
+    /// is stored exactly once, still attributed to the device the relay
+    /// authenticated — and not twice, which is what would happen if the relay
+    /// egress also persisted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_clipboard_sync_is_stored_exactly_once_for_the_relay_sender() {
+        let ctx = create_test_ctx();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let inner = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync",
+            "content": "copied on another network",
+            "mime": "text/plain",
+            "source_device": "dev_impostor"
+        }))
+        .unwrap();
+        let sealed = as_relay_forwarded_payload(&ctx, "ws_phone", &inner).await;
+        let delivery = RelayDelivery::new(
+            "dev_phone",
+            "test-device",
+            serde_json::from_str(&sealed).expect("sealed payload is JSON"),
+        );
+        let wire = serde_json::to_string(&delivery).expect("RelayDelivery serializes");
+
+        WsServer::handle_message(&wire, RELAY_CLIENT_ID, &ctx).await;
+
+        let rows = ctx.storage.get_clipboard_history(10).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one relayed sync must produce exactly one row, not two"
+        );
+        assert_eq!(rows[0].content, "copied on another network");
+        assert_eq!(
+            rows[0].source_device, "dev_phone",
+            "a relayed sender has no registry entry; the relay-authenticated \
+             device id is the identity"
+        );
+    }
+
+    /// The desktop's own webview has the alias `local_desktop`, which is a
+    /// transport identity and not a device. The row must record the desktop's
+    /// real device id — the same one the webview puts in the frame, and the one
+    /// the UI resolves against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_desktops_own_copy_is_recorded_under_its_real_device_id() {
+        let ctx = create_test_ctx();
+        ctx.ws_to_device_id.write().await.insert(
+            "ws_webview".to_string(),
+            handlers::LOCAL_DESKTOP_ID.to_string(),
+        );
+
+        let text = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync",
+            "content": "copied on the desktop",
+            "mime": "text/plain",
+            "source_device": "test-device",
+            "timestamp": 1_700_000_000
+        }))
+        .unwrap();
+
+        WsServer::handle_message(&text, "ws_webview", &ctx).await;
+
+        let rows = ctx.storage.get_clipboard_history(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].source_device, "test-device",
+            "the transport alias must not leak into a device column"
+        );
+    }
+
+    /// A frame with no content is relayed but not stored: an empty row would
+    /// render as a blank card.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clipboard_sync_with_no_content_is_relayed_but_not_stored() {
+        let ctx = create_test_ctx();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let other = add_test_paired_client(&ctx, "ws_tablet", "dev_tablet").await;
+        let mut other_rx = other.subscribe();
+
+        // `validate_clipboard_message` treats `content` as optional, so this
+        // reaches the dispatcher rather than being rejected as malformed.
+        let text = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync", "mime": "text/plain"
+        }))
+        .unwrap();
+
+        WsServer::handle_message(&text, "ws_phone", &ctx).await;
+
+        assert!(
+            ctx.storage
+                .get_clipboard_history(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an empty clipboard frame must not create a blank history row"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), other_rx.recv())
+                .await
+                .is_ok(),
+            "and it must still be relayed"
+        );
+    }
+
+    /// A peer whose clock is far ahead must not be able to pin its content at
+    /// the top of this desktop's history forever: `save_clipboard` prunes by
+    /// `timestamp DESC`, so an unbounded future stamp is a retention attack.
+    /// Arrival time is used instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clipboard_sync_with_a_wildly_future_timestamp_uses_arrival_time() {
+        let ctx = create_test_ctx();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let far_future = chrono::Utc::now().timestamp() + 86_400 * 30;
+
+        let text = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync",
+            "content": "from a broken clock", "mime": "text/plain",
+            "timestamp": far_future
+        }))
+        .unwrap();
+
+        WsServer::handle_message(&text, "ws_phone", &ctx).await;
+
+        let rows = ctx.storage.get_clipboard_history(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].timestamp <= chrono::Utc::now().timestamp() + 1,
+            "a 30-day-future timestamp must not be stored, got {}",
+            rows[0].timestamp
+        );
+    }
+
+    /// Clipboard sync off, nothing is stored — the settings gate runs before the
+    /// handler, so turning the feature off really does stop the table growing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clipboard_sync_is_not_stored_when_sync_clipboard_is_off() {
+        let ctx = create_test_ctx();
+        ctx.storage
+            .save_setting("sync_clipboard", "false")
+            .await
+            .unwrap();
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+
+        let text = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync",
+            "content": "should not be kept", "mime": "text/plain"
+        }))
+        .unwrap();
+
+        WsServer::handle_message(&text, "ws_phone", &ctx).await;
+
+        assert!(
+            ctx.storage
+                .get_clipboard_history(10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a disabled clipboard sync must not leave history behind"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    //  The relay egress seals what the LAN egress seals
+    //
+    //  `send_to` is the only desktop->relay egress (`relay_tx` has one reader),
+    //  and its relay arm used to drop the caller's JSON straight into the route
+    //  payload. The relay socket's writer sends verbatim, and sealing lives in
+    //  the per-connection socket writer, so a directed frame reached a phone on
+    //  the LAN sealed and the same frame reached the same phone through the
+    //  relay in the clear.
+    // -----------------------------------------------------------------
+
+    /// The route key `send_to` would sign with. Arbitrary bytes: only the HMAC
+    /// over the route cares about them, and these tests assert on the payload,
+    /// not the signature.
+    fn test_route_key() -> Vec<u8> {
+        vec![0x5au8; 32]
+    }
+
+    /// A phone with a real shared secret, optionally *not* on this LAN.
+    ///
+    /// `with_socket = false` is the only situation `send_to`'s relay arm exists
+    /// for: the device is paired (so the registry knows its secret) but has no
+    /// socket here, so the frame has to travel through the relay.
+    async fn ctx_with_phone(secret: &str, with_socket: bool) -> WsContext {
+        let ctx = create_test_ctx();
+        // Sets up the registry entry and a connection; the secret it installs is
+        // overwritten below because these tests need a known one.
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        ctx.sync_engine.write().await.add_client(ConnectedClient {
+            device_id: "dev_phone".to_string(),
+            device_name: "Phone".to_string(),
+            device_type: "phone".to_string(),
+            shared_secret: secret.to_string(),
+            last_heartbeat: 0,
+            battery_level: None,
+        });
+        if !with_socket {
+            ctx.ws_to_device_id.write().await.remove("ws_phone");
+            ctx.clients.write().await.remove("ws_phone");
+        }
+        ctx
+    }
+
+    /// Peel one `encrypted` layer, failing the test if it is not there.
+    fn open_envelope(ctx: &WsContext, secret: &str, envelope: &Value) -> String {
+        assert_eq!(
+            envelope["type"], "encrypted",
+            "expected an encrypted envelope, got {envelope}"
+        );
+        let data_hex = envelope["data"].as_str().expect("data");
+        assert!(
+            ctx.encryption
+                .verify_hmac(secret, data_hex, envelope["hmac"].as_str().expect("hmac")),
+            "the relayed envelope must carry a valid HMAC"
+        );
+        ctx.encryption
+            .decrypt(
+                secret,
+                &hex::decode(envelope["nonce"].as_str().expect("nonce")).unwrap(),
+                &hex::decode(data_hex).unwrap(),
+            )
+            .expect("a sealed frame must decrypt with the shared secret")
+    }
+
+    /// REGRESSION: a directed `file/chunk` — base64 payload and all — is sealed
+    /// before it goes into the relay route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_directed_frame_is_sealed_on_the_relay_egress() {
+        let secret = "3c".repeat(32);
+        let ctx = ctx_with_phone(&secret, false).await;
+        let server = server_over(ctx.clone());
+
+        let chunk = serde_json::json!({
+            "type": "file", "action": "chunk", "id": "t1",
+            "index": 3, "total": 9, "data": "c2VjcmV0LWJ5dGVz"
+        });
+        let wire = server
+            .sealed_relay_route("dev_phone", &chunk.to_string(), &test_route_key())
+            .await;
+
+        let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
+        assert_eq!(route["type"], "relay_route");
+        assert_eq!(route["to_device_id"], "dev_phone");
+        assert_eq!(
+            route["payload"]["type"], "encrypted",
+            "the relay route's payload must be sealed, not the caller's JSON"
+        );
+        assert!(
+            !wire.contains("c2VjcmV0LWJ5dGVz"),
+            "the base64 chunk must not appear in the clear on the relay wire: {wire}"
+        );
+        assert_eq!(
+            open_envelope(&ctx, &secret, &route["payload"]),
+            chunk.to_string(),
+            "one layer, and it must be the frame the caller passed"
+        );
+    }
+
+    /// `commands::pairing::send_encrypted_message` hands `send_to` an envelope
+    /// it built itself. Sealing must not add a second layer, or the phone peels
+    /// one and dispatches the inner envelope to a handler it has not
+    /// registered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_already_sealed_frame_is_not_sealed_again_on_the_relay_egress() {
+        let secret = "4d".repeat(32);
+        let ctx = ctx_with_phone(&secret, false).await;
+        let server = server_over(ctx.clone());
+
+        let inner = r#"{"type":"call","action":"answer","content":"secret"}"#;
+        let sealed = WsServer::seal_for_device(&ctx, "dev_phone", inner).await;
+        let wire = server
+            .sealed_relay_route("dev_phone", &sealed, &test_route_key())
+            .await;
+
+        let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
+        assert_eq!(route["payload"]["type"], "encrypted");
+        assert_eq!(
+            open_envelope(&ctx, &secret, &route["payload"]),
+            inner,
+            "peeling exactly one layer must yield the original frame, not another \
+             envelope"
+        );
+    }
+
+    /// The point of the fix: `send_to`'s two paths must agree. Same frame, same
+    /// peer, two transports — both must be sealed, and both must open to the
+    /// same plaintext.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn both_of_send_to_s_egress_paths_seal_the_same_frame() {
+        let secret = "6e".repeat(32);
+        let ctx = ctx_with_phone(&secret, true).await;
+        let server = server_over(ctx.clone());
+
+        let frame = r#"{"type":"file","action":"request","id":"t9","name":"a.txt"}"#;
+        let lan = WsServer::seal_for_peer(&ctx, "ws_phone", frame).await;
+        let wire = server
+            .sealed_relay_route("dev_phone", frame, &test_route_key())
+            .await;
+        let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
+        let lan_value: Value = serde_json::from_str(&lan).expect("the LAN frame is JSON");
+
+        assert_eq!(
+            lan_value["type"], "encrypted",
+            "the LAN socket writer seals, and always did"
+        );
+        assert_eq!(
+            route["payload"]["type"], "encrypted",
+            "the relay egress must seal identically, or the same frame is \
+             confidential on one transport and readable on the other"
+        );
+        assert_eq!(
+            open_envelope(&ctx, &secret, &route["payload"]),
+            open_envelope(&ctx, &secret, &lan_value),
+            "the relay copy and the LAN copy of one frame must open identically"
+        );
+    }
+
+    /// The relay is not a blind pipe: a `pairing` frame is what establishes the
+    /// shared secret, so sealing it would leave the peer unable to derive one.
+    /// The exemption has to hold on this egress too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pairing_frame_is_not_sealed_on_the_relay_egress() {
+        let secret = "7f".repeat(32);
+        let ctx = ctx_with_phone(&secret, false).await;
+        let server = server_over(ctx);
+
+        let frame = r#"{"type":"pairing","action":"accept","public_key":"ab"}"#;
+        let wire = server
+            .sealed_relay_route("dev_phone", frame, &test_route_key())
+            .await;
+        let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
+        assert_eq!(
+            route["payload"]["type"], "pairing",
+            "wrapping a pairing frame would make it undecryptable at the peer"
+        );
+    }
+
+    /// A destination with no shared secret still gets plaintext, exactly as on
+    /// the LAN: `seal_for_device` cannot invent a key, and the relay is not the
+    /// place to fail closed against a peer we know nothing about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_frame_for_an_unknown_device_is_still_routed_verbatim() {
+        let ctx = create_test_ctx();
+        let server = server_over(ctx);
+        let frame = r#"{"type":"sms","action":"new","body":"hi"}"#;
+        let wire = server
+            .sealed_relay_route("dev_stranger", frame, &test_route_key())
+            .await;
+        let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
+        assert_eq!(route["payload"]["type"], "sms");
+        assert_eq!(route["payload"]["body"], "hi");
     }
 }

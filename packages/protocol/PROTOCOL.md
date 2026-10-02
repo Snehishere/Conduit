@@ -1428,7 +1428,9 @@ sender. An `encrypted` message that arrives unwrapped is refused with
 
 ```
 Byte  0:              version (0x02)
-Bytes 1..=16:         target device ID, ASCII, zero-padded to 16 bytes
+Bytes 1..=16:         target device ID: the id's first 16 bytes, NUL-padded
+                      — see §5.1.4, which defines the field and what an
+                      over-long id becomes
 Bytes 17..=20:        sequence number, u32 big-endian
                       (strictly increasing per sender connection)
 Bytes 21..=52:        HMAC-SHA256 tag (32 raw bytes) — see below
@@ -1438,7 +1440,8 @@ Bytes 53..:           payload
 ```
 Offset  Length  Description
 0       1       Version byte (0x02)
-1       16      Target device ID (ASCII, zero-padded, NUL-trimmed on read)
+1       16      Target device ID (the id's first 16 bytes, NUL-padded,
+                NUL-trimmed on read) — §5.1.4
 17      4       Sequence number (u32 big-endian)
 21      32      HMAC-SHA256 tag (raw bytes)
 53      N       Payload bytes
@@ -1462,8 +1465,9 @@ tag = HMAC-SHA256(
 That is: the authenticated `from_device_id`, an ASCII unit separator (`0x1F`),
 then the header (version, target id, sequence) concatenated with the payload.
 `from_device_id` is taken from the *authenticated* connection identity, never
-from the frame — the 16-byte header names only the recipient. The key is that
-connection's device's route key (§4.15.2.2), resolved through the host.
+from the frame — the 16-byte header names only the recipient, and only by prefix
+(§5.1.4). The key is that connection's device's route key (§4.15.2.2), resolved
+through the host.
 
 A **v1** frame (`0x01`, 17 bytes: version + target id + payload) is **retired
 and rejected** with `binary_version_unsupported`. v1 carried no integrity
@@ -1484,6 +1488,92 @@ need one. The relay resolves exactly one key — the one belonging to the device
 resolver, and compares in constant time. There is no ring to walk, so there is
 no "try every key we know" oracle and no window during which a retired key is
 still accepted.
+
+#### 5.1.4 The target device id field
+
+**The field is the first 16 bytes of the device id's UTF-8 encoding, NUL-padded.**
+Nothing else: no hashing, no case folding, no separators removed, no length. The
+reference implementation is `conduit_protocol::binary_target_field`, and it is
+the *only* definition — the producer (`build_binary_frame`), the relay's router
+and every receiver's identity check all call it, so the parties cannot disagree
+about what the bytes mean.
+
+Truncation is by **byte**, not by character, and it is deliberate: **every device
+id this protocol produces is longer than 16 bytes.** `device_id` is a
+36-character UUID — the desktop mints `Uuid::new_v4().to_string()` and a phone's
+id is either that or the per-connection UUID the pairing handshake falls back to
+— so a real frame's target field always carries the id's first 16 characters
+(`550e8400-e29b-41` for `550e8400-e29b-41d4-a716-446655440000`). The shorter
+spellings remain valid (§4.1: the first 16 hex chars of an X25519 key, `b145d`,
+`device-1`) and are carried whole, NUL-padded.
+
+An over-long id is therefore **canonicalised, not rejected**: the frame is built,
+tagged and delivered exactly as if the sender had written the prefix itself, and
+the tag covers those 16 bytes precisely because they are the bytes on the wire.
+
+A field is **not** a UTF-8 prefix if a multi-byte character straddles byte 16;
+`binary_target_id_invalid` says so and the frame is dropped. A `device_id` is hex
+and hyphens, so this cannot arise in practice, and it fails closed if it ever
+does rather than naming a device whose id merely looks similar.
+
+**Why a prefix, and not a truncated hash of the id.** A 128-bit digest of the id
+would make collisions far less likely, and it is still the wrong choice here:
+
+* **It would be a wire break.** Truncation is what deployed producers already
+  write. Redefining the same 16 bytes to be a digest would leave every in-flight
+  and already-built frame unresolvable, with no version byte to announce it.
+* **It changes the field's type.** The field is NUL-padded ASCII and is read back
+  as UTF-8 with trailing NULs stripped. A raw digest is a different kind of
+  value, not a different meaning of this one.
+* **It is illegible.** In a hex dump the recipient's id is right there. A digest
+  identifies nobody without recomputing it against every registered device — the
+  wrong thing to ask of an operator reading a packet capture.
+
+And the security argument does not transfer: ambiguity is handled fail-closed by
+the resolver (§5.1.5) and the tag authenticates the bytes either way. For a
+hyphenated UUIDv4 the first 16 characters carry 14 hex digits — 56 bits of that
+version's randomness — so a collision is not expected in practice (about 5e-11
+across 10 000 devices, from the birthday bound).
+
+**What happens when two ids share those 16 bytes.** Nothing, in the field: two ids
+agreeing on their first 16 bytes are *identical on the wire*, so no encoding of 16
+bytes could separate them. Everything therefore happens in the resolver:
+
+* an id of 16 bytes or fewer can never be ambiguous against a *different* id —
+  the field is then the whole id, and NUL padding keeps `device-1` and
+  `device-10` apart;
+* a receiver cannot detect the ambiguity either, because identical bytes arrive
+  whichever id was meant. **The relay is the only party that can, which is why it
+  must fail closed** (§5.1.5).
+
+#### 5.1.5 Resolving the field to a device
+
+The relay's routing table is keyed by **full** device ids while the frame carries
+16 bytes, so the relay resolves the field against its own table before it forwards
+anything. It must resolve to **exactly one** connected device:
+
+| Outcome | Relay's answer |
+|---|---|
+| Exactly one connected device has that canonical field | Re-frame and forward to it |
+| None | `binary_target_not_found`, counted as a drop, nothing forwarded |
+| Two or more | `binary_target_ambiguous`, counted as a drop, **delivered to none of them** |
+
+The ambiguous case is the one that matters: delivering to either candidate would
+put a file in front of the wrong device, so the relay refuses rather than guesses.
+The refusal names the prefix and the number of candidates, never the candidates —
+the routing table is not something an authenticated sender may enumerate. Both
+outcomes are counted in `conduit_relay_messages_dropped_total{reason="not_found"}`.
+
+A **receiver** applies the same rule in the only direction it can:
+
+```
+frame[1..17] == first 16 bytes of my own device_id
+```
+
+— compared as bytes, with the NUL padding included, which is what
+`conduit_protocol::binary_target_matches` does. Comparing the field against the
+*whole* id is wrong and refuses every correctly-addressed frame, because a 36-byte
+id can never equal 16 bytes of itself.
 
 **Mobile and desktop both send:**
 
@@ -1651,6 +1741,8 @@ listed above, before any handler runs.
 | `binary_version_unsupported` | Binary frame version was not `0x02` |
 | `binary_target_id_invalid` | The 16-byte target id is not valid UTF-8 |
 | `binary_target_id_empty` | The target id was empty after NUL-trimming |
+| `binary_target_not_found` | The frame verified, but its 16-byte target field matches no connected device (§5.1.5) |
+| `binary_target_ambiguous` | The frame verified, but its target field matches two or more connected devices, so it was delivered to none (§5.1.5) |
 | `binary_replay_detected` | Sequence number not strictly greater than the last accepted one |
 | `binary_hmac_invalid` | The frame tag did not verify |
 
@@ -1706,10 +1798,12 @@ is intended — the old forms are the vulnerability the change fixed.
    one outright; the relay stops accepting the old key within its key-refresh
    interval. Never omit `key_id`, and never reuse another device's.
 4. **Build 53-byte v2 binary frames**, with a strictly increasing per-connection
-   sequence number and a tag computed over
+   sequence number, the target id **canonicalised to its first 16 bytes** in the
+   16-byte field (§5.1.4), and a tag computed over
    `hex(from_device_id || 0x1F || frame[0..21] || payload)`, where
    `from_device_id` is the authenticated identity, keyed with the same route
-   key.
+   key. When you *receive* one, check the field against your own canonical field,
+   not against your whole device id (§5.1.5).
 5. **Keep routed frames under 1 MiB** (§2.5) or move to a binary path.
 6. **Pair before anything except `pairing`, `ping` and `pong`** — `discovery`
    is now gated, and `pairing/local_auth` is mandatory for the desktop's own
@@ -1726,6 +1820,12 @@ Documented, not fixed here:
   complete a connection. The desktop has no pin configuration target at all.
   This is live rather than hypothetical now that the relay runs by default.
 * **`sms/new` and `sms/sent` still have two incompatible shapes** (§4.11).
+* **The mobile client still compares the whole target field against its whole
+  device id** (`websocket_service.dart`, `_handleRelayBinary`). §5.1.5 says the
+  check is against the first 16 bytes of the id, so a frame the relay correctly
+  resolved to the phone is dropped on arrival. The producer side
+  (`relay_route.dart`, `buildBinaryFrame`) already writes the canonical prefix and
+  needs no change.
 * **Mobile-side drift could not be verified** from this crate. The Dart client
   was read only for the port constants that `types.rs` asserts against; whether
   it has adopted the `remote_input/key` message, the `fps` field, or
