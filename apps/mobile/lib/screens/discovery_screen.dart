@@ -187,6 +187,7 @@ class _DiscoveryScreenState extends State<DiscoveryScreen> {
                   builder: (context) => PairingScreen(
                     ip: device.address,
                     port: device.port,
+                    wssPort: device.wssPort,
                   ),
                 ),
               );

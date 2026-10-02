@@ -6,7 +6,7 @@ import { makeAutomationRule } from '../mocks';
 // ─── Mocks ────────────────────────────────────────────────────────────────────
 
 const mockSendMessage = vi.fn();
-const mockRegisterHandler = vi.fn(() => vi.fn()); // returns unregister fn
+const mockRegisterHandler = vi.fn((_type: string, _handler: (frame: unknown) => void) => vi.fn());
 
 vi.mock('../../hooks/useWebSocket', () => ({
   useSharedWebSocket: () => ({
@@ -232,6 +232,107 @@ describe('useAutomation', () => {
     });
   });
 
+  // ── Live subscription (the handler actually registered on mount) ──────────
+  //
+  // The direct-call tests above cover `handleAutomationMessage`, which the
+  // component does NOT use. `App.tsx` renders `AutomationPanel`, which reads
+  // `rules` off the hook, and the only thing that writes it in production is
+  // the callback registered here — so the two paths must agree.
+
+  describe('registered automation handler', () => {
+    const deliver = (frame: unknown) => {
+      const handler = mockRegisterHandler.mock.calls[0]?.[1];
+      expect(typeof handler).toBe('function');
+      act(() => { (handler as (frame: unknown) => void)(frame); });
+    };
+
+    it('replaces the list from an automation/sync frame', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      deliver({
+        type: 'automation',
+        action: 'sync',
+        rules: [makeAutomationRule({ id: 's1', name: 'Synced' })],
+      });
+
+      expect(result.current.rules).toHaveLength(1);
+      expect(result.current.rules[0].name).toBe('Synced');
+    });
+
+    it('keeps the existing list when a sync frame carries no rules array', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      deliver({
+        type: 'automation',
+        action: 'sync',
+        rules: [makeAutomationRule({ id: 'keep', name: 'Kept' })],
+      });
+      expect(result.current.rules).toHaveLength(1);
+
+      // A sync frame with a missing/non-array `rules` must not destroy the list:
+      // the panel maps over it, so `undefined` is a crash, not an empty state.
+      deliver({ type: 'automation', action: 'sync' });
+      expect(result.current.rules).toHaveLength(1);
+
+      deliver({ type: 'automation', action: 'sync', rules: 'not-an-array' });
+      expect(result.current.rules).toHaveLength(1);
+      expect(result.current.rules[0].name).toBe('Kept');
+    });
+
+    it('gives synced rules a numeric triggerCount', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      // The wire format carries no `triggerCount`; without a default the card
+      // renders "Triggered  times" and the next increment is NaN.
+      deliver({
+        type: 'automation',
+        action: 'sync',
+        rules: [{ id: 's2', name: 'No counters', trigger: { type: 'time' }, action: { type: 'open_url' }, enabled: true }],
+      });
+
+      expect(result.current.rules[0].triggerCount).toBe(0);
+      deliver({ type: 'automation', action: 'triggered', id: 's2', trigger_type: 'time' });
+      expect(result.current.rules[0].triggerCount).toBe(1);
+    });
+
+    it('increments the counter for a triggered frame in the documented wire shape', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      deliver({ type: 'automation', action: 'sync', rules: [makeAutomationRule({ id: 't9' })] });
+      deliver({
+        type: 'automation',
+        action: 'triggered',
+        id: 't9',
+        trigger_type: 'device_connect',
+        device_id: 'dev_x',
+      });
+
+      expect(result.current.rules[0].triggerCount).toBe(1);
+      // `AutomationTriggeredMessage` carries no timestamp, so the hook has to
+      // supply one; `RuleCard` renders it as seconds.
+      expect(typeof result.current.rules[0].lastTriggered).toBe('number');
+      expect(result.current.rules[0].lastTriggered).toBeGreaterThan(0);
+    });
+
+    it('prefers an explicit timestamp when the sender supplies one', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      deliver({ type: 'automation', action: 'sync', rules: [makeAutomationRule({ id: 't10' })] });
+      deliver({ type: 'automation', action: 'triggered', id: 't10', timestamp: 9999 });
+
+      expect(result.current.rules[0].lastTriggered).toBe(9999);
+    });
+
+    it('removes a rule from a delete frame addressed by id', () => {
+      const { result } = renderHook(() => useAutomation());
+
+      deliver({ type: 'automation', action: 'sync', rules: [makeAutomationRule({ id: 'd1' })] });
+      deliver({ type: 'automation', action: 'deleted', id: 'd1' });
+
+      expect(result.current.rules).toHaveLength(0);
+    });
+  });
+
   // ── createRule ────────────────────────────────────────────────────────────
 
   it('createRule adds a rule with generated id and triggerCount=0', () => {
@@ -272,6 +373,28 @@ describe('useAutomation', () => {
       action: 'rule',
       rule: expect.objectContaining({ name: 'WS Rule' }),
     });
+  });
+
+  it('sends the nested rule frame the hub parses, not the flat generated one', () => {
+    const { result } = renderHook(() => useAutomation());
+
+    act(() => {
+      result.current.createRule({
+        name: 'Shape Rule',
+        trigger: { type: 'time', time: '08:00' },
+        action: { type: 'open_url', url: 'https://example.com' },
+        enabled: true,
+      });
+    });
+
+    // `automation.rs::parse_rule_packet` unwraps `rule` and only falls back to
+    // the flat fields, so the nested shape is the one on the wire. The generated
+    // `AutomationRuleMessage` is flat and describes a frame nobody sends (W1.5);
+    // this pins the shape we do send so it cannot drift silently.
+    const sent = mockSendMessage.mock.calls[0][0];
+    expect(Object.keys(sent).sort()).toEqual(['action', 'rule', 'type']);
+    expect(sent.rule_action).toBeUndefined();
+    expect(sent.rule.name).toBe('Shape Rule');
   });
 
   // ── toggleRule ────────────────────────────────────────────────────────────

@@ -170,18 +170,27 @@ pub async fn handle_automation_triggered(msg: Value, ctx: &WsContext) {
             .await;
         info!("Automation: rule {} executed ({})", rule_id, trigger_type);
     } else {
+        // This action is not desktop-executable. Nothing was sent to the target
+        // device: the desktop does not emit `automation/triggered` outbound
+        // (see W1.16), so there is no path by which a phone could have run it.
+        // Logging `success = true` with "action executes on the target" claimed
+        // an execution that happened nowhere — the same false-success shape as
+        // W3.1, one layer up. The honest record is a failure that says why.
         let _ = ctx
             .storage
             .log_automation_execution(
                 &rule.id,
                 trigger_type,
                 timestamp,
-                true,
-                Some("action executes on the target phone/tablet; desktop logged only"),
+                false,
+                Some(
+                    "not executed: this action runs on the target device, and the desktop \
+                     does not currently forward automation triggers to peers",
+                ),
             )
             .await;
-        info!(
-            "Automation: rule {} targets a remote device ({}), no desktop action",
+        warn!(
+            "Automation: rule {} targets a remote device ({}), nothing was sent",
             rule_id,
             crate::automation::action_tag(&rule.action)
         );
@@ -194,8 +203,14 @@ mod tests {
     use crate::server::handlers::test_helpers::{add_test_client, create_test_ctx};
 
     /// Wire-format packet the frontend sends: nested `rule` object holding
-    /// `trigger` + `action`. Uses a `send_notification` action because it is
-    /// desktop-executable but has NO real side effects (just logs a row).
+    /// `trigger` + `action`. Uses `run_shell_command` because it is the only
+    /// action the desktop genuinely executes, so asserting `success` is
+    /// asserting something true. `execute_action` passes no allowlist on this
+    /// path (the allowlist is only enforced for externally-triggered actions),
+    /// so a bare `echo` runs and exits 0. This was `send_notification`, which
+    /// has no implementation at all and now honestly reports failure — a
+    /// fixture depending on that would have been asserting the very bug W3.1
+    /// removed.
     fn rule_packet(id: &str) -> Value {
         serde_json::json!({
             "type": "automation",
@@ -205,7 +220,7 @@ mod tests {
                 "name": format!("Rule {id}"),
                 "enabled": true,
                 "trigger": { "type": "device_connect", "device_id": "*" },
-                "action": { "type": "send_notification", "title": "T", "body": "B" }
+                "action": { "type": "run_shell_command", "command": "echo automation" }
             }
         })
     }

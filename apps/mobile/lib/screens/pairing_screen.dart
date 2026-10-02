@@ -8,8 +8,13 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 class PairingScreen extends StatefulWidget {
   final String? ip;
   final int? port;
+  /// TLS port the peer advertised over mDNS (`wss_port` TXT property). Pairing
+  /// dials this, not [port]: [port] is the plaintext SRV port, which exists in
+  /// the TXT record so the entry reads the way it looks on the network. When
+  /// null the client's compiled-in default is used.
+  final int? wssPort;
 
-  const PairingScreen({super.key, this.ip, this.port});
+  const PairingScreen({super.key, this.ip, this.port, this.wssPort});
 
   @override
   State<PairingScreen> createState() => _PairingScreenState();
@@ -181,7 +186,7 @@ class _PairingScreenState extends State<PairingScreen> {
                 final code = _codeController.text.trim();
                 if (code.isNotEmpty) {
                   final wsService = context.read<WebSocketService>();
-                  svc.pairFromCode(code, wsService, ip: widget.ip, port: widget.port);
+                  svc.pairFromCode(code, wsService, ip: widget.ip, port: widget.port, wssPort: widget.wssPort);
                 }
               },
               child: const Text('Connect'),

@@ -1,39 +1,54 @@
 name: ci
 
 # ===========================================================================
-# THIS WORKFLOW HAS NEVER BEEN EXECUTED.
+# THIS WORKFLOW HAS BEEN EXECUTED. It runs on every push to main.
 #
-# Conduit had no git remote until the first public release. Every job below
-# was written by reading the tree, not by running it. The first push to a
-# real remote is the first execution of this file, and the following jobs are
-# EXPECTED TO NEED FIXING on that run. This is deliberate disclosure, not an
-# oversight, and it is the reason this banner exists.
+# It was written by reading the tree rather than by running it, and the first
+# execution is what found the defects it had been carrying: the icon drift
+# job's setup-python cache key, and the `import type { any }` parse error in the
+# dev server that only the e2e step could reach. Both are fixed in this file and
+# both were invisible to every other step.
 #
-# Expected red or non-green on the very first run:
+# Run history on `main`, all four jobs green end to end:
+#   36737997124  Build the relay into the app, and give each device its own
+#                signing key                                                    success
+#   36834961099  Make the relay deliver anything, and pin certificates on the
+#                SPKI                                                          success
+#   36840097378  Bound every binary frame, and the queue behind it               success
+#   36850507922  Close fourteen items in the relay's W6 section                 success
 #
-#   node      - `npm run lint` exits 1 today: 15 errors across 19 files. The
-#               step is marked continue-on-error for that reason alone.
-#   rust      - the desktop crate (`conduit`) has no verified Linux build
-#               path. Its clippy/test/release steps are all continue-on-error.
-#               See the long comment in that job.
-#   hygiene   - the tauri.conf.json entitlements path-case check is currently
-#               RED for real. It found a live macOS codesign bug. Marked
+# A green run means the BLOCKING steps passed. Steps marked
+# continue-on-error below still report their own failure as an annotation, and
+# these are red right now:
+#   node      - `npm run lint` exits 1: 15 errors across 19 files. The step is
+#               marked continue-on-error for that reason alone.
+#   rust      - all three desktop-crate steps exit 101. The blocker is a missing
+#               system library, not OpenSSL: `alsa-sys` (via cpal) cannot find
+#               alsa.pc. libasound2-dev is now installed for it; the three steps
+#               stay continue-on-error until a run proves the crate's TESTS
+#               pass on Linux, not merely compile. See the long comment there.
+#   rust      - `cargo audit` and `cargo deny check advisories` both exit
+#               non-zero on real findings: RUSTSEC-2024-0429 (glib, unsound),
+#               a yanked yoke-derive, and a tail of "unmaintained" advisories.
+#               Non-blocking; needs a deny.toml with an explicit policy, or
+#               dependency bumps.
+#   hygiene   - the tauri.conf.json entitlements path-case check is RED for
+#               real. It found a live macOS codesign bug. Marked
 #               continue-on-error so the finding is visible without taking the
 #               other three hygiene checks down with it.
 #   flutter   - `dart format --set-exit-if-changed` fails: 63 of 74 Dart files
 #               are unformatted. `flutter analyze --fatal-infos` is
 #               non-blocking for a different reason. Both already were.
-#   codegen   - fixed in this file. The drift gate itself is expected to pass:
-#               `npm run generate` exits 0, is byte-for-byte idempotent, and
-#               both generated clients are a fresh render of schema.json.
-#   icons     - expected to pass. Verified locally: 36 tracked assets,
-#               188 assertions, 0 problems, Pillow 12.3.0.
 #
-# Verified green before the first run, on the crates that build portably:
+# Measured green on CI (run 36737997124), on the crates that build portably:
 #   cargo fmt --all -- --check                                  exit 0
 #   cargo clippy -p conduit-protocol -p conduit-relay --all-targets    exit 0
-#   cargo test  -p conduit-protocol -p conduit-relay                    266 + 183 passed
+#   cargo test  -p conduit-protocol -p conduit-relay               275 + 188 passed
 #   cargo build -p conduit-protocol -p conduit-relay --release          exit 0
+#
+# The codegen drift gate and the icon drift gate are both blocking and both pass:
+# `npm run generate` is byte-for-byte idempotent, and 36 tracked brand assets
+# verify against the spec with 0 problems.
 #
 # Policy applied throughout, so the above list is not a matter of taste:
 #   - A step that fails for a reason fixable inside this file (a wrong path, a
@@ -77,6 +92,19 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege, for every job in this file. Nothing here writes to the
+# repository: there is deliberately no deploy, publish or release automation,
+# and no step pushes a commit, a tag or a package. `contents: read` is exactly
+# what actions/checkout needs.
+#
+# This matters more than it looks. Without an explicit block, every job
+# inherits whatever the repository's default GITHUB_TOKEN permissions are, and
+# checkout persists that token into .git/config for the remainder of the job.
+# A default of read/write would hand all six jobs a write-capable credential
+# for no benefit.
+permissions:
+  contents: read
+
 jobs:
   # ------------------------------------------------------------------
   # Rust: fmt, clippy, test, build.
@@ -93,6 +121,13 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-latest
+    # Generous, because two steps compile tools from source on a cold cache:
+    # `cargo install cargo-audit --locked` and `cargo install cargo-deny
+    # --locked`. Observed 2m57s WITH the rust-cache; the dependabot PRs that
+    # ran without a cache took 16-18 minutes. The point of the limit is a
+    # hung runner, not a slow one: GitHub's own default is 360 minutes, so a
+    # step that wedges holds a runner for six hours before anything says so.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -101,11 +136,19 @@ jobs:
         # vendored-OpenSSL question below - see the note there.
         # The two portable crates need none of this; it is here only so
         # the non-blocking desktop steps have a chance of running.
+        #
+        # libasound2-dev was ADDED after run 36737997124: the desktop crate's
+        # clippy/test/release steps all exited 101 on `failed to run custom
+        # build command for alsa-sys`, because cpal pulls in alsa-sys, whose
+        # build script shells out to `pkg-config --libs --cflags alsa`. That
+        # was the first hard failure on Linux and it has nothing to do with
+        # OpenSSL. The package exists in noble and in resolute, so it survives
+        # the ubuntu-latest -> Ubuntu 26 migration.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev librsvg2-dev \
-            libayatana-appindicator3-dev patchelf
+            libayatana-appindicator3-dev patchelf libasound2-dev
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -169,31 +212,64 @@ jobs:
       #   OPENSSL_LIB_DIR   = .tools/openssl-win64/lib/static
       #   OPENSSL_INCLUDE_DIR = .tools/openssl-win64/include
       #
-      # Three facts make this unresolvable on a Linux runner as written.
+      # WHAT RUN 36737997124 ACTUALLY SHOWED, which is not what this comment
+      # used to predict. All three desktop steps exited 101 with
       #
-      #  1. .tools/ is gitignored and is absent from a fresh clone. It is
-      #     ~80 MB of .lib/.h with no fetch script, no version pin and no
-      #     SHA-256 check. scripts/fetch-openssl.ps1 does not exist; it is
-      #     tracked as outstanding work in the project notes.
+      #   error: failed to run custom build command for `alsa-sys v0.4.0`
+      #   thread 'main' panicked at .../alsa-sys-0.4.0/build.rs:13:19:
+      #   pkg-config exited with status code 1
+      #   Package alsa was not found in the pkg-config search path.
       #
-      #  2. The [env] table is UNCONDITIONAL. It is not scoped to
-      #     [target.x86_64-pc-windows-msvc], so cargo exports those two
-      #     variables on Linux too, pointing at a directory that is not
-      #     there. Anything that honours OPENSSL_LIB_DIR will abort on the
-      #     missing directory.
+      # cpal pulls in alsa-sys. So the first hard failure on Linux was a
+      # MISSING APT PACKAGE, and libasound2-dev (added above) is the fix for
+      # it. OpenSSL was never reached. Nothing about this crate has been
+      # verified on Linux, which is why the three steps are still
+      # continue-on-error.
       #
-      #  3. Cargo.lock contains NO openssl-sys and NO openssl-src. The
-      #     only crypto-adjacent entries are libsqlite3-sys 0.38.2 (deps:
-      #     cc, pkg-config, vcpkg). So the consumer is libsqlite3-sys's own
-      #     build script, not an openssl-sys build script - which means the
-      #     Linux behaviour depends on whether that build script prefers
-      #     pkg-config (finding the system OpenSSL that libssl-dev installs
-      #     above) or honours OPENSSL_LIB_DIR first.
+      # The two facts below were the ones thought to be unresolvable. One is
+      # fixed; the other cannot be fixed the way this file used to suggest:
       #
-      # Point 3 was NOT resolved. It cannot be resolved from a Windows
-      # checkout, and guessing wrong here is how a build ends up green on a
-      # maintainer laptop and red on every runner. So every step below is
-      # continue-on-error and emits a warning instead.
+      #  1. FIXED. .tools/ is gitignored and absent from a fresh clone, but
+      #     scripts/fetch-openssl.ps1 now exists: it downloads a PINNED
+      #     OpenSSL 3.5.8, verifies the archive's SHA-256 against the digest
+      #     GitHub publishes for the release asset, checks the archive size,
+      #     extracts to .tools/openssl-win64, and asserts that
+      #     lib/static/{libcrypto,libssl}.lib and include/openssl are present
+      #     before it reports success. `-Check` verifies an existing tree
+      #     without downloading.
+      #
+      #  2. NOT FIXED, and the obvious one-liner does not work. Scoping that
+      #     [env] table to a target triple is impossible in cargo 1.98:
+      #     `relative = true` under [target.x86_64-pc-windows-msvc.env] is a
+      #     hard PARSE ERROR ("expected a string, but found a table"), and
+      #     every other spelling parses and then never exports the variable at
+      #     all - measured on cargo 1.98.1 with and without --target, and via
+      #     [target.'cfg(windows)'.env]. Without `relative` the values would be
+      #     resolved against the process CWD rather than the config file, and
+      #     build scripts do not run in the directory cargo was invoked from,
+      #     so a plain string is not a fallback either. The config file is
+      #     therefore still exporting OPENSSL_LIB_DIR on every platform, and a
+      #     Linux runner still gets a path that does not exist. The fix is to
+      #     stop relying on that file (see the a/b list below), not to retarget
+      #     it.
+      #
+      # STILL OPEN, and the reason these steps are not yet a gate:
+      #
+      #  3. Cargo.lock contains NO openssl-sys and NO openssl-src. The only
+      #     crypto-adjacent entries are libsqlite3-sys 0.38.2 (deps: cc,
+      #     pkg-config, vcpkg). So the consumer is libsqlite3-sys's own build
+      #     script, not an openssl-sys build script. Whether it prefers the
+      #     OPENSSL_LIB_DIR above over pkg-config is UNKNOWN on Linux, because
+      #     the build died on alsa-sys long before reaching it. libssl-dev is
+      #     installed above, so if it does prefer pkg-config this resolves
+      #     itself; if it does not, the crate cannot link here at all.
+      #
+      #  4. Fixing alsa-sys only moves the failure to the next native crate.
+      #     The desktop tree also carries enigo (x11rb/xkbcommon, pure Rust),
+      #     xcap (the xcb crate), keyring 4 (zbus-secret-service, pure Rust at
+      #     build time but it needs a Secret Service at RUN time, and a
+      #     headless runner has none) and tauri itself. None of those has been
+      #     observed to build on Linux, because the build never got that far.
       #
       # There is a second, independent risk in the same crate even if the
       # OpenSSL question resolves favourably: cpal, enigo, xcap and keyring
@@ -203,13 +279,23 @@ jobs:
       # that box.
       #
       # TO MAKE THESE BLOCKING, in order:
-      #   a. Add scripts/fetch-openssl.ps1 (or a Linux equivalent) that
-      #      downloads a pinned OpenSSL with a verified SHA-256.
-      #   b. Scope .cargo/config.toml's [env] to the Windows target triple,
-      #      or delete it in favour of the fetch script exporting the
-      #      variables only where they apply.
+      #   a. DONE, partly. scripts/fetch-openssl.ps1 downloads a pinned OpenSSL
+      #      3.5.8 and verifies its SHA-256, so a fresh clone can build the
+      #      desktop crate on Windows. It does not run on this job - it is not
+      #      needed here, because on Linux SQLCipher links the system
+      #      libssl-dev.
+      #   b. NOT DONE, because it cannot be done as described. The [env] table
+      #      in .cargo/config.toml cannot be retargeted in cargo 1.98 (see
+      #      point 2). Either delete that file and have a bootstrap wrapper
+      #      export the variables before exec'ing cargo - which changes every
+      #      documented `cargo build -p conduit` invocation - or drop the
+      #      vendored copy entirely for the vcpkg / libssl-dev route. Both are
+      #      larger changes than this file should make on its own.
       #   c. Run this job once on a Linux runner and confirm the desktop
-      #      crate's tests actually pass, not merely compile.
+      #      crate's tests actually PASS, not merely compile. libasound2-dev
+      #      is in; whatever native crate fails next is the next thing to fix.
+      #      If a test needs a Secret Service, either install one or exclude
+      #      it - but do NOT delete the test to make the job green.
       #   d. Delete `continue-on-error: true` from the three steps below.
       #
       # Until then these steps are a tripwire, not a gate. They are worth
@@ -218,13 +304,13 @@ jobs:
 
       - name: cargo clippy -p conduit (non-blocking, see comment above)
         run: |
-          echo "::warning title=Desktop crate unverified on Linux::apps/desktop/src-tauri (crate 'conduit') has no verified Linux build path. Vendored OpenSSL under .tools/ is gitignored with no fetch script, and .cargo/config.toml exports it unconditionally. Non-blocking until that is fixed."
+          echo "::warning title=Desktop crate unverified on Linux::apps/desktop/src-tauri (crate 'conduit') still has no GREEN run on Linux. The last observed failure was a missing system library, not OpenSSL. Non-blocking until one run proves clippy, test and build all pass."
           cargo clippy -p conduit --all-targets --locked -- -D warnings
         continue-on-error: true
 
       - name: cargo test -p conduit (non-blocking, see comment above)
         run: |
-          echo "::warning title=Desktop crate unverified on Linux::The 696 desktop Rust tests have only ever run on Windows. Treated as advisory here."
+          echo "::warning title=Desktop crate unverified on Linux::729 desktop Rust tests pass on a maintainer's Windows machine and have never executed on a Linux runner. Advisory here."
           cargo test -p conduit --locked
         continue-on-error: true
 
@@ -241,6 +327,11 @@ jobs:
       # the crate compiles at all on Linux is the open question, not just
       # whether it links. clippy and test both have to compile it. The claim
       # has been removed rather than softened.
+      #
+      # STILL TRUE, and now demonstrated rather than argued: the run that followed
+      # showed the crate failing to COMPILE on a missing alsa.pc, not merely to
+      # link. "Does it compile" was the right question. The answer is not yes
+      # yet.
 
       # ---- supply chain, both NON-BLOCKING -------------------------------
 
@@ -282,6 +373,10 @@ jobs:
   node:
     name: node
     runs-on: ubuntu-latest
+    # `npx playwright install --with-deps chromium` downloads a browser and a
+    # pile of apt packages, so this is not a fast job even when it is a green
+    # one. Observed 4m46s. Anything past 45 minutes is a hang.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/desktop
@@ -405,6 +500,9 @@ jobs:
   codegen:
     name: codegen drift
     runs-on: ubuntu-latest
+    # npm ci plus two generator runs. Observed 18s. 20 minutes is ~60x that,
+    # which leaves room for a slow registry while still catching a hung step.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/desktop
@@ -471,6 +569,8 @@ jobs:
   icons:
     name: icon drift
     runs-on: ubuntu-latest
+    # Renders 36 brand assets with Pillow. Observed 16s.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: apps/desktop
@@ -534,6 +634,10 @@ jobs:
   flutter:
     name: flutter
     runs-on: ubuntu-latest
+    # subosito/flutter-action caches the SDK but still downloads it on a cold
+    # cache, and that download is the single slowest thing in this job.
+    # Observed 1m0s warm.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: apps/mobile
@@ -622,6 +726,9 @@ jobs:
   hygiene:
     name: hygiene
     runs-on: ubuntu-latest
+    # Four `git ls-files` greps. Observed 5s. Ten minutes cannot be reached by
+    # any of this job's work, so reaching it means the runner is wedged.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

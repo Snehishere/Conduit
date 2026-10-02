@@ -61,7 +61,7 @@ class NotificationsScreen extends StatelessWidget {
               },
               onMarkRead: () {
                 ws.sendNotificationMarkRead(n.id);
-                svc.dismissNotification(n.id);
+                svc.markReadNotification(n.id);
               },
             );
           },
@@ -146,12 +146,17 @@ class _NotificationCard extends StatelessWidget {
     return Dismissible(
       key: Key(notification.id),
       direction: DismissDirection.horizontal,
-      onDismissed: (direction) {
+      // Only a swipe towards the delete affordance removes the row. Swiping
+      // the other way marks it read and is then cancelled, so the card springs
+      // back and stays visible with its read styling — dismissing it here would
+      // hide a notification the list still holds.
+      confirmDismiss: (direction) async {
         if (direction == DismissDirection.startToEnd) {
           onDismiss();
-        } else {
-          onMarkRead();
+          return true;
         }
+        onMarkRead();
+        return false;
       },
       background: Container(
         alignment: Alignment.centerLeft,
@@ -177,13 +182,20 @@ class _NotificationCard extends StatelessWidget {
             ),
             child: Icon(
               _getAppIcon(notification.app),
-              color: _getAppColor(notification.app),
+              color: _getAppColor(notification.app).withValues(
+                alpha: notification.read ? 0.4 : 1.0,
+              ),
               size: 20,
             ),
           ),
           title: Text(
             notification.title,
-            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: colors.text1),
+            style: TextStyle(
+              fontSize: 14,
+              fontWeight:
+                  notification.read ? FontWeight.w400 : FontWeight.w600,
+              color: notification.read ? colors.text2 : colors.text1,
+            ),
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
           ),

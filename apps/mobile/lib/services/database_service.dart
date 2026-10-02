@@ -14,7 +14,27 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 ///   - sms_threads           (no auto-prune — native is source of truth)
 class DatabaseService {
   static const _dbName = 'conduit_mobile.db';
-  static const _dbVersion = 1;
+  static const _dbVersion = 2;
+
+  /// The `read` column landed in v2. Exposed so the schema and the migration
+  /// that introduces it cannot drift apart: `read` is what makes "mark as
+  /// read" a persisted fact rather than a no-op.
+  static const notificationReadColumnUpgrade =
+      'ALTER TABLE notification_history ADD COLUMN read INTEGER NOT NULL DEFAULT 0';
+
+  static const notificationTableDdl = '''
+      CREATE TABLE notification_history (
+        id          TEXT PRIMARY KEY,
+        device_id   TEXT NOT NULL,
+        app         TEXT NOT NULL,
+        title       TEXT NOT NULL,
+        body        TEXT NOT NULL,
+        timestamp   INTEGER NOT NULL,
+        actions     TEXT,
+        read        INTEGER NOT NULL DEFAULT 0,
+        created_at  INTEGER NOT NULL
+      )
+    ''';
 
   Database? _db;
 
@@ -51,18 +71,7 @@ class DatabaseService {
   }
 
   Future<void> _onCreate(Database db, int version) async {
-    await db.execute('''
-      CREATE TABLE notification_history (
-        id          TEXT PRIMARY KEY,
-        device_id   TEXT NOT NULL,
-        app         TEXT NOT NULL,
-        title       TEXT NOT NULL,
-        body        TEXT NOT NULL,
-        timestamp   INTEGER NOT NULL,
-        actions     TEXT,
-        created_at  INTEGER NOT NULL
-      )
-    ''');
+    await db.execute(notificationTableDdl);
 
     await db.execute('''
       CREATE TABLE clipboard_history (
@@ -112,7 +121,11 @@ class DatabaseService {
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
-    // Future migrations go here
+    // v1 -> v2: notifications gained a `read` flag. Rows written by v1 default
+    // to unread, which is the truth for anything the user had not dismissed.
+    if (oldVersion < 2) {
+      await db.execute(notificationReadColumnUpgrade);
+    }
   }
 
   // ── Notifications ───────────────────────────────────────────────────
@@ -130,6 +143,18 @@ class DatabaseService {
 
   Future<void> deleteNotification(String id) async {
     await db.delete('notification_history', where: 'id = ?', whereArgs: [id]);
+  }
+
+  /// Record that a notification has been read. Returns the number of rows
+  /// changed, so a caller can tell "marked" from "no such notification" instead
+  /// of assuming success.
+  Future<int> markNotificationRead(String id) async {
+    return db.update(
+      'notification_history',
+      {'read': 1},
+      where: 'id = ?',
+      whereArgs: [id],
+    );
   }
 
   // ── Clipboard ───────────────────────────────────────────────────────

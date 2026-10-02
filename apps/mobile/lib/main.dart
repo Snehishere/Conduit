@@ -16,6 +16,7 @@ import 'services/pairing_service.dart';
 import 'services/automation_service.dart';
 import 'services/audio_stream_service.dart';
 import 'services/database_service.dart';
+import 'services/native_screen_capture.dart';
 import 'models/conduit_notification.dart';
 
 const _nativeChannel = MethodChannel('com.conduit.mobile/native');
@@ -162,6 +163,13 @@ void main() async {
       final body = msg['body'] as String?;
       if (to != null && body != null) {
         smsService.sendSms(to, body);
+      }
+    } else if (action == 'mark_read') {
+      // A peer opened the thread; clear its unread state here too, or this
+      // device's badge says unread about a thread the user is looking at.
+      final threadId = msg['thread_id'] as String?;
+      if (threadId != null) {
+        smsService.markThreadRead(threadId);
       }
     }
   });
@@ -326,6 +334,16 @@ void main() async {
       _nativeChannel.invokeMethod(action!, msg);
     }
   });
+
+  // Subscribe to native capture frames for the whole app lifetime. Both
+  // natives push frames on the shared `com.conduit.mobile/events` channel with
+  // argument `screen_mirror`, and until something subscribes to that argument
+  // they are produced and dropped: the phone starts capturing and the desktop's
+  // canvas never fills. Registering here rather than inside the mirror screen
+  // is deliberate - the relay must outlive any one screen, because the desktop
+  // may ask for a stream while the user is elsewhere in the app. The handler is
+  // idempotent, so a second attach is harmless.
+  NativeScreenCapture.attachTo(websocketService);
 
   // The desktop sends touch, key and scroll events for this phone to apply.
   // Android only — the iOS handlers return not-implemented.

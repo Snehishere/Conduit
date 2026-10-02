@@ -168,11 +168,23 @@ class NotificationService extends ChangeNotifier {
 
   /// Mark a notification as read.
   ///
-  /// Not implemented: [ConduitNotification] has no read flag, so there is
-  /// nothing to persist. The UI currently marks a notification read by removing
-  /// it, and sends the desktop a `mark_read` action over the WebSocket. Add a
-  /// read column before this needs to do anything.
-  void markReadNotification(String id) {}
+  /// The entry stays in the list and on disk — only the flag moves. Deleting
+  /// the row here (what the UI used to do) destroyed the notification on the
+  /// phone, so the desktop was told "read" while the phone's copy vanished.
+  Future<void> markReadNotification(String id) async {
+    final index = _notificationsList.indexWhere((n) => n.id == id);
+    if (index < 0 || _notificationsList[index].read) return;
+
+    _notificationsList[index] = _notificationsList[index].copyWith(read: true);
+    notifyListeners();
+
+    if (_db == null) return;
+    try {
+      await _db!.markNotificationRead(id);
+    } catch (e) {
+      debugPrint('[NotificationService] Failed to mark $id read: $e');
+    }
+  }
 
   @override
   void dispose() {

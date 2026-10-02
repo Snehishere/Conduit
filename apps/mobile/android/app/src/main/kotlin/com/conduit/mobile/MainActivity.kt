@@ -360,6 +360,7 @@ class MainActivity : FlutterActivity() {
         )
 
         cursor?.use {
+            val idIdx = it.getColumnIndex("_id")
             val addressIdx = it.getColumnIndex("address")
             val bodyIdx = it.getColumnIndex("body")
             val dateIdx = it.getColumnIndex("date")
@@ -368,6 +369,11 @@ class MainActivity : FlutterActivity() {
 
             while (it.moveToNext()) {
                 val thread = JSONObject()
+                // Stable across reads, and unique per message. Without it the
+                // Dart reader has to synthesise an id (sms_service.dart
+                // _nativeId), which can only distinguish messages by sender and
+                // second.
+                thread.put("id", "sms_${it.getLong(idIdx)}")
                 thread.put("address", it.getString(addressIdx) ?: "")
                 thread.put("body", it.getString(bodyIdx) ?: "")
                 thread.put("timestamp", (it.getLong(dateIdx) / 1000).toInt())

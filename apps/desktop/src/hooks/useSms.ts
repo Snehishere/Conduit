@@ -35,7 +35,7 @@ export function useSms(
   ) => Promise<SendResult>,
 ) {
   const [threads, setThreads] = useState<SmsThread[]>([]);
-  const [selectedThread, setSelectedThread] = useState<string | null>(null);
+  const [selectedThread, setSelectedThreadState] = useState<string | null>(null);
 
   const handleSmsMessage = useCallback((data: WebSocketMessage) => {
     if (data.type !== 'sms') return;
@@ -124,13 +124,50 @@ export function useSms(
     sendMessage(msg);
   }, [sendMessage, sendSensitive]);
 
-  const markRead = useCallback((threadId: string) => {
+  /**
+ * Clear a thread's unread state, locally and on the phone that owns it.
+ *
+ * W4.22: this used to exist and be exported but nothing called it, so opening a
+ * thread left its badge untouched for the life of the session.
+ *
+ * `sms/mark_read` carries no message content, so it goes out in the clear like
+ * every other `sms` frame — the hub relays the whole type unexamined
+ * (`server/mod.rs:933`). It is a no-op when the thread is already read, which
+ * keeps a re-selection of the open thread from putting a frame on the wire.
+ */
+const markRead = useCallback(
+  (threadId: string) => {
+    const target = threads.find((t) => t.thread_id === threadId);
+    if (!target || target.unread_count === 0) return;
+
     setThreads((prev) =>
       prev.map((t) =>
-        t.thread_id === threadId ? { ...t, unread_count: 0 } : t
-      )
+        t.thread_id === threadId
+          ? {
+              ...t,
+              unread_count: 0,
+              messages: t.messages.map((m) => ({ ...m, read: true })),
+            }
+          : t,
+      ),
     );
-  }, []);
+    sendMessage?.({ type: 'sms', action: 'mark_read', thread_id: threadId });
+  },
+  [threads, sendMessage],
+);
+
+/**
+ * Selecting a thread is what "reading" it means, so the selection setter
+ * clears the unread count itself. Anything else that wants to open a thread has
+ * to go through here or the badge comes back.
+ */
+const setSelectedThread = useCallback(
+  (threadId: string | null) => {
+    setSelectedThreadState(threadId);
+    if (threadId !== null) markRead(threadId);
+  },
+  [markRead],
+);
 
   const getSelectedThread = useCallback(() => {
     return threads.find((t) => t.thread_id === selectedThread) || null;

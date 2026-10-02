@@ -70,6 +70,14 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
     // Screen mirror state
     private var isScreenCapturing = false
     private var screenCaptureTimer: Timer?
+    /// Guards `isScreenCapturing` and `lastFrameEmit`.
+    ///
+    /// ReplayKit invokes the capture handler on its own queue while
+    /// `stopScreenMirror` mutates the same state from the main queue, so these
+    /// are read and written from two threads.
+    private let captureLock = NSLock()
+    /// `systemUptime` at which the last frame was emitted, for the fps clamp.
+    private var lastFrameEmit: TimeInterval = 0
 
     override func application(
         _ application: UIApplication,
@@ -259,8 +267,40 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
 
     // MARK: - Screen Mirror (ReplayKit)
 
+    /// Width and JPEG quality for a requested `quality`, matching the ladder
+    /// `ScreenMirrorService.kt:69-81` uses on Android.
+    ///
+    /// The scale is a fraction of the screen's own width, so the two platforms
+    /// pick the same picture size for the same request instead of one of them
+    /// ignoring the request entirely.
+    private static func qualityLadder(_ quality: String?) -> (scale: CGFloat, jpeg: CGFloat) {
+        switch quality {
+        case "low":    return (0.25, 0.60)
+        case "high":   return (0.75, 0.90)
+        default:       return (0.50, 0.80)
+        }
+    }
+
+    /// The requested frame rate, clamped to `1...30`.
+    ///
+    /// Same bound `ScreenMirrorService.kt:82` applies, so asking for more only
+    /// wastes battery and bandwidth: the desktop renders at most 30 fps and the
+    /// hub's per-type budget is sized for that.
+    private static func frameRate(_ fps: Any?) -> Double {
+        var requested = 15.0
+        if let number = fps as? NSNumber {
+            requested = number.doubleValue
+        } else if let text = fps as? String, let parsed = Double(text) {
+            requested = parsed
+        }
+        return min(max(requested, 1.0), 30.0)
+    }
+
     private func startScreenMirror(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard !isScreenCapturing else {
+        captureLock.lock()
+        let alreadyCapturing = isScreenCapturing
+        captureLock.unlock()
+        guard !alreadyCapturing else {
             result(false)
             return
         }
@@ -275,51 +315,93 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
             return
         }
 
+        // The arguments the caller chose. Previously both were ignored and the
+        // capture ran at a hardcoded 640pt / quality 0.5 whatever was asked for.
+        let arguments = call.arguments as? [String: Any]
+        let ladder = Self.qualityLadder(arguments?["quality"] as? String)
+        let fps = Self.frameRate(arguments?["fps"])
+
+        // One `CIContext` for the session. Building a `CIContext` allocates GPU
+        // resources and costs milliseconds, and the previous code built one *per
+        // sample buffer* — dozens of allocations a second competing with the
+        // encode they were supposed to be doing. Captured strongly below, which
+        // keeps it alive for as long as the capture runs.
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        captureLock.lock()
+        lastFrameEmit = 0
+        isScreenCapturing = true
+        captureLock.unlock()
+
         recorder.startCapture(handler: { [weak self] (sampleBuffer, type, error) in
-            guard let self = self, error == nil else { return }
+            guard let self = self, error == nil, type == .screen else { return }
 
-            if type == .screen {
-                // Extract the pixel buffer and send metadata through the EventChannel.
-                // Sending full frames as raw bytes over EventChannel is expensive;
-                // we send metadata + a base64 JPEG snapshot at the configured interval.
-                // For production, a more efficient path (e.g. adding the sample buffer
-                // directly to a VideoToolBox encoder) would be preferable.
-                guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-                let ciImage = CIImage(cvImageBuffer: imageBuffer)
-                let context = CIContext(options: [.useSoftwareRenderer: false])
-                guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
+            // Throttle to the requested rate. ReplayKit hands over a sample
+            // buffer per display refresh, so without this every frame is
+            // resized, JPEG-encoded, base64'd and pushed across the channel —
+            // several times the rate anyone asked for.
+            let now = ProcessInfo.processInfo.systemUptime
+            self.captureLock.lock()
+            let due = now - self.lastFrameEmit >= (1.0 / fps)
+            if due { self.lastFrameEmit = now }
+            self.captureLock.unlock()
+            guard due else { return }
 
-                let uiImage = UIImage(cgImage: cgImage)
-                // Resize to reduce bandwidth
-                let maxWidth: CGFloat = 640
-                let scale = min(maxWidth / uiImage.size.width, 1.0)
-                let newSize = CGSize(width: uiImage.size.width * scale,
-                                     height: uiImage.size.height * scale)
-                let renderer = UIGraphicsImageRenderer(size: newSize)
-                let resized = renderer.image { _ in
-                    uiImage.draw(in: CGRect(origin: .zero, size: newSize))
-                }
+            // Extract the pixel buffer and send metadata through the EventChannel.
+            // Sending full frames as raw bytes over EventChannel is expensive;
+            // we send metadata + a base64 JPEG snapshot at the configured interval.
+            // For production, a more efficient path (e.g. adding the sample buffer
+            // directly to a VideoToolBox encoder) would be preferable.
+            guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let ciImage = CIImage(cvImageBuffer: imageBuffer)
+            guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else { return }
 
-                if let jpegData = resized.jpegData(compressionQuality: 0.5) {
-                    let base64 = jpegData.base64EncodedString()
-                    let event: [String: Any] = [
-                        "type": "screen_mirror_frame",
-                        "frame": base64,
-                        "width": Int(newSize.width),
-                        "height": Int(newSize.height),
-                        "timestamp": Int(Date().timeIntervalSince1970 * 1000)
-                    ]
-                    self.mainStreamHandler.send(type: "screen_mirror", data: event)
-                }
+            let uiImage = UIImage(cgImage: cgImage)
+            // Resize to reduce bandwidth, by the same fraction of the screen's
+            // own width the Android capture pipeline uses — so "medium" means
+            // the same picture size on both platforms.
+            let scale = min(ladder.scale, 1.0)
+            let newSize = CGSize(width: (uiImage.size.width * scale).rounded(),
+                                 height: (uiImage.size.height * scale).rounded())
+            let renderer = UIGraphicsImageRenderer(size: newSize)
+            let resized = renderer.image { _ in
+                uiImage.draw(in: CGRect(origin: .zero, size: newSize))
             }
+
+            guard let jpegData = resized.jpegData(compressionQuality: ladder.jpeg) else { return }
+
+            // The canonical `ScreenMirrorFrame`
+            // (`packages/protocol/src/types.rs:594`): `action: "frame"` with the
+            // JPEG under `data`. This used to be `screen_mirror_frame` with the
+            // JPEG under `frame`, which no reader on either side of the channel
+            // understood — Android emits this shape and the Dart relay parses
+            // this shape, so the iOS frames were unreadable rather than merely
+            // oddly shaped.
+            let event: [String: Any] = [
+                "type": "screen_mirror",
+                "action": "frame",
+                "data": jpegData.base64EncodedString(),
+                "format": "jpeg",
+                "width": Int(newSize.width),
+                "height": Int(newSize.height),
+                "timestamp": Int(Date().timeIntervalSince1970 * 1000)
+            ]
+            self.mainStreamHandler.send(type: "screen_mirror", data: event)
         }, completionHandler: { [weak self] error in
             DispatchQueue.main.async {
+                guard let self = self else {
+                    result(FlutterError(code: "CAPTURE_FAILED",
+                                        message: "The recorder went away",
+                                        details: nil))
+                    return
+                }
                 if let error = error {
+                    self.captureLock.lock()
+                    self.isScreenCapturing = false
+                    self.captureLock.unlock()
                     result(FlutterError(code: "CAPTURE_FAILED",
                                         message: error.localizedDescription,
                                         details: nil))
                 } else {
-                    self?.isScreenCapturing = true
                     result(true)
                 }
             }
@@ -327,16 +409,25 @@ class ConduitStreamHandler: NSObject, FlutterStreamHandler {
     }
 
     private func stopScreenMirror(result: @escaping FlutterResult) {
-        guard isScreenCapturing else {
+        captureLock.lock()
+        let wasCapturing = isScreenCapturing
+        captureLock.unlock()
+        guard wasCapturing else {
             result(true)
             return
         }
 
         RPScreenRecorder.shared().stopCapture { [weak self] error in
             DispatchQueue.main.async {
-                self?.isScreenCapturing = false
-                self?.screenCaptureTimer?.invalidate()
-                self?.screenCaptureTimer = nil
+                guard let self = self else {
+                    result(true)
+                    return
+                }
+                self.captureLock.lock()
+                self.isScreenCapturing = false
+                self.captureLock.unlock()
+                self.screenCaptureTimer?.invalidate()
+                self.screenCaptureTimer = nil
                 if let error = error {
                     result(FlutterError(code: "STOP_FAILED",
                                         message: error.localizedDescription,

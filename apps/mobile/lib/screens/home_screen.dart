@@ -66,11 +66,16 @@ class _HomeScreenState extends State<HomeScreen> {
           }
         }
         _syncDeviceList();
-      } else if (map['id'] != null) {
+      } else if (map['device_id'] != null) {
+        // A `discovery/announce` carries the protocol's own field names
+        // (`device_id`/`device_name`/`device_type`), the same ones the pairing
+        // handler below reads. This branch used to look for `id`/`name`/`type`,
+        // which no announce can contain, so `_deviceMap` was never written and
+        // `hasDesktop` stayed false forever.
         final device = DeviceInfo(
-          id: map['id'] as String,
-          name: (map['name'] as String?) ?? 'Unknown',
-          type: (map['type'] as String?) ?? 'unknown',
+          id: map['device_id'] as String,
+          name: (map['device_name'] as String?) ?? 'Unknown',
+          type: (map['device_type'] as String?) ?? 'unknown',
           status: 'connected',
           battery: map['battery'] as int?,
         );

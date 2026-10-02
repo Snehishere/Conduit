@@ -465,7 +465,7 @@ async fn notify_capture_stopped(client_id: &str, ctx: &WsContext) {
 
 /// Route a `frame` from a capturing device to the viewers watching it.
 async fn relay_frame(frame: &Value, client_id: &str, ctx: &WsContext) {
-    let sender_device_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
+    let sender_device_id = sender_identity(ctx, client_id).await;
 
     let targets: Vec<String> = {
         let viewers = VIEWERS.lock().await;
@@ -491,6 +491,35 @@ async fn relay_frame(frame: &Value, client_id: &str, ctx: &WsContext) {
             VIEWERS.lock().await.remove(&viewer);
         }
     }
+}
+
+/// The stable device id a frame from `client_id` should be attributed to.
+///
+/// Two shapes of sender reach this handler and they are not interchangeable:
+///
+///  * a **LAN** socket, whose `client_id` is a per-connection UUID and whose
+///    device id lives in the pairing registry; and
+///  * a **relayed** frame, which `unwrap_relay_delivery` dispatches under the
+///    sender's own device id. A phone on another network has no socket here, so
+///    there is no registry entry to map and the lookup returns `None` — which is
+///    what made every relayed frame look like it came from nobody and drop.
+///
+/// So when there is no registry entry, `client_id` is only accepted as the
+/// device id if the device registry says that device is a paired peer with a
+/// derived secret — the same bar `super::is_trusted_peer` applies, and the same
+/// bar the dispatcher already cleared before this handler ran. An id-shaped
+/// string from an unpaired socket is not identity, and gets no attribution.
+async fn sender_identity(ctx: &WsContext, client_id: &str) -> Option<String> {
+    if let Some(device_id) = super::paired_device_id(ctx, client_id).await {
+        return Some(device_id);
+    }
+    let is_paired_device = ctx
+        .sync_engine
+        .read()
+        .await
+        .get_client(client_id)
+        .is_some_and(|client| !client.shared_secret.is_empty());
+    is_paired_device.then(|| client_id.to_string())
 }
 
 /// Periodically capture the local monitor and send JPEG frames to `client_id`.
@@ -706,7 +735,7 @@ fn monitor_dimensions() -> (u32, u32) {
 mod tests {
     use super::*;
     use crate::server::handlers::test_helpers::{
-        add_test_client, add_test_client_mapped, create_test_ctx,
+        add_test_client, add_test_client_mapped, add_test_unpaired_client, create_test_ctx,
     };
 
     // SAFETY: no test here starts a local capture — every `start` names a
@@ -1009,6 +1038,273 @@ mod tests {
             frame.contains("c3RhcnQ="),
             "relayed frame lost its payload: {frame}"
         );
+    }
+
+    /// A phone on another network captures through the relay. It has no LAN
+    /// socket, so `ws_to_device_id` has no entry for it and the relay
+    /// dispatches its frames under the phone's **device id** rather than a
+    /// connection id (`unwrap_relay_delivery`). The frame must still reach the
+    /// viewer that asked for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_frame_reaches_the_viewer_that_asked_for_the_phone() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_relay_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+
+        // The capture side is reachable only through the relay, so the desktop
+        // asks for it by device id and gets its `start` delivered over the
+        // relay socket rather than a LAN one.
+        let _relay_tx = add_test_client(&ctx, "relay_server").await;
+        VIEWERS.lock().await.insert(
+            "sm_relay_viewer".to_string(),
+            ViewerSession {
+                target_device_id: "sm-relay-phone".to_string(),
+            },
+        );
+        ctx.sync_engine
+            .write()
+            .await
+            .add_client(crate::sync::ConnectedClient {
+                device_id: "sm-relay-phone".into(),
+                device_name: "Relayed phone".into(),
+                device_type: "phone".into(),
+                shared_secret: "22".repeat(32),
+                last_heartbeat: 0,
+                battery_level: None,
+            });
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "frame", "data": "cmVsYXk="
+            }),
+            "sm-relay-phone",
+            &ctx,
+        )
+        .await;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(500), viewer_rx.recv())
+            .await
+            .expect("a relayed frame must reach the viewer watching that device")
+            .expect("broadcast recv");
+        assert!(
+            frame.contains("cmVsYXk="),
+            "relayed frame lost its payload: {frame}"
+        );
+
+        VIEWERS.lock().await.remove("sm_relay_viewer");
+    }
+
+    /// The LAN case still works: a paired socket is mapped through
+    /// `ws_to_device_id`, not through its own connection id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lan_frame_is_attributed_through_the_pairing_registry() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_lan_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+        let _phone_tx = add_test_client_mapped(&ctx, "sm_lan_phone", "sm-lan-phone").await;
+        VIEWERS.lock().await.insert(
+            "sm_lan_viewer".to_string(),
+            ViewerSession {
+                target_device_id: "sm-lan-phone".to_string(),
+            },
+        );
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "frame", "data": "bGFu"
+            }),
+            "sm_lan_phone",
+            &ctx,
+        )
+        .await;
+
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(500), viewer_rx.recv())
+            .await
+            .expect("a LAN frame must reach the viewer")
+            .expect("broadcast recv");
+        assert!(frame.contains("bGFu"), "got: {frame}");
+
+        VIEWERS.lock().await.remove("sm_lan_viewer");
+    }
+
+    /// KNOWN GAP — not a fix. A phone that is reachable only through the relay
+    /// cannot be asked to start capturing, because forwarding a `start` means
+    /// resolving the target to a *socket* on this machine
+    /// (`resolve_target_client` reads `ws_to_device_id`) and a relayed device
+    /// has none. So the desktop refuses with `capture_stopped` and the relay
+    /// socket is never used, which means `relay_frame`'s relay path — the one
+    /// `a_relayed_frame_reaches_the_viewer_that_asked_for_the_phone` covers —
+    /// is unreachable from the UI today.
+    ///
+    /// This test pins the gap so whoever closes it has a red test to turn
+    /// green, and so nobody "fixes" it by falling back to a local capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_gap_a_relay_only_target_cannot_be_asked_to_start() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_gap_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+        let relay_tx = add_test_client(&ctx, "relay_server").await;
+        let mut relay_rx = relay_tx.subscribe();
+        // Paired and known to the hub, but on another network: no LAN socket.
+        ctx.sync_engine
+            .write()
+            .await
+            .add_client(crate::sync::ConnectedClient {
+                device_id: "sm-gap-phone".into(),
+                device_name: "Relay-only phone".into(),
+                device_type: "phone".into(),
+                shared_secret: "33".repeat(32),
+                last_heartbeat: 0,
+                battery_level: None,
+            });
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "start", "device_id": "sm-gap-phone"
+            }),
+            "sm_gap_viewer",
+            &ctx,
+        )
+        .await;
+
+        let relayed =
+            tokio::time::timeout(std::time::Duration::from_millis(150), relay_rx.recv()).await;
+        assert!(
+            relayed.is_err(),
+            "today the start never reaches the relay connection either"
+        );
+        assert!(
+            viewer_target("sm_gap_viewer").await.is_none(),
+            "and no session may be registered, or frames would route to a \
+             device that was never asked to capture"
+        );
+        assert!(
+            !LOCAL_CAPTURES.lock().await.contains_key("sm_gap_viewer"),
+            "and it must not fall back to capturing the desktop's own screen"
+        );
+        let ack = tokio::time::timeout(std::time::Duration::from_millis(500), viewer_rx.recv())
+            .await
+            .expect("the viewer must be told the capture did not start")
+            .expect("broadcast recv");
+        assert!(ack.contains("capture_stopped"), "got: {ack}");
+
+        VIEWERS.lock().await.remove("sm_gap_viewer");
+    }
+
+    /// Attribution is not widened: falling back to the connection id must still
+    /// require that id to name a *paired device*, so it cannot become a way to
+    /// deliver a frame from a socket the auth gate would have refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_from_an_unpaired_connection_reaches_nobody() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_anon_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+        // A connection UUID with no registry entry and no `ConnectedClient` —
+        // the state the hub's auth gate refuses before the handler runs.
+        let _phone_tx = add_test_unpaired_client(&ctx, "sm-anon-uuid").await;
+        VIEWERS.lock().await.insert(
+            "sm_anon_viewer".to_string(),
+            ViewerSession {
+                target_device_id: "sm-anon-phone".to_string(),
+            },
+        );
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "frame", "data": "YW5vbg=="
+            }),
+            "sm-anon-uuid",
+            &ctx,
+        )
+        .await;
+
+        let leaked =
+            tokio::time::timeout(std::time::Duration::from_millis(150), viewer_rx.recv()).await;
+        assert!(
+            leaked.is_err(),
+            "an unpaired sender's frame must reach nobody"
+        );
+
+        VIEWERS.lock().await.remove("sm_anon_viewer");
+    }
+
+    /// The sharp case: the sender's id *matches* the viewer's target device id
+    /// as a string, but nothing is paired under it. A string match is not
+    /// identity — only the device registry is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_id_shaped_like_a_device_id_is_not_enough_to_be_one() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_imp_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+        add_test_unpaired_client(&ctx, "sm-imp-device").await;
+        VIEWERS.lock().await.insert(
+            "sm_imp_viewer".to_string(),
+            ViewerSession {
+                target_device_id: "sm-imp-device".to_string(),
+            },
+        );
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "frame", "data": "aW1wb3N0b3I="
+            }),
+            "sm-imp-device",
+            &ctx,
+        )
+        .await;
+
+        let leaked =
+            tokio::time::timeout(std::time::Duration::from_millis(150), viewer_rx.recv()).await;
+        assert!(
+            leaked.is_err(),
+            "an unpaired id must not be able to claim a viewer's target device"
+        );
+
+        VIEWERS.lock().await.remove("sm_imp_viewer");
+    }
+
+    /// A paired device with an empty secret is not a peer either, so a frame
+    /// attributed to it must not be routed on the strength of the id alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_row_with_no_secret_does_not_earn_relay_attribution() {
+        let ctx = create_test_ctx();
+        let viewer_tx = add_test_client_mapped(&ctx, "sm_nosecret_viewer", "local_desktop").await;
+        let mut viewer_rx = viewer_tx.subscribe();
+        ctx.sync_engine
+            .write()
+            .await
+            .add_client(crate::sync::ConnectedClient {
+                device_id: "sm-nosecret-phone".into(),
+                device_name: "Half-paired".into(),
+                device_type: "phone".into(),
+                shared_secret: String::new(),
+                last_heartbeat: 0,
+                battery_level: None,
+            });
+        VIEWERS.lock().await.insert(
+            "sm_nosecret_viewer".to_string(),
+            ViewerSession {
+                target_device_id: "sm-nosecret-phone".to_string(),
+            },
+        );
+
+        handle_screen_mirror(
+            serde_json::json!({
+                "type": "screen_mirror", "action": "frame", "data": "bm9zZWNyZXQ="
+            }),
+            "sm-nosecret-phone",
+            &ctx,
+        )
+        .await;
+
+        let leaked =
+            tokio::time::timeout(std::time::Duration::from_millis(150), viewer_rx.recv()).await;
+        assert!(
+            leaked.is_err(),
+            "an unpaired device must not reach a viewer"
+        );
+
+        VIEWERS.lock().await.remove("sm_nosecret_viewer");
     }
 
     /// Two viewers of two devices: each has its own session and only its own

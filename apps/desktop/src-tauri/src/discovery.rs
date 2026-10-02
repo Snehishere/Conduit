@@ -7,6 +7,63 @@ use tauri::Emitter;
 const SERVICE_TYPE: &str = crate::MDNS_SERVICE_TYPE;
 const SERVICE_DOMAIN: &str = "local.";
 
+/// How many characters of the device id the registration log line shows.
+const LOGGED_ID_CHARS: usize = 8;
+
+/// The first [`LOGGED_ID_CHARS`] characters of an id, cut on a character boundary.
+///
+/// The id is not generated fresh on every launch — `load_or_create_device_id`
+/// reads it verbatim out of `device_id.txt` — so it can be any UTF-8 the user
+/// or a sync tool put there. A byte-index slice (`&id[..8.min(id.len())]`)
+/// panics the moment that index lands inside a multi-byte character, which would
+/// take down the one startup path that must never fail.
+fn short_id(device_id: &str) -> &str {
+    match device_id.char_indices().nth(LOGGED_ID_CHARS) {
+        Some((idx, _)) => &device_id[..idx],
+        None => device_id,
+    }
+}
+
+/// Turn a resolved mDNS service into the payload the frontend consumes, or
+/// `None` when the result is not surfaceable.
+///
+/// This is the whole consumption decision for the mDNS path, kept out of the
+/// event loop so it can be exercised without a multicast socket:
+///
+///  * our own service comes back from the browse loop like any other, and must
+///    not be listed as a peer;
+///  * a peer that advertises no `device_id` is skipped, because
+///    `DiscoveredDevice::device_id` is the identity every consumer keys on —
+///    admitting an empty one would collapse every unnamed responder into one
+///    unusable entry.
+///
+/// Nothing here is a trust check and nothing here is advertised: the TXT
+/// record written by [`advertised_txt_properties`] is the complete set of
+/// properties this service publishes, and it is unchanged.
+fn discovered_from_txt(
+    my_device_id: &str,
+    txt: &HashMap<String, String>,
+    hostname: &str,
+    address: Option<&str>,
+    port: u16,
+) -> Option<DiscoveredDevice> {
+    let device_id = txt.get("device_id").map(String::as_str).unwrap_or("");
+    if device_id.is_empty() || device_id == my_device_id {
+        return None;
+    }
+    Some(DiscoveredDevice {
+        device_id: device_id.to_string(),
+        name: hostname.to_string(),
+        address: address.unwrap_or_default().to_string(),
+        port,
+        device_type: txt
+            .get("device_type")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string()),
+        version: txt.get("version").cloned().unwrap_or_default(),
+    })
+}
+
 /// The TXT properties advertised alongside the mDNS service.
 ///
 /// `ws_port` / `wss_port` are the *authoritative* source of the peer's ports:
@@ -98,7 +155,7 @@ impl DiscoveryService {
                                 my_addr,
                                 crate::WS_PORT,
                                 crate::WSS_PORT,
-                                &device_id[..8.min(device_id.len())]
+                                short_id(&device_id)
                             );
                         }
                         Err(e) => {
@@ -143,40 +200,32 @@ impl DiscoveryService {
                 while let Ok(event) = rx.recv_async().await {
                     match event {
                         ServiceEvent::ServiceResolved(info) => {
-                            let props = info.get_properties();
-                            let device_id = props
-                                .get_property_val_str("device_id")
-                                .unwrap_or("")
-                                .to_string();
-                            let device_type = props
-                                .get_property_val_str("device_type")
-                                .unwrap_or("unknown")
-                                .to_string();
-                            let version = props
-                                .get_property_val_str("version")
-                                .unwrap_or("")
-                                .to_string();
+                            let txt: HashMap<String, String> =
+                                info.get_properties().clone().into_property_map_str();
+                            let hostname = info.get_hostname();
+                            let address = info.get_addresses().iter().next().map(|a| a.to_string());
 
-                            if device_id != my_device_id && !device_id.is_empty() {
-                                let discovered = DiscoveredDevice {
-                                    device_id,
-                                    name: info.get_hostname().to_string(),
-                                    address: info
-                                        .get_addresses()
-                                        .iter()
-                                        .next()
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_default(),
-                                    port: info.get_port(),
-                                    device_type,
-                                    version,
-                                };
+                            if let Some(discovered) = discovered_from_txt(
+                                &my_device_id,
+                                &txt,
+                                hostname,
+                                address.as_deref(),
+                                info.get_port(),
+                            ) {
                                 info!(
                                     "Discovered device: {} ({})",
                                     discovered.name, discovered.device_id
                                 );
-                                if let Some(ref handle) = app_handle {
-                                    let _ = handle.emit("mdns-device-discovered", &discovered);
+                                match &app_handle {
+                                    Some(handle) => {
+                                        let _ = handle.emit("mdns-device-discovered", &discovered);
+                                    }
+                                    None => warn!(
+                                        "Resolved {} ({}) but no app handle is attached, \
+                                         so nothing can receive it — discovery results are \
+                                         dropped",
+                                        discovered.name, discovered.device_id
+                                    ),
                                 }
                             }
                         }
@@ -328,5 +377,172 @@ mod tests {
             props.get("version").map(String::as_str),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    // ── short_id: a log line must never be able to panic ──────────────────────
+
+    #[test]
+    fn short_id_takes_eight_characters_of_an_ascii_id() {
+        assert_eq!(short_id("dev-1234-5678"), "dev-1234");
+    }
+
+    #[test]
+    fn short_id_returns_short_ids_whole() {
+        assert_eq!(short_id("dev"), "dev");
+        assert_eq!(short_id(""), "");
+        assert_eq!(short_id("12345678"), "12345678");
+    }
+
+    #[test]
+    fn short_id_never_splits_a_multi_byte_character() {
+        // REGRESSION: `&device_id[..8.min(device_id.len())]` sliced by *byte*.
+        // This id has 7 ASCII bytes then a 2-byte 'é', so byte index 8 — the
+        // one the old expression used — is the second byte of that character
+        // and `&id[..8]` panicked. This is reachable: the id comes from
+        // `device_id.txt` on disk, not from a freshly generated UUID.
+        let id = "aaaaaaaé-bbbb";
+        assert_eq!(id.len(), 14, "sanity: the id is longer than 8 bytes");
+        assert_eq!(
+            id.char_indices().nth(LOGGED_ID_CHARS).map(|(i, _)| i),
+            Some(9)
+        );
+        assert_eq!(short_id(id), "aaaaaaaé");
+        assert_eq!(short_id(id).chars().count(), LOGGED_ID_CHARS);
+    }
+
+    #[test]
+    fn short_id_is_a_prefix_of_its_input_for_every_id() {
+        for id in [
+            "",
+            "a",
+            "dev-1234-5678",
+            "aaaaaaaé-bbbb",
+            "日本語のデバイス",
+            "🎛🎛🎛🎛🎛",
+            "mixed é文 mixed",
+            " exactly-8",
+            " exactly-9!",
+        ] {
+            let prefix = short_id(id);
+            assert!(
+                id.starts_with(prefix),
+                "{prefix:?} is not a prefix of {id:?}"
+            );
+            assert_eq!(
+                prefix.chars().count(),
+                LOGGED_ID_CHARS.min(id.chars().count()),
+                "wrong length for {id:?}"
+            );
+            assert!(prefix.len() <= id.len(), "{prefix:?} is longer than {id:?}");
+        }
+    }
+
+    // ── consumption: resolved mDNS results reach the frontend payload ─────────
+
+    fn txt_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn resolved_peer_becomes_a_payload_the_frontend_can_key_on() {
+        let txt = advertised_txt_properties("dev-remote");
+        let d = discovered_from_txt("dev-me", &txt, "laptop.local", Some("192.168.1.5"), 9527)
+            .expect("a peer advertising a device_id is surfaceable");
+        assert_eq!(d.device_id, "dev-remote");
+        assert_eq!(d.name, "laptop.local");
+        assert_eq!(d.address, "192.168.1.5");
+        assert_eq!(d.port, 9527);
+        assert_eq!(d.device_type, "desktop");
+        assert_eq!(d.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn resolved_peer_payload_serialises_with_the_field_names_the_hook_reads() {
+        // useDiscovery.ts reads `device_id`, `name`, `address`, `port`,
+        // `device_type`, `version`. If serde ever renames one of these the
+        // frontend silently drops the peer, so pin the wire names here.
+        let txt = advertised_txt_properties("dev-remote");
+        let d =
+            discovered_from_txt("dev-me", &txt, "laptop.local", Some("192.168.1.5"), 9527).unwrap();
+        let json = serde_json::to_value(&d).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "address",
+                "device_id",
+                "device_type",
+                "name",
+                "port",
+                "version"
+            ]
+        );
+    }
+
+    #[test]
+    fn our_own_service_is_not_reported_back_to_us() {
+        let txt = advertised_txt_properties("dev-me");
+        assert!(
+            discovered_from_txt("dev-me", &txt, "myhost.local", Some("192.168.1.9"), 9527)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_peer_that_advertises_no_device_id_is_skipped() {
+        for txt in [
+            HashMap::new(),
+            txt_of(&[("device_type", "desktop"), ("version", "1.0.0")]),
+            txt_of(&[("device_id", "")]),
+        ] {
+            assert!(
+                discovered_from_txt("dev-me", &txt, "ghost.local", Some("192.168.1.5"), 9527)
+                    .is_none(),
+                "a peer with no usable device_id must not enter the device list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_with_no_address_still_surfaces_with_an_empty_address() {
+        // mDNS resolves the SRV record before the A record on a cold cache.
+        // Dropping the peer there loses it for good — the resolved event does
+        // not fire again — so the entry is emitted with an empty address and
+        // the frontend's existing `payload.address || ''` fallback applies.
+        let txt = advertised_txt_properties("dev-remote");
+        let d = discovered_from_txt("dev-me", &txt, "laptop.local", None, 9527)
+            .expect("an unresolved address must not discard the peer");
+        assert_eq!(d.device_id, "dev-remote");
+        assert_eq!(d.address, "");
+    }
+
+    #[test]
+    fn a_peer_with_no_device_type_is_reported_as_unknown() {
+        let txt = txt_of(&[("device_id", "dev-remote"), ("version", "1.0.0")]);
+        let d =
+            discovered_from_txt("dev-me", &txt, "laptop.local", Some("10.0.0.2"), 9527).unwrap();
+        assert_eq!(d.device_type, "unknown");
+        assert_eq!(d.version, "1.0.0");
+    }
+
+    #[test]
+    fn every_advertised_property_still_rides_in_the_payload() {
+        // Round-trip: the record we publish must be the record we read back,
+        // so a peer sees the same identity on both sides of the LAN.
+        let txt = advertised_txt_properties("dev-remote");
+        let d =
+            discovered_from_txt("dev-me", &txt, "laptop.local", Some("10.0.0.2"), 9527).unwrap();
+        assert_eq!(d.device_id, txt["device_id"]);
+        assert_eq!(d.device_type, txt["device_type"]);
+        assert_eq!(d.version, txt["version"]);
     }
 }

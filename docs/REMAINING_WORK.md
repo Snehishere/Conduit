@@ -138,45 +138,60 @@ where the drift actually is. The items below are that drift.
   but nothing yet asserts the *round trip* — that an envelope sealed on a
   device and opened on its peer decrypts. W8.2/W8.3.
 
-- [ ] **W1.2 (CRITICAL)** Both relay clients sign `relay_route` in a way the
-  relay rejects on three axes.
-  > **⚠ AFFECTED BY THE RELAY REFACTOR.** The three axes below were derived
-  > against the deleted `services/relay/src/main.rs` and a shared
-  > `SigningKeyring` keyed from `HMAC_SECRET`. There is no shared signing key
-  > and no `SigningKeyring` now: verification is per-device, keyed by the
-  > pairing secret, with `key_id` required to equal `from_device_id`
-  > ([ADR-0011](decisions/0011-per-device-relay-route-keys.md)). The *caller* of
-  > this item — both clients signing with the relay token instead of a derived
-  > per-device route key — is the substance, and that substance has not been
-  > re-verified against the new relay. Re-audit before acting.
-  Desktop `src-tauri/src/server/mod.rs:991-1012`, mobile
-  `websocket_service.dart:600-612, 672-684`.
-  1. Key: both HMAC with `RELAY_TOKEN`; the relay verifies against
-     `SigningKeyring`, derived from `HMAC_SECRET`
-     (`services/relay/src/main.rs:1532-1535`).
-  2. Field set: both send 5 fields; `SIGNED_FIELDS`
-     (`packages/protocol/src/lib.rs:177-185`) requires 7, including
-     `from_device_id` and a mandatory `key_id`.
-  3. Byte order: both serialize in insertion order. The verifier
-     (`lib.rs:193-201`) rebuilds through a `BTreeMap`, so it is alphabetical.
-     Even with the right key the digests differ.
-  The correct signer already exists at `packages/protocol/src/types.rs:1475`
-  (`RelayRoute::signed_with`) and the relay's own tests use it
-  (`services/relay/src/main.rs:3457, 4266, 5416`). Neither client calls it.
-  `PROTOCOL.md:1670-1676` names this fix.
-  *Left to do:* call `RelayRoute::signed_with` from both clients; delete the
-  hand-rolled map construction in each.
+- [x] **W1.2 (RESOLVED — was stale)** Both relay clients signed `relay_route`
+  in a way the relay rejected on three axes. **Already fixed** by the relay
+  refactor; re-audited axis by axis and none of the three defects is present.
 
-- [ ] **W1.3 (CRITICAL)** The phone emits the superseded binary frame version.
-  `websocket_service.dart:592` writes `0x01`;
-  `packages/protocol/src/types.rs:1280` requires `0x02`. The relay rejects on
-  the literal at `services/relay/src/main.rs:1968`.
-  The Dart frame is also 17 bytes (`version || target_id || payload`) where the
-  relay requires at least 53 — `BINARY_HEADER_LEN` at `types.rs:1291` adds a
-  4-byte sequence number and a 32-byte HMAC tag, both mandatory.
-  *Note:* the LAN-direct chunk frame in `apps/mobile/lib/services/file_service.dart:288-298`
-  **is** correct and matches `types.rs:1305-1307`. Only the relay-routed binary
-  path is broken.
+  The entry carried its own warning that its axes were derived against the
+  deleted `services/relay/src/main.rs` and a `SigningKeyring` that no longer
+  exists. Re-verified against the current tree:
+
+  1. **Key** — the relay has no shared keyring. It resolves per device
+     (`services/relay/src/route.rs:125`), after requiring `from_device_id` to
+     equal the authenticated connection identity (`route.rs:110`). The desktop
+     calls the existing signer `RelayRoute::signed_with` with that device's own
+     key (`server/mod.rs:1174`). The phone derives its own from the pairing
+     secret (`websocket_service.dart:940` → `relay_route.dart:74`). The relay
+     token appears in exactly one place in mobile — `relay_auth`.
+  2. **Field set** — both sides send all seven signed fields including `key_id`.
+  3. **Byte order** — `canonicalSigningString` (`relay_route.dart:97`) sorts
+     recursively to match the verifier's `BTreeMap` re-serialisation.
+
+  One description correction: the relay does **not** look the key up by
+  `key_id`. `key_id` is signed and must equal `from_device_id`, but lookup is
+  under the authenticated connection id — so a signed `key_id` is checked, not
+  trusted as a selector.
+
+  What the audit got right and the earlier fix had no test for: the Dart and
+  Rust signing paths had never been pinned to each other. They are now —
+  `apps/mobile/test/services/relay_route_test.dart` asserts the exact canonical
+  string, HMAC and route key, and a new
+  `websocket_service_relay_test.dart` drives the real `WebSocketService` over a
+  real socket to check what actually leaves the phone. Reverting each of the
+  three axes in turn makes those tests fail.
+
+- [x] **W1.3 (RESOLVED — was stale)** The phone emitted the superseded binary
+  frame version. **Already fixed**; the cited line is now the *receive* path.
+
+  The send path builds a v2 frame (`websocket_service.dart:997` →
+  `relay_route.dart:257`) with the version literal at `relay_route.dart:218`, a
+  strictly-increasing per-connection sequence and a 32-byte tag. The relay's
+  checks are at `services/relay/src/route.rs:185` and `:195`, not the deleted
+  `main.rs:1968`. The tag is keyed by the sender's per-device route key, which
+  the phone legitimately holds, and the MAC input is
+  `from_device_id || 0x1F || frame[0..21] || payload`.
+
+  The Dart v2 tests were previously self-consistent only — build and parse both
+  in Dart — so Dart↔Rust drift was undetectable. They are now pinned to whole
+  frames produced by `conduit_protocol::build_binary_frame`, which is the same
+  producer the relay re-frames with.
+
+  The LAN-direct chunk frame in `file_service.dart` was already correct and is
+  untouched.
+
+  The `// Right side of the pin` comment in `types.rs` claims the two are pinned
+  to a shared vector. Until now only the Dart half was; the Rust half is worth
+  adding so the pin is two-way.
 
 - [x] **W1.4 (RESOLVED)** Mobile certificate pinning can never succeed. **Fixed.**
   The phone hashed the whole DER certificate while the relay publishes an SPKI
@@ -321,40 +336,116 @@ where the drift actually is. The items below are that drift.
 
 ## W2 — Mobile client
 
-- [ ] **W2.1 (CRITICAL)** Screen mirroring never delivers a frame.
-  `apps/mobile/lib/main.dart:308-323` registers branches for `start`, `stop`,
-  `touch`, `key`, `scroll` — **there is no `frame` branch**. Native frames
-  arrive on EventChannel arg `'screen_mirror'`
-  (`android/.../MainActivity.kt:111`, `ScreenMirrorService.kt:152-165`) and
-  nothing subscribes with that argument; the only two subscribers are
-  `'notifications'` and `'calls'`. `lib/services/screen_mirror_service.dart`,
-  which *does* read frames, is never instantiated in `main.dart`.
-  The screen is additionally gated on `hasDesktop`, which is always false —
-  see W2.2.
-  *Left to do:* subscribe to the `screen_mirror` EventChannel; add the `frame`
-  branch; instantiate the service; move capture into
-  `ConduitForegroundService` so an Android rotation does not end mirroring
+- [x] **W2.1 (RESOLVED)** Screen mirroring never delivered a frame. **Fixed** —
+  and only in one of the two directions the audit did not distinguish.
+
+  The audit's claims were largely wrong. `screen_mirror_service.dart` *is*
+  instantiated (`screen_mirror_screen.dart:32`), the `frame` branch *does*
+  exist (`screen_mirror_service.dart:24`), and `registerHandler` appends to a
+  list rather than replacing, so the two handlers coexist. The `hasDesktop`
+  gate it blamed is now derived from `connectedDevices`
+  (`actions_menu_sheet.dart:22`), not hardcoded false.
+
+  **Direction A (phone views the desktop) was never broken.**
+
+  **Direction B (desktop views the phone) was broken in two independent
+  places**, both now fixed:
+
+  - **Nothing subscribed to the native frames.** Android and iOS push frames on
+    the shared `com.conduit.mobile/events` channel with argument
+    `screen_mirror`; `receiveBroadcastStream` existed only for `calls`, `sms`
+    and `notifications`. The frames were produced and discarded.
+    `apps/mobile/lib/services/native_screen_capture.dart` is the missing
+    subscriber, attached for the app's lifetime from `main.dart` — the relay must
+    outlive any one screen, since the desktop may request a stream while the
+    user is elsewhere.
+  - **Every relayed frame was dropped.** `relay_frame` resolved the sender
+    through `ws_to_device_id`, but `unwrap_relay_delivery` dispatches a relayed
+    frame under the *sender's device id*, and a relay-only device has no LAN
+    socket, so the lookup returned `None` for every viewer. Attribution now
+    falls back to accepting the client id as a device id **only** when the
+    pairing registry holds a row for it with a derived secret — a strictly
+    higher bar than the string match it replaces. `is_trusted_peer` already
+    handled this case; `relay_frame` did not.
+
+  **Still open, and it blocks the UI path:** a relay-only target cannot be
+  *asked* to start. `resolve_target_client` resolves through `ws_to_device_id`,
+  i.e. it needs a socket, so the desktop refuses with `capture_stopped` and
+  never touches the relay socket. Closing it means sending `start` over
+  `relay_route` — the auth boundary, and a design decision rather than a fix.
+  Pinned as a known gap by
+  `known_gap_a_relay_only_target_cannot_be_asked_to_start`.
+  Android capture still lives in an activity rather than
+  `ConduitForegroundService`, so an Android rotation still ends mirroring
   (`MainActivity.kt:634, 643-649`).
 
-- [ ] **W2.2 (CRITICAL)** Discovery results are discarded. The desktop announces
-  `device_id`, `device_name`, `device_type`, `battery`, `ws_port`, `wss_port`
-  (`src-tauri/src/server/mod.rs:1554-1566`); the home-screen handler reads
-  `map['id']`, `map['name']`, `map['type']` (`apps/mobile/lib/screens/home_screen.dart:54-79`).
-  `_deviceMap` can never populate, so `hasDesktop` is always false and several
-  screens are unreachable. `StatusUpdate` has no `device_id` either
-  (`types.rs:921-938`).
-  Separately, `setAdvertisedWssPort` (`websocket_service.dart:171`) is declared
-  and never called, so the mDNS-derived TLS port is dropped and every LAN dial
-  falls back to the literal 9531.
+- [x] **W2.2 (RESOLVED)** Discovery results were discarded. **Fixed** — and the
+  two halves were separate defects in separate files.
 
-- [ ] **W2.3 (CRITICAL)** SMS on Android is real but its data is mangled.
-  `MainActivity.kt:371-375` returns `address, body, timestamp, is_outgoing, read`;
-  `apps/mobile/lib/services/sms_service.dart:315-320` reads `_id`, `date`, `type`.
-  Every message therefore gets a synthetic id, a "now" timestamp, and
-  `isOutgoing = (null ?? 1) == 2 = false`. **All messages render as incoming.**
-  On iOS `getSmsThreads` returns `result([])` (`ios/Runner/AppDelegate.swift:139`)
-  where Dart does `invokeMethod<String>` + `jsonDecode` (`sms_service.dart:300, 307`),
-  raising a `TypeError` caught at `sms_service.dart:342`.
+  **Mobile (`hasDesktop` always false).** The desktop's announce carries
+  `device_id`/`device_name`/`device_type`
+  (`server/mod.rs:1725-1738`), `WebSocketService` passes the frame through
+  verbatim (`websocket_service.dart:920-929`), and the home-screen handler read
+  `map['id']`/`map['name']`/`map['type']`. No announce can contain those keys,
+  so `_deviceMap` was never written. It now reads the wire names — the same ones
+  the pairing handler beside it already used. `hasDesktop` is computed at
+  `actions_menu_sheet.dart:22`.
+
+  **The dropped TLS port.** `setAdvertisedWssPort` was declared and never
+  called, so every LAN dial fell back to the literal 9531. The chain was longer
+  than it looked: the service layer already threaded it correctly
+  (`pairFromCode(wssPort:)` → `lanUrl`), `DiscoveredDevice` carried it, and
+  `PairingScreen` simply had no field to receive it, so
+  `discovery_screen.dart` could not pass it. Added the field and threaded it
+  through. `port` is still passed and still means the plaintext SRV port — it is
+  shown in the UI so the entry reads as it appeared on the network.
+
+  **Not fixed, and it is a real remaining hole:** `start_discovery`
+  (`commands/pairing.rs:110-113`) builds a `DiscoveryService` and calls
+  `.start()` without `set_app_handle`, unlike `main.rs:405`. After a
+  `stop_discovery`, a later `start_discovery` installs a browse loop that
+  resolves peers and has nowhere to emit — results are discarded again. There is
+  now a `warn!` at the discard point so it is at least visible.
+
+  Also found while auditing, unlisted here before: `DiscoveredDevice` carries no
+  `service_name`, but `mdns-device-removed` emits an mDNS fullname, so the exact
+  -match removal branch can never fire and removal depends on an instance-label
+  heuristic. Mobile's mDNS service uses the SRV hostname as device identity
+  rather than the advertised `device_id` TXT property, which means
+  `deviceLost()` cannot match a `discovery/remove` id and dedup collides when
+  two peers share a hostname. Both are behavioural changes to files this pass
+  did not own.
+
+- [x] **W2.3 (RESOLVED)** SMS on Android was real but its data was
+  mangled. **Fixed, and worse than documented.**
+  The audit says messages get a synthetic id, a "now" timestamp and
+  `isOutgoing = false`. In fact the whole load **aborted on the first record**,
+  leaving an empty inbox and an error toast: `read` came back as a bool and Dart
+  cast it `as num?`.
+
+  Four separate mismatches, field by field:
+
+  | Dart read | Android emitted | Effect |
+  |---|---|---|
+  | `_id` | *(absent)* | synthetic `'${address}_${DateTime.now()}'` — **changed on every reload** |
+  | `date` (ms) | `timestamp` (already `date/1000`, i.e. **seconds**) | key missing → fell back to "now"; units disagreed by 1000× even had the key matched |
+  | `type` (int, `== 2`) | `is_outgoing` (**bool**) | key missing → `1 == 2` → **everything incoming** |
+  | `as num?` | `read` (**bool**) | **throws** → whole load caught → empty inbox |
+
+  Android now emits a stable `sms_<_id>`, and the Dart parser accepts both
+  spellings and both time units rather than assuming one.
+
+  The iOS `TypeError` (`result([])` where Dart does `invokeMethod<String>` +
+  `jsonDecode`) is fixed too — the parser now accepts an already-decoded list —
+  but it was **unreachable**: `permission_handler` denies SMS on iOS, so
+  `loadThreads` is never called there.
+
+  Also fixed alongside: `_addIncomingToLocal` wrote the wrong thread to SQLite,
+  because it indexed the list *after* re-sorting it, so a message that moved its
+  thread upward persisted a different thread's rows. **This one has no test** —
+  `DatabaseService` is a concrete class with a private handle and no injectable
+  seam, and `sqflite_common_ffi` is not a dev dependency. Recorded here as an
+  untested correctness fix rather than presented as covered.
 
 - [ ] **W2.4 (HIGH)** The mDNS multicast permission is missing.
   `android/app/src/main/AndroidManifest.xml` declares `ACCESS_WIFI_STATE`,
@@ -388,11 +479,30 @@ where the drift actually is. The items below are that drift.
   `injectTouch`. The frames are the **desktop's** screen, so tapping it injects
   a tap into the phone.
 
-- [ ] **W2.9 (HIGH)** iOS frame payloads do not match the Dart reader.
-  `AppDelegate.swift:305-311` emits `{"type":"screen_mirror_frame","frame":…}`
-  with no `action` field; `screen_mirror_service.dart:23-29` requires
-  `action == 'frame'` and reads `msg['data']`. `AppDelegate.swift:294` also
-  hardcodes `maxWidth = 640` and ignores the `quality`/`fps` arguments.
+- [x] **W2.9 (RESOLVED)** iOS frame payloads did not match the Dart reader.
+  **Fixed**, and it was a *separate* defect from W2.1 on the same hop — same
+  native EventChannel, different cause. W2.1 was "nothing subscribes at all"
+  (breaking Android and iOS); this was "the iOS producer's payload disagrees
+  with the reader" (breaking iOS only, and only once a subscriber exists).
+  Fixing one would not have fixed the other.
+
+  `AppDelegate.swift` emitted `{"type":"screen_mirror_frame","frame":…,"width",
+  "height","timestamp"}`. The reader requires `action == 'frame'` and reads
+  `msg['data']`, and Android's shape matched neither. iOS now emits the
+  canonical shape; the reader also still accepts the legacy one, so a phone
+  that has not been updated keeps working.
+
+  It also ignored the `quality`/`fps` arguments entirely, hardcoding
+  `maxWidth = 640` and `compressionQuality: 0.5`, and had **no frame-rate
+  throttle at all** while building a `CIContext` per sample buffer. It now
+  honours both arguments using Android's ladder and hoists the context to one
+  per session.
+
+  The Swift has no test target and `swiftc` cannot run on this host, so the
+  producer/reader contract is pinned by a source assertion in
+  `ios_screen_capture_contract_test.dart` rather than a behavioural one. That
+  is weaker than it looks and is called out here on purpose: the Swift is
+  unbuilt and unrun.
 
 - [ ] **W2.10 (HIGH)** Two native methods have no Android implementation:
   `getApnsToken` (`main.dart:88`, no handler at `MainActivity.kt:62-99`) and
@@ -414,11 +524,23 @@ where the drift actually is. The items below are that drift.
   this switch has no effect"* (`:309-310`). `sync_notifications` and
   `sync_clipboard` are never consulted by the listener at `main.dart:261-288`.
 
-- [ ] **W2.14 (MEDIUM)** Notification read state is not modelled.
-  `notification_service.dart:175` — `void markReadNotification(String id) {}`,
-  an empty body, while the UI calls the wire-level
-  `sendNotificationMarkRead` (`screens/notifications_screen.dart:63`). The
-  desktop is told "mark read"; the phone stores nothing.
+- [x] **W2.14 (RESOLVED)** Notification read state is not modelled. **Fixed.**
+  `markReadNotification` had an empty body, `ConduitNotification` had no read
+  field, and the table had no read column — so the UI "marked read" by calling
+  `dismissNotification`, which means **the phone deleted the notification while
+  telling the desktop it was read.**
+
+  There is now a real read field through the whole stack: the model, all four
+  (de)serialisers, a schema migration (`_dbVersion` 1 → 2, with the `ALTER
+  TABLE`), and `markReadNotification` returning rows-changed so the UI can tell
+  the difference between a mark that landed and one that did not. The screen
+  marks read instead of deleting, and the swipe is handled in `confirmDismiss`
+  returning `false` — otherwise the card left the list while the model kept it.
+
+  Worth recording: the desktop's `handle_notification_mark_read`
+  (`handlers/notifications.rs:65-71`) is a *deliberate* pure relay with a test
+  asserting that mark-read must never be conflated with dismiss. So the phone
+  is the only place this state can live, and the desktop half needed no change.
 
 - [ ] **W2.15 (MEDIUM)** `context.sms` and `remote_input` are declared in the
   manifest and requested at `MainActivity.kt:149-176` but no Dart code calls
@@ -489,19 +611,66 @@ where the drift actually is. The items below are that drift.
 
 ## W3 — Desktop backend
 
-- [ ] **W3.1 (CRITICAL)** Five of seven automation actions report success while
-  doing nothing. `src-tauri/src/automation.rs:742-804`:
-  `SendNotification` (`:742`), `RouteAudio` (`:765`), `ToggleWiFi` (`:775`),
-  `ToggleBluetooth` (`:785`) and `OpenUrl` (`:795`) each log and return
-  `success: true`. No notification is emitted, `AudioStream` is never touched,
-  no WiFi or Bluetooth code exists in the crate, and `tauri-plugin-opener` is
-  not a dependency. A rule fires, writes `success=1` to `automation_logs`, and
-  the UI shows green.
-  *Left to do:* implement each action, or narrow
-  `is_desktop_executable` (`automation.rs:493-504`) and make the unimplemented
-  arms return `success: false` so the log stops lying.
-  The test at `main.rs:603-639` asserts a message exists — which every stub
-  satisfies — and never asserts `success`. Add that assertion.
+- [x] **W3.1 (RESOLVED)** Five of seven automation actions reported success
+  while doing nothing. **Fixed** — and there were seven, not five.
+
+  `SendNotification`, `RouteAudio`, `ToggleWiFi`, `ToggleBluetooth`,
+  `OpenUrl` and `SetPhoneProfile` each logged and returned `success: true`.
+  Confirmed there is no implementation to find: no notification emitter, no
+  `AudioStream` access (the executor is a pure function with no `AppState`), no
+  Wi-Fi or Bluetooth code anywhere in the crate, and no URL opener
+  (`tauri-plugin-opener` is not a dependency). The remaining two were already
+  honest — `RunShellCommand` reports the process's real exit status, and
+  `SetWindowState` already returned `false`.
+
+  **The audit's enumeration was incomplete.** `handlers/auto_rules.rs:172-188`
+  was a sixth and seventh site of the same shape: for a non-desktop action it
+  logged `success = true` with the message "action executes on the target
+  phone/tablet; desktop logged only" — and `handle_automation_triggered` sends
+  nothing to any device. Nothing was ever forwarded, so the claim was pure
+  fiction one layer up. Now logged as a failure that says why.
+
+  **The audit's suggested fix was harmful and was not taken.** It proposed
+  narrowing `is_desktop_executable` so the five actions fall into the `else`
+  branch — which is exactly the branch that writes `success = 1` and claims a
+  phone did it. That trades five false successes for seven.
+  `is_desktop_executable` is a routing predicate ("which side runs this"), not
+  a capability predicate; the truthful report belongs in the executor. This is
+  written down at the function so it is not "tidied" back later.
+
+  No trust gate was touched. The shell allowlist, metacharacter rejection,
+  `shell_rule_gate` and `triggered_rule_gate` are byte-identical, and the diff
+  touches no gate. Six of the seven actions still cannot be *implemented* here —
+  that remains new capability, deliberately not built. What changed is that they
+  no longer lie about having run.
+
+  **Still open, and separate:** `main.rs:603-639` asserts a message exists —
+  which every stub satisfies — and never asserts `success`.
+  `every_action_without_an_implementation_reports_failure` covers it in
+  `automation.rs` instead, but the integration-level assertion is worth adding
+  where the path is actually exercised.
+
+- [ ] **W3.11 (HIGH, new — found while fixing W3.1)** The per-type rate limit
+  caps screen mirroring at **1 fps**, and shares its bucket with `stop`.
+  `security.rs:156` sets `"screen_mirror" => TypeLimitConfig::new(60, 60)`, i.e.
+  60 messages per 60 seconds, under a comment reading
+  `// Screen mirror frames: ~30 fps × 2 msgs each` — a limit three orders of
+  magnitude away from the one the comment describes. `audio` has the same
+  numbers.
+
+  `check_type_limit` is inbound-only, so this throttles exactly the phone→hub
+  direction that W2.1's repair depends on: fixing delivery and then leaving this
+  in place produces a stream that renders at one frame a second.
+
+  Worse, frames and `screen_mirror/stop` share the bucket. Once a stream fills
+  it, the user's `stop` is dropped too and capture continues with no way to halt
+  it from the desktop — the global limiter
+  (`security.rs` `RateLimitConfig::default`, 100 msgs / 10 s) is a second cap on
+  top.
+
+  **Do not fix this by relaxing the number.** The fix is a correctly-sized
+  per-type budget plus a control/action exemption, so a burst of frames can never
+  starve the message that stops them.
 
 - [ ] **W3.2 (HIGH)** `handlers/audio.rs` leaks live system-audio PCM to
   unpaired LAN sockets. Three sites iterate `ctx.clients` directly —
@@ -782,12 +951,22 @@ where the drift actually is. The items below are that drift.
   `answerCall` (`useCalls.ts:183-186`) flips local state to `active` for a
   frame that was dropped.
 
-- [ ] **W4.16 (MEDIUM)** Discovery is write-only. `hooks/useDiscovery.ts:283-290`
-  returns `startDiscovery`, `stopDiscovery`, `clearDiscovered`,
-  `discoveredDevices` and `isDiscovering`; `App.tsx:133` destructures only
-  `handleDiscoveryMessage`. The `start_discovery`/`stop_discovery` invokes are
-  unreachable, and `components/network/DeviceHub.tsx:28, 43` declares
-  `onShiftClickDevice` and `onNavigate` that `App.tsx:283-289` never passes.
+- [ ] **W4.16 (PARTLY RESOLVED)** Discovery was write-only. **Half of this
+  entry was stale.** `useDiscovery.ts` is *not* write-only: it subscribes to both
+  mDNS events, dispatches into its reducer, handles the WebSocket announce, and
+  now has a hook-level test (12 tests) that mounts it, registers a fake `listen`
+  and fires the exact payload `serde_json::to_value(DiscoveredDevice)` produces.
+  Every value it exposes works.
+
+  **Still real:** `App.tsx:133` destructures only `handleDiscoveryMessage`, so
+  `discoveredDevices` is populated in memory and never read — the *observable*
+  claim holds even though the stated mechanism was wrong. There is no UI surface
+  for discovered devices anywhere in the app, so closing this means designing
+  one, which is new capability rather than a bug fix; it is left open for that
+  reason and not because the plumbing is missing.
+
+  `components/network/DeviceHub.tsx:28, 43` still declares `onShiftClickDevice`
+  and `onNavigate` that `App.tsx:283-289` never passes.
 
 - [ ] **W4.17 (MEDIUM)** The search categories do not all exist.
   `components/ui/SearchBar.tsx:9, 22-23` offers `file` and `message`, but
@@ -818,12 +997,19 @@ where the drift actually is. The items below are that drift.
   double-fire or target dead instances under `React.StrictMode`
   (`main.tsx:13`).
 
-- [ ] **W4.22 (MEDIUM)** `hooks/useSms.ts` exposes `markRead` (`:127-133, 147`)
-  and `hooks/useCalls.ts` exposes `dismissCall` (`:168-170, 231`); neither is
-  consumed by `App.tsx:141-144`, so opening a thread never clears its unread
-  count. `components/messages/MessageInput.tsx:7` declares a `disabled` prop that
-  `MessageThread.tsx:60` never passes, so the composer is never disabled while
-  offline.
+- [ ] **W4.22 (PARTLY RESOLVED)** `hooks/useSms.ts` exposes `markRead`
+  (`:127-133, 147`) and `hooks/useCalls.ts` exposes `dismissCall` (`:168-170,
+  231`); neither is consumed by `App.tsx:141-144`, so opening a thread never
+  clears its unread count. `components/messages/MessageInput.tsx:7` declares a
+  `disabled` prop that `MessageThread.tsx:60` never passes, so the composer is
+  never disabled while offline.
+  **The `useSms` half is fixed:** selecting a thread now clears its unread count
+  on both ends — locally and by telling the phone — and `markRead` sets
+  per-message read state and sends `sms/mark_read`, no-op when already read.
+  Unlike W2.14 this was *not* a missing model: `msg_read`/`msg_outgoing`,
+  `unread_count` on the wire and `SmsMessage.read` all existed. The only fault
+  was that the desktop never invoked the writer.
+  **Still open:** `dismissCall`, and the `MessageInput.disabled` prop.
 
 - [ ] **W4.23 (MEDIUM)** `components/settings/AdvancedSection.tsx:112-126` —
   `handleClearCache`'s catch reports *"Cache cleared"*, the same message as the
@@ -844,11 +1030,25 @@ where the drift actually is. The items below are that drift.
   Also `components/layout/FloatingDock.tsx:230-267` — 38 lines behind a prop
   `App.tsx:450-456` never passes.
 
-- [ ] **W4.26 (MEDIUM)** `components/automation/automationMeta.ts:25-44`
-  hand-maintains 7 trigger and 8 action labels over generated unions that
-  declare 8 and 9. `audio_device_disconnect` and `set_window_state` have no UI
-  entry, and the file's own comment claims omissions are a compile error — they
-  are not, because the arrays are explicitly typed as a subset.
+- [x] **W4.26 (RESOLVED, one deliberate exclusion)** `automationMeta.ts:25-44`
+  hand-maintained 7 trigger and 8 action labels over generated unions declaring
+  8 and 9. `audio_device_disconnect` and `set_window_state` had no UI entry, and
+  the file's own comment claimed omissions were a compile error — they were not,
+  because the arrays were explicitly typed as a subset.
+  **That was the more interesting half of the finding.** The arrays were
+  annotated `Record<TriggerType, …>` / `Record<ActionType, …>`, which widens the
+  literal back to the full union and makes the annotation a no-op. The first
+  attempt at a compile-time coverage assertion was *vacuous for exactly this
+  reason*. Switched to `as const satisfies`, which both adds the missing
+  `audio_device_disconnect` entry and makes a future omission a real
+  `TS2344`.
+  **Still excluded on purpose:** `set_window_state` has no UI entry and is
+  recorded as an explicit `Exclude<>` with the reasoning — `ActionEditor` has no
+  control for `state`, so the rule would carry `{type: 'set_window_state'}`, which
+  the Rust parser rejects outright. Offering an option that is guaranteed to fail
+  would be worse than not offering it.
+  `@ts-nocheck` is also gone from `automationMeta.ts`, `ActionEditor.tsx`,
+  `AutomationPanel.tsx` and `useAutomation.ts`.
 
 - [ ] **W4.27 (MEDIUM)** Design-system leakage. ~40 hardcoded `rgba()`/`hex`
   literals across `ContextMenu.tsx:107`, `SearchBar.tsx:62`,
@@ -925,33 +1125,45 @@ where the drift actually is. The items below are that drift.
 
 ## W5 — Build, CI and dependencies
 
-- [ ] **W5.1 (CRITICAL)** A fresh clone cannot build the desktop app.
+- [ ] **W5.1 (PARTLY RESOLVED)** A fresh clone cannot build the desktop app.
   `apps/desktop/src-tauri` depends on `rusqlite` with `bundled-sqlcipher`,
   which links against OpenSSL. `.cargo/config.toml:8-10` supplies it
-  unconditionally:
-  ```toml
-  [env]
-  OPENSSL_LIB_DIR     = { value = ".tools/openssl-win64/lib/static", relative = true }
-  OPENSSL_INCLUDE_DIR = { value = ".tools/openssl-win64/include",     relative = true }
-  ```
-  Four problems: (1) **no fetch script** — `scripts/` contains no
-  `fetch-openssl.ps1`; (2) **no version pin** in any tracked file (only the
-  untracked `.tools/openssl-win64/version.txt`); (3) **no checksum**; (4)
-  `.tools/` is gitignored (`.gitignore:51`), so a clone never receives it. The
-  failure surfaces as a link error from `libsqlite3-sys`, not as a message
-  naming the missing directory. There is **no `[target.'cfg(...)']` guard**, so
-  Linux and macOS get the same Windows `.lib` path and there is no working build
-  path at all.
-  *Left to do — three options, in order:*
-  - **B (immediate):** move the `[env]` table to
-    `[target.x86_64-pc-windows-msvc.env]`. One-line change; unblocks three CI
-    steps and makes the desktop clippy/test/build steps eligible to become
-    blocking.
-  - **A:** delete `.cargo/config.toml` and have a fetch script export the
-    variables into its own process before exec'ing cargo.
-  - **C (the real fix):** replace the vendored copy with `vcpkg install
-    openssl:x64-windows-static` on Windows and `libssl-dev` / `brew install
-    openssl@3` elsewhere.
+  unconditionally via `[env]` with `relative = true`, and `.tools/` is
+  gitignored (`.gitignore:51`), so a clone never receives it.
+
+  **Closed: the bootstrap.** `scripts/fetch-openssl.ps1` now exists. It pins
+  OpenSSL **3.5.8**, verifies size → SHA-256 *before* extracting, then asserts
+  the four files the build actually needs (`version.txt`, `opensslv.h`,
+  `libcrypto.lib`, `libssl.lib`). The expected digest is GitHub's own published
+  asset digest, so the pin is independently checkable rather than a hash
+  somebody typed. `-Check` verifies without downloading; `-Force` replaces.
+  Running it produced `libcrypto.lib`, `libssl.lib` and `opensslv.h`
+  **byte-identical (SHA-256)** to the copy already in use, which is the
+  strongest evidence available that the pin is right.
+
+  **Option B in the old entry does not work, and this was measured rather than
+  assumed.** The proposed "one-line change" — moving `[env]` to
+  `[target.x86_64-pc-windows-msvc.env]` — is **not implementable** on cargo
+  1.98.1:
+
+  | Config | Result |
+  |---|---|
+  | `[env]` + `{value, relative}` (current) | **works** |
+  | `[target.x86_64-pc-windows-msvc.env]` + `{value, relative}` | **hard parse error**: `expected a string, but found a table` |
+  | `[target.x86_64-pc-windows-msvc.env]` + plain string | parses, **never exports the variable** |
+  | `[target.'cfg(windows)'.env]` + `{value, relative}` | parses, **never exports the variable** |
+
+  Plain strings are not a fallback either: without `relative` the value resolves
+  against the process CWD, and build scripts do not run in cargo's invocation
+  directory. The change was reverted rather than forced through.
+
+  **Still open:** Linux and macOS still get the same Windows `.lib` path with no
+  guard, so there is no working non-Windows desktop build path. Options A (fetch
+  script exports into its own process) and C (`vcpkg` / `libssl-dev` /
+  `brew install openssl@3`) remain. **We still do not know whether this even
+  manifests on Linux** — the CI build died on `alsa-sys` before reaching
+  `libsqlite3-sys`, so it is unknown whether that build script prefers
+  `OPENSSL_LIB_DIR` over pkg-config.
 
 - [ ] **W5.2 (CRITICAL)** The vendored OpenSSL static libraries may not be
   redistributable, and `tauri.conf.json:38` bundles them.
@@ -964,19 +1176,52 @@ where the drift actually is. The items below are that drift.
   archive, not the licence); if restricted, switch to the dynamic
   `lib/import/*.lib` plus the shipped DLLs, or adopt W5.1 option C; add a
   third-party-licences file.
+  `fetch-openssl.ps1` now prints this warning at the end of a successful run, so
+  whoever fetches the binaries is told, rather than only whoever reads the
+  archive's own README. No binaries were committed and the licence question is
+  deliberately still yours to decide.
 
-- [ ] **W5.3 (CRITICAL)** The desktop crate's 699 tests never run in CI.
-  `.github/workflows/ci.yml:230` `cargo test -p conduit --locked` is
-  `continue-on-error: true`, as are the clippy (`:224`) and release build
-  (`:236`) steps. **699 of 1154 Rust tests — 61% — execute only on a
-  maintainer's Windows machine.** Direct consequence of W5.1.
+- [ ] **W5.3 (CRITICAL, diagnosis corrected — still open)** The desktop crate's
+  tests do not run in CI. **Every stated reason was wrong; the substance is
+  real.** `cargo test -p conduit --locked` *does* exist (`ci.yml:225`) and *does*
+  execute — but it dies in a build script before running a single test:
 
-- [ ] **W5.4 (CRITICAL)** The CI workflow has never been executed.
-  `ci.yml:11` says so in its own banner: *"THIS WORKFLOW HAS NEVER BEEN
-  EXECUTED."* `git log` shows 5 commits and `git remote -v` is empty. The
-  `hygiene` job's entitlements step is documented as currently red (`:706-707`).
-  Every "Verified" claim in the file (`:33-37`) is a local Windows measurement
-  extrapolated to a Linux runner.
+  ```
+  error: failed to run custom build command for `alsa-sys v0.4.0`
+  pkg-config exited with status code 1
+  Package alsa was not found in the pkg-config search path.
+  ```
+
+  All three desktop steps exit **101**. Three corrections: it is **not**
+  `continue-on-error` — the step runs and fails; the cause is **not** W5.1 or
+  OpenSSL, it is a **missing apt package**; and "699 of 1154" is stale — the
+  baseline is 748.
+  `libasound2-dev` is now installed in the workflow's apt line, which is the
+  observed blocker and is a real package in Ubuntu noble *and* resolute (so it
+  survives the announced `ubuntu-latest` migration). **This is unverified end to
+  end:** there is no Docker or WSL on the machine this was fixed from, and the
+  next native crate to fail is unpredictable. `keyring` needs a Secret Service
+  at *run* time and a headless runner has none, so the crate may compile and
+  still fail tests.
+
+  Also newly found: `cargo audit` and `cargo deny check advisories` both exit
+  non-zero on real advisories (RUSTSEC-2024-0429 `glib` unsoundness, a yanked
+  `yoke-derive`, ~10 unmaintained), hidden behind `continue-on-error`.
+
+- [x] **W5.4 (RESOLVED — was stale)** The CI workflow has never been executed.
+  **False, and decisively so.** Verified against the GitHub API rather than
+  assumed: there are 15 runs of `ci.yml`, and **four consecutive green runs on
+  `main`, the last being `e21d715`** — `36737997124`, `36834961099`,
+  `36840097378`, `36850507922`, 6/6 jobs each. `origin` is
+  `Snehishere/Conduit.git` (not empty) and there are 9 commits (not 5).
+  The "NEVER BEEN EXECUTED" banner is gone from `ci.yml`, replaced with the
+  actual history and the list of steps currently red.
+
+  **One part was true and is kept:** the `hygiene` job's entitlements step is
+  genuinely red (exit 1 — `tauri.conf.json` references an `./Entitlements.plist`
+  that does not exist on disk). Non-blocking, as before. And the per-step
+  "Verified" comments *were* written before the first run, which is worth
+  remembering rather than treating as a defect.
 
 - [ ] **W5.5 (HIGH)** `dtolnay/rust-toolchain@master` (`ci.yml:111`) pins a
   **mutable branch**, not a version tag — and it is the step that installs the
@@ -1066,10 +1311,14 @@ where the drift actually is. The items below are that drift.
   (`dock-navigation.spec.ts:34` and `revision3-surfaces.spec.ts:57`).
   *Left to do:* add a `pretest:e2e`; fix the four strings; pick one count.
 
-- [ ] **W5.14 (MEDIUM)** CI has no `timeout-minutes` and no `permissions:` block
-  anywhere. The `rust` job runs two full source builds of Rust tools
-  (`cargo install cargo-audit`, `cargo install cargo-deny`) plus three release
-  builds. Every job's `GITHUB_TOKEN` gets repository defaults.
+- [x] **W5.14 (RESOLVED)** CI had no `timeout-minutes` and no `permissions:`
+  block. Both are now in `ci.yml`: `permissions: contents: read` (every step was
+  reviewed for a write requirement — there are none; no deploy, no publish, and
+  all caches use the runtime token) and per-job `timeout-minutes` of
+  60/45/20/20/45/10, each set against that job's observed duration rather than
+  picked round.
+  `cargo install cargo-audit` and `cargo install cargo-deny` in the `rust` job
+  are still the long pole; the 60 is sized for them.
 
 - [ ] **W5.15 (MEDIUM)** `scripts/generate_dart.js:59-76` silently falls back to
   `npx --yes quicktype` when the local install is missing, downloading whatever
@@ -1117,7 +1366,7 @@ where the drift actually is. The items below are that drift.
 
 - [ ] **W5.24 (LOW)** `dart format` (63 of 74 files unformatted) and
   `flutter analyze --fatal-infos` are both non-blocking. The stated reason for
-  the latter is wrong: 359 of the 362 infos are in the generated
+  the latter is wrong: 365 of the 367 infos are in the generated
   `lib/models/protocol.dart`, which `analysis_options.yaml` does not exclude.
   Excluding one file would let this become a gate.
 
@@ -1531,9 +1780,15 @@ is W6.1, and bounded logging is part of W6.23.
   > across keys to short-circuit. The "MAC the raw bytes" half may still stand.
   > Re-audit `route.rs`.
 
-- [ ] **W7.8 (LOW)` `discovery.rs:101` byte-slices a `String` that came from a
-  file: `&device_id[..8.min(device_id.len())]`. A non-ASCII value panics the
-  discovery task. Use `.chars().take(8)`.
+- [x] **W7.8 (RESOLVED)** `discovery.rs` byte-sliced a `String` that came from a
+  file: `&device_id[..8.min(device_id.len())]`. A non-ASCII value panicked the
+  discovery task. Replaced with `short_id()`, which cuts on a character boundary
+  via `char_indices().nth(8)`.
+  Two tests prove it, including one that panics with the old expression
+  restored (`end byte index 8 … is inside 'é'`). Note the id comes from
+  `device_id.txt` on disk, not a fresh UUID, so it is attacker-adjacent input in
+  the sense that matters here: it is whatever an operator or a previous install
+  left behind.
 
 - [ ] **W7.9 (LOW)` A stale comment inverts the current design.
   `handlers/screen_mirror.rs:128-131` says loopback peers map to the
@@ -1716,16 +1971,16 @@ standalone service into a library hosted by the desktop app.
 |---|---|---|---|
 | Relay | repo root | `cargo test -p conduit-relay` | **235** passed, 1 ignored + 2 doctests |
 | Protocol | repo root | `cargo test -p conduit-protocol` | **270** passed + 1 doctest |
-| Desktop Rust | repo root | `cargo test -p conduit` | **729** passed |
+| Desktop Rust | repo root | `cargo test -p conduit` | **748** passed |
 | Clippy | repo root | `cargo clippy --workspace --all-targets` | exit 0, zero warnings |
 | Rust format | repo root | `cargo fmt --all -- --check` | exit 0 |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
-| Desktop unit | `apps/desktop` | `npm test` | **222** passed, 20 files |
+| Desktop unit | `apps/desktop` | `npm test` | **249** passed, 22 files |
 | Desktop e2e | `apps/desktop` | `npm run test:e2e` | **31/31 fail** — no `playwright install` bootstrap (W5.13) |
 | Desktop codegen | `apps/desktop` | `npm run generate` | exit 0, clean tree |
 | npm audit | `apps/desktop` | `npm audit` | 0 vulnerabilities |
-| Mobile unit | `apps/mobile` | `flutter test` | **87** passed |
-| Mobile analyze | `apps/mobile` | `flutter analyze lib test` | exit 0, no errors or warnings |
+| Mobile unit | `apps/mobile` | `flutter test` | **150** passed |
+| Mobile analyze | `apps/mobile` | `flutter analyze` | **367** infos, 0 errors, 0 warnings — 365 of them in the *generated* `lib/models/protocol.dart` |
 | Lockfile | repo root | — | see W5.6 |
 
 ## Notes

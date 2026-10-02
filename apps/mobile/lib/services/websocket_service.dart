@@ -1116,7 +1116,7 @@ class WebSocketService extends ChangeNotifier {
     _sendMessage({
       'type': 'status',
       'action': 'update',
-      if (battery != null) 'battery': battery,
+      'battery': ?battery,
     });
   }
 

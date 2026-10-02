@@ -5,6 +5,25 @@
 # Prebuilt OpenSSL is at <workspace>/.tools/openssl-win64/ (downloaded from
 # https://github.com/TaurusTLS-Developers/OpenSSL-Distribution/releases).
 #
+# `.tools/` is gitignored, so a fresh clone does not have it. Run
+#
+#     pwsh scripts/fetch-openssl.ps1        (Windows PowerShell: powershell)
+#
+# first: it downloads OpenSSL 3.5.8, verifies the archive's SHA-256, extracts to
+# .tools/openssl-win64/ and asserts the layout this file points at.
+# `scripts/fetch-openssl.ps1 -Check` verifies an existing tree without
+# downloading anything.
+#
+# KNOWN DEFECT, deliberately not "fixed" here. These variables are exported on
+# EVERY platform, so a Linux or macOS build points OPENSSL_LIB_DIR at a directory
+# that only ever exists on a Windows checkout. Scoping them to the target is the
+# obvious fix and it DOES NOT WORK in cargo 1.98: `relative = true` under
+# [target.x86_64-pc-windows-msvc.env] is a hard parse error ("expected a string,
+# but found a table"), and every other spelling of a target-scoped env table
+# parses and then never exports the variable at all - verified against
+# x86_64-pc-windows-msvc both with and without --target, and via
+# [target.'cfg(windows)'.env]. The real fix is to stop relying on this file: see
+# docs/REMAINING_WORK.md W5.1.
 [env]
 OPENSSL_LIB_DIR = { value = ".tools/openssl-win64/lib/static", relative = true }
 OPENSSL_INCLUDE_DIR = { value = ".tools/openssl-win64/include", relative = true }

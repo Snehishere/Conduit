@@ -21,6 +21,42 @@ const String vectorHmac =
 const String vectorSecret =
     '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f';
 
+/// Whole-frame vectors, byte for byte, produced by
+/// `conduit_protocol::build_binary_frame` — the single Rust producer the relay
+/// itself re-frames with (`services/relay/src/connection.rs`), so if these
+/// match, a frame this client builds is a frame the relay parses and tags
+/// identically. `buildBinaryFrame` below must reproduce them exactly.
+///
+/// The Dart tests for v2 frames were previously self-consistent only: they
+/// built a frame and then parsed it back with Dart code, which cannot detect
+/// the two implementations drifting apart. These constants are that check.
+///
+/// Re-emit from the Rust producer — `build_binary_frame` takes the same route
+/// key the vector above is derived from, so this is the exact call:
+///
+/// ```text
+/// conduit_protocol::build_binary_frame(
+///     &hmac::derive_route_key(&secret, "deadbeef"),
+///     "deadbeef", "cafebabe", 7, b"hello",
+/// )
+/// ```
+///
+/// `packages/protocol/src/types.rs` documents that its own tests pin this pair,
+/// and the Rust half of that assertion does not exist yet; whoever owns that
+/// file should add it so neither side is a one-way pin.
+const String vectorFrameHello =
+    '026361666562616265000000000000000000000007b721e258479b9f7c7b4b0ca343acde53f'
+    '1a495b884cb568297114c7dca056c5f68656c6c6f';
+const String vectorFrameEmpty =
+    '026361666562616265000000000000000000000001138f68922f828ce72b7573213db3e'
+    '2f798245c651512f1155623ce3aeb7ee865';
+const String vectorFrameLong =
+    '02303132333435363738396162636465660102030475dcdfbaa081e2127b1d6df93df6de'
+    '99614b28792e84b5e40baedfa4a1d826b874686520717569636b2062726f776e20666f78';
+const String vectorFrameTruncated =
+    '0230313233343536373839616263646566000000022129374e159f29fd2130c0bd1f17b'
+    '616dee807e3994120f91bcbb0e35fcffb6178';
+
 List<int> _secret() => EncryptionService.hexToBytes(vectorSecret);
 
 Map<String, dynamic> _vectorMessage() => {
@@ -77,6 +113,111 @@ void main() {
         nonce: 'nonce-1',
       );
       expect(route['hmac'], vectorHmac);
+    });
+  });
+
+  group('binary frame interop with the Rust producer', () {
+    List<int> key() => deriveRouteKey(_secret(), 'deadbeef');
+    Uint32List seq(int n) => Uint32List.fromList([n]);
+
+    test('builds the exact frame conduit_protocol::build_binary_frame builds', () {
+      // One short payload, an empty payload (the 53-byte minimum), a full
+      // 16-byte target id with a large sequence and a long payload, and a
+      // target id too long for the field. Together they cover every branch in
+      // the builder: zero padding, truncation, an empty body and a normal one.
+      expect(
+        hexEncode(
+          buildBinaryFrame(
+            routeKey: key(),
+            fromDeviceId: 'deadbeef',
+            targetDeviceId: 'cafebabe',
+            sequence: seq(7),
+            payload: utf8.encode('hello'),
+          ),
+        ),
+        vectorFrameHello,
+      );
+      expect(
+        hexEncode(
+          buildBinaryFrame(
+            routeKey: key(),
+            fromDeviceId: 'deadbeef',
+            targetDeviceId: 'cafebabe',
+            sequence: seq(1),
+            payload: Uint8List(0),
+          ),
+        ),
+        vectorFrameEmpty,
+      );
+      expect(
+        hexEncode(
+          buildBinaryFrame(
+            routeKey: key(),
+            fromDeviceId: 'deadbeef',
+            targetDeviceId: '0123456789abcdef',
+            sequence: seq(0x01020304),
+            payload: utf8.encode('the quick brown fox'),
+          ),
+        ),
+        vectorFrameLong,
+      );
+      expect(
+        hexEncode(
+          buildBinaryFrame(
+            routeKey: key(),
+            fromDeviceId: 'deadbeef',
+            targetDeviceId: '0123456789abcdefEXTRA',
+            sequence: seq(2),
+            payload: utf8.encode('x'),
+          ),
+        ),
+        vectorFrameTruncated,
+      );
+    });
+
+    test('the tagged region is the sender id, 0x1F, header and payload', () {
+      // Asserted separately from the whole-frame equality above because this is
+      // the part the relay recomputes: it rebuilds the MAC input from the bytes
+      // it received, so a client that hashed anything else would still build a
+      // self-consistent frame and would be rejected at the relay.
+      //
+      // deadbeef | 0x1F | 02 cafebabe<8 NUL> 00000007 | hello
+      const macInput =
+          '64656164626565661f02636166656261626500000000000000000000000768656c6c6f';
+      final frame = Uint8List.fromList(
+        EncryptionService.hexToBytes(vectorFrameHello),
+      );
+      final headerAndPayload = Uint8List(binaryTagOffset + 5)
+        ..setRange(0, binaryTagOffset, frame)
+        ..setRange(binaryTagOffset, binaryTagOffset + 5, utf8.encode('hello'));
+      expect(hexEncode(binaryMacInput('deadbeef', headerAndPayload)), macInput);
+    });
+
+    test('a Rust-built frame verifies with the Dart verifier', () {
+      final frame = Uint8List.fromList(
+        EncryptionService.hexToBytes(vectorFrameHello),
+      );
+      expect(frame[0], binaryFrameVersion);
+      expect(
+        verifyBinaryFrame(routeKey: key(), fromDeviceId: 'deadbeef', frame: frame),
+        isTrue,
+      );
+      // And a Dart-built frame verifies as the Rust relay would: the tag is
+      // keyed by the route key, not by the connection's bearer token, and names
+      // the sender the relay authenticated on that connection.
+      expect(
+        verifyBinaryFrame(
+          routeKey: utf8.encode('relay-token'),
+          fromDeviceId: 'deadbeef',
+          frame: frame,
+        ),
+        isFalse,
+      );
+      expect(
+        verifyBinaryFrame(routeKey: key(), fromDeviceId: 'cafebabe', frame: frame),
+        isFalse,
+        reason: 'the sender id is inside the MAC input',
+      );
     });
   });
 

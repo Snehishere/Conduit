@@ -112,9 +112,18 @@ still outstanding; see the Limitations section of the README.
 
 **Unwelcome.** The allowlist is a flat name list, so a legitimate rule that runs
 `git status` requires the user to allowlist `git` — and therefore authorises
-`git` for any arguments. There is no per-rule or per-argument granularity. The
-`trusted_source_only` flag on a rule (`automation.rs:90`) restricts who may
-*fire* a rule; it does not restrict what the rule may run.
+`git` for any arguments. There is no per-rule or per-argument granularity.
+
+> **Correction.** This paragraph used to continue: "The `trusted_source_only`
+> flag on a rule (`automation.rs:90`) restricts who may *fire* a rule; it does not
+> restrict what the rule may run." **That is not true.** The flag is declared and
+> documented, and read by **no code anywhere** — not by
+> `evaluate_device_triggers`, not by `handle_status_update`, not by
+> `handle_automation_triggered`. Every peer-supplied rule carrying the flag set
+> still fires. The "Unwelcome" notes below cited a boundary that did not exist,
+> which is worth correcting here rather than leaving in a decision record:
+> implementing it needs the trigger's source identity threaded into evaluation,
+> and that is open work, not a property of the current code.
 
 **Unwelcome.** Deny-by-default is a behaviour change for any existing user with
 automation rules containing shell commands: those rules stop working until the

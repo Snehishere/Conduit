@@ -5,6 +5,117 @@ import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'database_service.dart';
 
+/// A native timestamp at or above this is milliseconds, not seconds. 1e11
+/// seconds is the year 5138, so nothing real is at risk of being divided.
+const _millisTimestampFloor = 100000000000;
+
+/// Turn a flat list of native records into one thread per address, each thread
+/// ordered oldest-message-first and the threads themselves newest-first.
+List<SmsThread> _buildSmsThreads(Map<String, List<SmsMessage>> grouped) {
+  final threads = grouped.entries.map((e) {
+    final msgs = e.value..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+    final last = msgs.last;
+    return SmsThread(
+      threadId: e.key,
+      address: msgs.first.address,
+      snippet: last.body,
+      unreadCount: msgs.where((m) => !m.read).length,
+      timestamp: last.timestamp,
+      messages: msgs,
+    );
+  }).toList();
+  threads.sort((a, b) => b.timestamp.compareTo(a.timestamp));
+  return threads;
+}
+
+/// Decode a `getSmsThreads` reply into raw records.
+///
+/// Android answers with a JSON string (`MainActivity.getSmsThreads`); iOS
+/// answers with an empty Flutter list (`AppDelegate.swift:139`), which is why
+/// the reply cannot be decoded as `String` — that cast raised a `TypeError`
+/// the caller could only catch as "failed to load". Returns `null` for a
+/// reply that is neither, so the caller can report it instead of silently
+/// showing an empty inbox.
+List<Map<dynamic, dynamic>>? _decodeNativeSmsRecords(Object? reply) {
+  Object? decoded = reply;
+  if (reply is String) {
+    if (reply.trim().isEmpty) return const [];
+    decoded = jsonDecode(reply);
+  } else if (reply == null) {
+    return const [];
+  }
+  if (decoded is! List) return null;
+  final records = <Map<dynamic, dynamic>>[];
+  for (final entry in decoded) {
+    if (entry is Map<dynamic, dynamic>) records.add(entry);
+  }
+  return records;
+}
+
+int _nativeTimestamp(Map<dynamic, dynamic> record) {
+  final raw = record['timestamp'] ?? record['date'];
+  if (raw is num) {
+    final value = raw.toInt();
+    return value.abs() >= _millisTimestampFloor ? value ~/ 1000 : value;
+  }
+  // Neither platform sends anything else. "Now" keeps ordering sane; a zero
+  // would sort the message to the top of an ancient thread.
+  return DateTime.now().millisecondsSinceEpoch ~/ 1000;
+}
+
+bool _nativeRead(Map<dynamic, dynamic> record) {
+  final raw = record['read'];
+  if (raw is bool) return raw;
+  if (raw is num) return raw.toInt() == 1;
+  // Unknown: treat as read so a message is never invented as unread.
+  return true;
+}
+
+bool _nativeIsOutgoing(Map<dynamic, dynamic> record) {
+  final raw = record['is_outgoing'];
+  if (raw is bool) return raw;
+  if (raw is num) return raw.toInt() != 0;
+  // `Telephony.Sms`: 1 = inbox, 2 = sent. Outbox/failed/queued/draft have not
+  // been sent, so they read as incoming.
+  final type = record['type'];
+  if (type is num) return type.toInt() == 2;
+  return false;
+}
+
+String _nativeId(Map<dynamic, dynamic> record, String address, int timestamp) {
+  final raw = record['id'] ?? record['_id'];
+  if (raw != null) return raw.toString();
+  // Deterministic on purpose. An id seeded from "now" changes on every reload,
+  // and `sms_threads` is keyed (thread_id, msg_id) and written with
+  // `ConflictAlgorithm.replace`, so the phone would append a duplicate row for
+  // every message on every relaunch. The cost is that two messages from one
+  // sender within the same second collapse into one row; only a real provider
+  // row id can separate those, and Android now sends one.
+  return 'sms_${address}_$timestamp';
+}
+
+/// Parse one flat record from a platform `getSmsThreads` handler.
+///
+/// Android (`MainActivity.kt:369-377`) sends `address`, `body`, `timestamp`
+/// (already in seconds), `is_outgoing` (bool) and `read` (bool). The raw
+/// `content://sms` cursor names are also accepted — `_id`, `date` (ms) and
+/// `type` (int) — because they are what the reader was written against, so a
+/// platform returning an untranslated row is not mangled either.
+SmsMessage smsMessageFromNativeRecord(Map<dynamic, dynamic> record) {
+  final rawAddress = record['address']?.toString().trim();
+  final address = (rawAddress == null || rawAddress.isEmpty) ? 'unknown' : rawAddress;
+  final rawBody = record['body'];
+  final timestamp = _nativeTimestamp(record);
+  return SmsMessage(
+    id: _nativeId(record, address, timestamp),
+    address: address,
+    body: rawBody == null ? '' : rawBody.toString(),
+    timestamp: timestamp,
+    read: _nativeRead(record),
+    isOutgoing: _nativeIsOutgoing(record),
+  );
+}
+
 /// SMS thread data matching the shared protocol
 class SmsThread {
   final String threadId;
@@ -114,20 +225,8 @@ class SmsService extends ChangeNotifier {
         grouped.putIfAbsent(threadId, () => []).add(msg);
       }
 
-      _threads = grouped.entries.map((e) {
-        final msgs = e.value..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-        final last = msgs.last;
-        return SmsThread(
-          threadId: e.key,
-          address: msgs.first.address,
-          snippet: last.body,
-          unreadCount: msgs.where((m) => !m.read).length,
-          timestamp: last.timestamp,
-          messages: msgs,
-        );
-      }).toList();
+      _threads = _buildSmsThreads(grouped);
 
-      _threads.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       if (_threads.isNotEmpty) {
         debugPrint('[SmsService] Loaded ${_threads.length} threads from DB');
         notifyListeners();
@@ -264,9 +363,10 @@ class SmsService extends ChangeNotifier {
     );
 
     final existingIndex = _threads.indexWhere((t) => t.address == from);
+    final SmsThread updatedThread;
     if (existingIndex >= 0) {
       final existing = _threads[existingIndex];
-      _threads[existingIndex] = SmsThread(
+      updatedThread = SmsThread(
         threadId: existing.threadId,
         address: from,
         name: existing.name,
@@ -275,66 +375,91 @@ class SmsService extends ChangeNotifier {
         timestamp: timestamp,
         messages: [...existing.messages, message],
       );
+      _threads[existingIndex] = updatedThread;
     } else {
-      _threads.insert(0, SmsThread(
+      updatedThread = SmsThread(
         threadId: 't_${DateTime.now().millisecondsSinceEpoch}',
         address: from,
         snippet: body,
         unreadCount: 1,
         timestamp: timestamp,
         messages: [message],
-      ));
+      );
+      _threads.insert(0, updatedThread);
     }
 
     _threads.sort((a, b) => b.timestamp.compareTo(a.timestamp));
     notifyListeners();
 
-    // Persist the updated thread to SQLite
-    final updatedThread = existingIndex >= 0 ? _threads[existingIndex] : _threads.first;
+    // The thread itself, not `_threads[existingIndex]` after the sort above:
+    // a newer message moves the thread up the list, so that index names a
+    // different thread and the wrong rows were written to SQLite.
     _persistThread(updatedThread);
+  }
+
+  /// Mark every message in a thread read, because it was opened elsewhere.
+  ///
+  /// Driven by a peer's `sms`/`mark_read`. The address is accepted as well as
+  /// the thread id because a thread the phone has not yet named is keyed by its
+  /// address until a local id is minted for it.
+  void markThreadRead(String threadId) {
+    final index = _threads.indexWhere(
+      (t) => t.threadId == threadId || t.address == threadId,
+    );
+    if (index < 0) return;
+    final thread = _threads[index];
+    if (thread.unreadCount == 0 &&
+        thread.messages.every((m) => m.read)) {
+      return;
+    }
+
+    final updated = SmsThread(
+      threadId: thread.threadId,
+      address: thread.address,
+      name: thread.name,
+      snippet: thread.snippet,
+      unreadCount: 0,
+      timestamp: thread.timestamp,
+      messages: thread.messages
+          .map((m) => SmsMessage(
+                id: m.id,
+                address: m.address,
+                body: m.body,
+                timestamp: m.timestamp,
+                read: true,
+                isOutgoing: m.isOutgoing,
+              ))
+          .toList(),
+    );
+    _threads[index] = updated;
+    notifyListeners();
+    _persistThread(updated);
   }
 
   /// Load all SMS threads from the device via native platform.
   Future<void> loadThreads() async {
     try {
-      final result = await _channel.invokeMethod<String>('getSmsThreads');
-      if (result == null || result.isEmpty) {
+      final reply = await _channel.invokeMethod<Object?>('getSmsThreads');
+      final records = _decodeNativeSmsRecords(reply);
+      if (records == null) {
+        _handleError('getSmsThreads returned an unreadable reply');
+        return;
+      }
+      if (records.isEmpty) {
         _threads = [];
         notifyListeners();
         return;
       }
 
-      final List<dynamic> data = jsonDecode(result);
-      // Native returns a FLAT list of SMS records (address/body/date/type/read).
-      // Group by address into threads; each record becomes one SmsMessage.
-      final Map<String, List<SmsMessage>> grouped = {};
-      for (final t in data) {
-        final m = t as Map<String, dynamic>;
-        final address = (m['address'] as String?) ?? 'unknown';
-        final msg = SmsMessage(
-          id: (m['_id']?.toString() ?? '${address}_${m['date'] ?? DateTime.now().millisecondsSinceEpoch}'),
-          address: address,
-          body: (m['body'] as String?) ?? '',
-          timestamp: ((m['date'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch) ~/ 1000,
-          read: ((m['read'] as num?)?.toInt() ?? 1) == 1,
-          isOutgoing: ((m['type'] as num?)?.toInt() ?? 1) == 2,
-        );
-        grouped.putIfAbsent(address, () => []).add(msg);
+      // Native returns a FLAT list of SMS records. Group by address into
+      // threads; each record becomes one SmsMessage.
+      final grouped = <String, List<SmsMessage>>{};
+      for (final record in records) {
+        final msg = smsMessageFromNativeRecord(record);
+        grouped.putIfAbsent(msg.address, () => []).add(msg);
       }
-      _threads = grouped.entries.map((e) {
-        final msgs = e.value..sort((a, b) => a.timestamp.compareTo(b.timestamp));
-        final last = msgs.last;
-        return SmsThread(
-          threadId: e.key,
-          address: e.key,
-          snippet: last.body,
-          unreadCount: msgs.where((m) => !m.read).length,
-          timestamp: last.timestamp,
-          messages: msgs,
-        );
-      }).toList();
+      _threads = _buildSmsThreads(grouped);
 
-      _threads.sort((a, b) => b.timestamp.compareTo(a.timestamp));
       notifyListeners();
 
       // Persist native-loaded threads to SQLite for offline caching

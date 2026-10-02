@@ -490,6 +490,23 @@ pub fn action_tag(action: &ActionType) -> String {
         .unwrap_or_default()
 }
 
+/// Does the **desktop hub** execute this action, rather than a paired phone?
+///
+/// This is a routing predicate, not a capability predicate: it answers "which
+/// side runs this", and therefore which side's execution path — and which log
+/// row — a rule produces. It is deliberately **not** narrowed to the actions the
+/// hub has an implementation for.
+///
+/// Narrowing it would be actively harmful. `handlers/auto_rules.rs` uses it to
+/// choose between executing the action and taking the "this executes on the
+/// target phone/tablet" branch, and that branch writes `success = 1` to
+/// `automation_logs` without sending anything to any device (the desktop never
+/// emits `automation/triggered` outbound — see W1.16). Dropping the five
+/// unimplemented actions out of this set would therefore trade five false
+/// successes for seven, and would misattribute them to a peer that never
+/// received the frame. The truthful report comes from
+/// [`execute_action_with_allowlist`] returning `success: false`, which is where
+/// W3.1 was fixed.
 pub fn is_desktop_executable(action: &ActionType) -> bool {
     matches!(
         action,
@@ -641,6 +658,33 @@ fn parse_hhmm(time: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
+/// The desktop hub has no implementation for `action_tag`, so nothing happened.
+///
+/// Every arm that reaches this helper used to `info!()` its parameters and
+/// return `success: true`. The caller writes that boolean to
+/// `automation_logs.success`, the Automation panel renders it green, and the
+/// user believes their machine sent a notification, routed audio, toggled
+/// Wi-Fi, toggled Bluetooth or opened a URL. None of those five had an
+/// implementation: there is no notification emitter, no Wi-Fi/Bluetooth
+/// control and no URL opener anywhere in this crate.
+///
+/// Reporting failure is the whole fix here. Implementing the actions is a
+/// separate piece of work and is deliberately not attempted here.
+fn not_executed(action_tag: &str, timestamp: i64, detail: impl Into<String>) -> RuleExecutionLog {
+    let detail = detail.into();
+    warn!(
+        "Automation action {} is not implemented on the desktop hub: {}",
+        action_tag, detail
+    );
+    RuleExecutionLog {
+        id: String::new(),
+        trigger_type: action_tag.to_string(),
+        timestamp,
+        success: false,
+        message: Some(format!("Not executed on the desktop hub: {}", detail)),
+    }
+}
+
 /// Execute an action with no allowlist enforcement (use only for internal/desktop-initiated actions).
 pub fn execute_action(action: &ActionType) -> RuleExecutionLog {
     execute_action_with_allowlist(action, None)
@@ -718,103 +762,79 @@ pub fn execute_action_with_allowlist(
             }
         }
         ActionType::SetWindowState { state } => {
-            info!(
-                "Setting window state: {} (standalone — requires window context)",
-                state
-            );
             let valid = matches!(
                 state.as_str(),
                 "minimize" | "maximize" | "restore" | "close"
             );
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "set_window_state".to_string(),
-                timestamp,
-                success: false,
-                message: Some(if valid {
-                    "Window action requires desktop window context; use execute_automation_action"
-                        .to_string()
-                } else {
-                    format!("Invalid window state: {}", state)
-                }),
+            if !valid {
+                return RuleExecutionLog {
+                    id: String::new(),
+                    trigger_type: "set_window_state".to_string(),
+                    timestamp,
+                    success: false,
+                    message: Some(format!("Invalid window state: {}", state)),
+                };
             }
-        }
-        ActionType::SendNotification { title, body } => {
-            info!("Sending notification: {} - {}", title, body);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "send_notification".to_string(),
+            not_executed(
+                "set_window_state",
                 timestamp,
-                success: true,
-                message: Some(format!("Notification: {} - {}", title, body)),
-            }
+                format!(
+                    "a window action requires desktop window context (state '{}'); \
+                     use execute_automation_action",
+                    state
+                ),
+            )
         }
-        ActionType::SetPhoneProfile { profile } => {
-            info!("Setting phone profile: {} (phone-only)", profile);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "set_phone_profile".to_string(),
-                timestamp,
-                success: false,
-                message: Some(format!(
-                    "Phone profile is phone-only, not executed on desktop: {}",
-                    profile
-                )),
-            }
-        }
-        ActionType::RouteAudio { device_id } => {
-            info!("Routing audio to device: {}", device_id);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "route_audio".to_string(),
-                timestamp,
-                success: true,
-                message: Some(format!("Audio routed to: {}", device_id)),
-            }
-        }
-        ActionType::ToggleWiFi { enabled } => {
-            info!("Toggling WiFi: {}", enabled);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "toggle_wifi".to_string(),
-                timestamp,
-                success: true,
-                message: Some(format!("WiFi set to: {}", enabled)),
-            }
-        }
-        ActionType::ToggleBluetooth { enabled } => {
-            info!("Toggling Bluetooth: {}", enabled);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "toggle_bluetooth".to_string(),
-                timestamp,
-                success: true,
-                message: Some(format!("Bluetooth set to: {}", enabled)),
-            }
-        }
-        ActionType::OpenUrl { url } => {
-            info!("Opening URL: {}", url);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "open_url".to_string(),
-                timestamp,
-                success: true,
-                message: Some(format!("URL opened: {}", url)),
-            }
-        }
-        ActionType::OpenApp { app_package } => {
-            info!("Open app (phone/tablet only): {}", app_package);
-            RuleExecutionLog {
-                id: String::new(),
-                trigger_type: "open_app".to_string(),
-                timestamp,
-                success: false,
-                message: Some(format!(
-                    "App open is phone/tablet only, not executed on desktop: {}",
-                    app_package
-                )),
-            }
-        }
+        ActionType::SendNotification { title, body } => not_executed(
+            "send_notification",
+            timestamp,
+            format!(
+                "sending a notification is not implemented ({}: {})",
+                title, body
+            ),
+        ),
+        ActionType::SetPhoneProfile { profile } => not_executed(
+            "set_phone_profile",
+            timestamp,
+            format!(
+                "setting the phone profile is a phone-only action ({})",
+                profile
+            ),
+        ),
+        ActionType::RouteAudio { device_id } => not_executed(
+            "route_audio",
+            timestamp,
+            format!(
+                "routing audio is not implemented ({} was not touched)",
+                device_id
+            ),
+        ),
+        ActionType::ToggleWiFi { enabled } => not_executed(
+            "toggle_wifi",
+            timestamp,
+            format!("toggling Wi-Fi is not implemented (requested {})", enabled),
+        ),
+        ActionType::ToggleBluetooth { enabled } => not_executed(
+            "toggle_bluetooth",
+            timestamp,
+            format!(
+                "toggling Bluetooth is not implemented (requested {})",
+                enabled
+            ),
+        ),
+        ActionType::OpenUrl { url } => not_executed(
+            "open_url",
+            timestamp,
+            format!("opening a URL is not implemented ({})", url),
+        ),
+        ActionType::OpenApp { app_package } => not_executed(
+            "open_app",
+            timestamp,
+            format!(
+                "opening an app is a phone/tablet only action ({})",
+                app_package
+            ),
+        ),
     }
 }
 
@@ -2057,48 +2077,126 @@ mod tests {
 
     // --- execute_action ---
 
+    // ── W3.1: an action that did nothing must not report `success: true` ────
+    //
+    // `SendNotification`, `RouteAudio`, `ToggleWiFi`, `ToggleBluetooth` and
+    // `OpenUrl` each used to `info!()` and return `success: true` without
+    // touching the machine at all. A rule therefore wrote `success = 1` to
+    // `automation_logs` and the UI showed green for something that never
+    // happened. There is no notification emitter, no Wi-Fi/Bluetooth control
+    // and no URL opener in this crate, so the honest report is a failure.
+
     #[test]
-    fn execute_send_notification_returns_success() {
+    fn execute_send_notification_reports_not_executed() {
         let action = ActionType::SendNotification {
             title: "Test".into(),
             body: "Hello".into(),
         };
         let log = execute_action(&action);
-        assert!(log.success);
+        assert!(!log.success, "nothing emitted a notification");
         assert_eq!(log.trigger_type, "send_notification");
         assert!(log.message.unwrap().contains("Test"));
     }
 
     #[test]
-    fn execute_toggle_wifi_returns_success() {
+    fn execute_toggle_wifi_reports_not_executed() {
         let log = execute_action(&ActionType::ToggleWiFi { enabled: true });
-        assert!(log.success);
+        assert!(!log.success, "no Wi-Fi control exists in the desktop crate");
         assert_eq!(log.trigger_type, "toggle_wifi");
     }
 
     #[test]
-    fn execute_toggle_bluetooth_returns_success() {
+    fn execute_toggle_bluetooth_reports_not_executed() {
         let log = execute_action(&ActionType::ToggleBluetooth { enabled: false });
-        assert!(log.success);
+        assert!(
+            !log.success,
+            "no Bluetooth control exists in the desktop crate"
+        );
         assert_eq!(log.trigger_type, "toggle_bluetooth");
     }
 
     #[test]
-    fn execute_route_audio_returns_success() {
+    fn execute_route_audio_reports_not_executed() {
         let log = execute_action(&ActionType::RouteAudio {
             device_id: "d1".into(),
         });
-        assert!(log.success);
+        assert!(!log.success, "the audio stream is never touched");
         assert_eq!(log.trigger_type, "route_audio");
     }
 
     #[test]
-    fn execute_open_url_returns_success() {
+    fn execute_open_url_reports_not_executed() {
         let log = execute_action(&ActionType::OpenUrl {
             url: "https://example.com".into(),
         });
-        assert!(log.success);
+        assert!(!log.success, "no URL opener is a dependency of this crate");
         assert_eq!(log.trigger_type, "open_url");
+    }
+
+    /// Every action the desktop hub cannot perform must report failure, and must
+    /// say in the log *why*. `RunShellCommand` is excluded because it really
+    /// does execute, and reports the process's own exit status.
+    #[test]
+    fn every_action_without_an_implementation_reports_failure() {
+        let unimplemented = vec![
+            ActionType::SendNotification {
+                title: "t".into(),
+                body: "b".into(),
+            },
+            ActionType::SetPhoneProfile {
+                profile: "silent".into(),
+            },
+            ActionType::RouteAudio {
+                device_id: "d1".into(),
+            },
+            ActionType::ToggleWiFi { enabled: true },
+            ActionType::ToggleBluetooth { enabled: true },
+            ActionType::OpenUrl {
+                url: "https://example.com".into(),
+            },
+            ActionType::OpenApp {
+                app_package: "com.example".into(),
+            },
+            ActionType::SetWindowState {
+                state: "minimize".into(),
+            },
+        ];
+
+        for action in unimplemented {
+            let tag = action_tag(&action);
+            let log = execute_action(&action);
+            assert!(
+                !log.success,
+                "{tag} reports success, but the desktop hub never performs it"
+            );
+            assert_eq!(log.trigger_type, tag);
+            let message = log.message.unwrap_or_default();
+            assert!(!message.is_empty(), "{tag} must explain itself");
+            assert!(
+                message.to_lowercase().contains("not executed"),
+                "{tag} must record that nothing was executed, got: {message}"
+            );
+        }
+    }
+
+    /// The one action the hub really does perform reports the process's own
+    /// exit status, in both directions — so the failure above is not just a
+    /// blanket `false`.
+    #[test]
+    fn run_shell_command_reports_the_real_exit_status() {
+        let ok = execute_action(&ActionType::RunShellCommand {
+            command: "echo hello".into(),
+        });
+        assert!(ok.success, "a command that exits 0 must report success");
+
+        let failed = execute_action(&ActionType::RunShellCommand {
+            command: "exit 1".into(),
+        });
+        assert!(
+            !failed.success,
+            "a command that exits 1 must report failure"
+        );
+        assert_eq!(failed.trigger_type, "run_shell_command");
     }
 
     #[test]

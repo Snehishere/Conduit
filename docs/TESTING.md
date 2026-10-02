@@ -26,14 +26,14 @@ common source of "command not found" / "no such package" in this project.
 # repository root
 cargo test -p conduit-protocol     # 270 passed, 0 failed, plus 1 doctest
 cargo test -p conduit-relay        # 235 passed, 0 failed, 1 ignored, plus 2 doctests
-cargo test -p conduit              # 729 passed, 0 failed
+cargo test -p conduit              # 748 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
 | `packages/protocol` | `conduit-protocol` | repository root | 270 passed, 0 failed, plus 1 doctest |
 | `services/relay` | `conduit-relay` | repository root | 235 passed, 0 failed, 1 ignored, plus 2 doctests |
-| `apps/desktop/src-tauri` | `conduit` | repository root | 729 passed, 0 failed |
+| `apps/desktop/src-tauri` | `conduit` | repository root | 748 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
 [DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem).
@@ -57,7 +57,7 @@ Note the crate directory and the `-p` name do not match (`apps/desktop/src-tauri
 ```bash
 # apps/desktop
 npx tsc --noEmit      # typecheck, no emit        -> exit 0
-npm test              # vitest run                -> 222 passed (20 files)
+npm test              # vitest run                -> 249 passed (22 files)
 npm run test:watch    # vitest, interactive
 npm run test:e2e      # playwright test           -> browser shell only
 npm run lint          # eslint src/
@@ -73,8 +73,8 @@ and a typecheck disagree.
 
 ```bash
 # apps/mobile
-flutter test                        # 87 passed
-dart analyze                       # 0 errors, 0 warnings (362 infos)
+flutter test                        # 150 passed
+dart analyze                       # 0 errors, 0 warnings (367 infos)
 dart format --output=none --set-exit-if-changed lib test integration_test
 flutter test integration_test       # needs a device or running emulator
 ```
@@ -182,23 +182,23 @@ and it hosts the relay in-process — `src/relay.rs` has its own 16 tests for th
 `conduit` crate, not here, so nothing in `conduit-relay`'s own suite exercises
 the crate the way that consumer does. See §3.
 
-### `conduit` (desktop Rust) — 729 tests, all passing
+### `conduit` (desktop Rust) — 748 tests, all passing
 
 Test count per module, as reported by `cargo test -p conduit -- --list`
-(729 total):
+(748 total):
 
 | Module | Tests | What it protects |
 |---|---|---|
-| `src/server/` | 196 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 51 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
+| `src/server/` | 202 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 57 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
 | `src/commands/` | 123 | Every Tauri command, via `tauri::test::mock_builder` |
-| `src/automation.rs` | 102 | Rule evaluation, the shell allowlist gate, `trusted_source_only`, trigger dispatch |
+| `src/automation.rs` | 104 | Rule evaluation, the shell allowlist gate, trigger dispatch, and **the honest reporting of actions with no implementation** — five of seven actions used to return `success: true` while doing nothing |
 | `src/encryption.rs` | 86 | Key resolution across keyring and 0600 key file, secret reuse, migration back into a recovered keyring |
 | `src/storage.rs` | 70 | SQLCipher persistence, migrations, settings round-trips, the keyring-loss data path |
 | `src/file_transfer.rs` | 53 | Chunking, path-traversal rejection, download-path validation |
 | `src/security.rs` | 46 | Rate limiters, file-request validation, `allowed_commands` parsing (fail-closed) |
+| `src/discovery.rs` | 20 | mDNS advertisement contents, the TXT-record consumption decision, and character-boundary-safe device-id truncation |
 | `src/relay.rs` | 17 | The `RelayHost`: building `conduit_relay::Overrides` from the desktop settings, resolving the keyring-backed relay token and the desktop's own route key, and the `RouteKeys` implementation |
 | `src/main.rs` → `mod integration_tests` | 13 | Bind address / port invariants |
-| `src/discovery.rs` | 9 | mDNS advertisement contents |
 | `src/sync.rs` | 6 | Sync engine state |
 | `src/audio.rs` | 3 | Audio stream and playback state |
 | `src/error.rs` | 3 | Error mapping |
@@ -210,7 +210,7 @@ Test count per module, as reported by `cargo test -p conduit -- --list`
 > the crate's public API surface and runs in the same binary. Nothing in this
 > repository is a real Cargo integration test.
 
-### Desktop frontend — vitest, 222 tests in 20 files
+### Desktop frontend — vitest, 249 tests in 22 files
 
 | Location | Files | Covers |
 |---|---|---|
@@ -219,7 +219,7 @@ Test count per module, as reported by `cargo test -p conduit -- --list`
 | `src/lib/__tests__/` | 2 | `toast`, `utils` |
 | `src/__tests__/hooks/` | 7 | `useAutomation`, `useClipboard`, `useDevices`, `useDiscovery`, `useEncryption`, `useSearch`, `useWebSocket` |
 
-The per-file split of the 222 is not recorded here: it is a `vitest` reporter
+The per-file split of the 249 is not recorded here: it is a `vitest` reporter
 figure and it moves every time a `it()` block is added, so a hand-maintained
 table of it would be wrong within a week. The file counts above are the useful
 part and they are the ones that describe where coverage lives.
@@ -254,7 +254,7 @@ project, `chromium`. Its own header comment states the constraint:
 > Tauri IPC calls are not available in the browser environment, so the app
 > must gracefully degrade when `invoke()` fails.
 
-### Mobile — `flutter test`, 87 tests in 20 files
+### Mobile — `flutter test`, 150 tests in 26 files
 
 All under `apps/mobile/test/`:
 
@@ -262,16 +262,36 @@ All under `apps/mobile/test/`:
 |---|---|
 | `test/screens/` | 13 — one per screen (`automation_rules`, `calls`, `clipboard`, `discovery`, `files`, `home`, `messages`, `notifications`, `pairing`, `remote_input`, `screen_mirror`, `search`, `settings`) |
 | `test/widgets/` | 5 — `ContextMenu`, `EmptyState`, `SearchBar`, `Skeleton`, `StatusBadge` |
-| `test/services/` | 1 — `relay_route` |
+| `test/services/` | 6 — `relay_route`, `websocket_service_relay`, `native_screen_capture`, `ios_screen_capture_contract`, `discovery_service`, `sms_service`, `notification_read_state` |
 | `test/theme/` | 1 — `theme_provider` |
 
-Most of what `flutter test` runs is still widget and theme tests. One service is
-covered — `test/services/relay_route_test.dart`, covering the per-device
-route-key derivation and the binary frame v2 codec — but the rest of the service
-layer is not: the services that actually talk to the WebSocket, the database,
-the keyring, the camera and the OS are still untested at the unit level, as is
-all of `lib/models/`. Those paths are only reached by the integration suite,
-which needs a device.
+The service layer is no longer bare. The largest gap — that nothing tested the
+WebSocket path — is now partly closed by
+`test/services/websocket_service_relay_test.dart`, which drives the **real**
+`WebSocketService` over a real loopback socket standing in for the relay and
+inspects what actually leaves the phone. That is not the same as the real
+in-process relay, and it is not claimed to be.
+
+Two other gaps closed this round:
+
+- **Dart↔Rust interop on the binary frame.** The v2 frame tests were previously
+  self-consistent only (build and parse both in Dart), so a drift between
+  `relay_route.dart` and `conduit_protocol::build_binary_frame` was undetectable.
+  Whole-frame vectors from the Rust producer are now pinned on the Dart side.
+  The reverse pin — a Rust test asserting the Dart-built frame — does not exist;
+  `types.rs` claims it does.
+- **Native screen capture.** `test/services/native_screen_capture_test.dart`
+  covers the EventChannel subscriber (argument binding, frame normalisation, the
+  legacy iOS shape, the size cap, and refusing another stream on the same
+  channel). The Swift producer is pinned by a **source** assertion
+  (`ios_screen_capture_contract_test.dart`) rather than a behavioural one —
+  there is no Swift test target and `swiftc` cannot run on this host, so the
+  iOS side is unbuilt and unrun.
+
+Still untested at the unit level: the keyring, the camera, and the OS
+integration behind `integration_test/`, which needs a device. The mobile
+database has no injectable seam, so a persistence fix made this round is
+recorded as **untested** rather than covered.
 
 ---
 
