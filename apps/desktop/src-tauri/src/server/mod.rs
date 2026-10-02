@@ -25,7 +25,7 @@ use crate::sync::{ConnectedClient, SyncEngine};
 
 pub mod handlers;
 
-use handlers::{Clients, WsContext, WsToDeviceId, broadcast_to_others};
+use handlers::{ClientSender, Clients, WsContext, WsToDeviceId, broadcast_to_others};
 
 /// Read limits for every accepted WebSocket connection.
 ///
@@ -475,43 +475,7 @@ impl WsServer {
                         let mut last = last_pong_time.lock().await;
                         *last = Instant::now();
                     }
-                    if let Message::Text(text) = msg {
-                        // Per-connection byte budget. The global limiter counts
-                        // messages; without this a peer could sit under the
-                        // message cap while pushing up to `MAX_MESSAGE_SIZE` per
-                        // message. Charged before parsing so an unparsable
-                        // flood still costs the attacker.
-                        let text = text.as_str();
-                        if !ctx
-                            .rate_limiter
-                            .check(&client_id, "", text.len() as u64)
-                            .await
-                        {
-                            warn!(
-                                "Byte budget exceeded by {} ({} bytes in window) — dropping frame",
-                                client_id,
-                                ctx.rate_limiter.window_bytes(&client_id).await
-                            );
-                            continue;
-                        }
-                        let preview: String = text.chars().take(120).collect();
-                        info!("Received from {}: {}...", client_id, preview);
-                        Self::handle_message(text, &client_id, &ctx).await;
-                    } else if let Message::Binary(bytes) = msg {
-                        let len = bytes.len();
-                        if !ctx.rate_limiter.check(&client_id, "", len as u64).await {
-                            warn!(
-                                "Byte budget exceeded by {} — dropping {len}-byte binary frame",
-                                client_id
-                            );
-                            continue;
-                        }
-                        info!("Received binary frame from {}: {} bytes", client_id, len);
-                        handlers::files::handle_binary_message(bytes.to_vec(), &client_id, &ctx)
-                            .await;
-                    } else if let Message::Pong(_) = msg {
-                        info!("Received pong from {}", client_id);
-                    }
+                    Self::admit_frame(&ctx, &client_id, msg).await;
                 }
                 Ok(Some(Err(e))) => {
                     warn!("WebSocket read error for {}: {}", client_id, e);
@@ -696,6 +660,85 @@ impl WsServer {
         Some((from.to_string(), payload))
     }
 
+    /// Charge one inbound frame to the connection's transport budget, and handle
+    /// it if it is within it.
+    ///
+    /// **This is the only place the global (`RateLimiter`) budget is charged.**
+    ///
+    /// It used to be charged here *and* again inside [`Self::dispatch`], against
+    /// the same `client_id`-keyed bucket, so every inbound text frame cost two
+    /// counts and the real ceiling was half of `max_messages`. With the old
+    /// default of 100 per 10 s that is ~5 msg/s — and screen mirroring (15–30
+    /// frames/s), audio (10–50/s) and a 64 KiB-chunked file push (~47/s) all
+    /// died inside it.
+    ///
+    /// # Why the reader, and not `dispatch`
+    ///
+    /// Not merely because it was there first. By the time a frame reaches this
+    /// function its bytes are already in the server's memory and about to be
+    /// JSON-parsed, HMAC-verified and decrypted — that work is what the limiter
+    /// exists to bound, and it happens before *anything* can reject the frame.
+    /// The charge therefore sits at the boundary where the cost starts.
+    ///
+    /// Keeping it here is also what makes **rejected frames cost something**.
+    /// `dispatch` is only reached by frames that parsed, passed
+    /// `validate_message`, the auth gate, the type allowlist and `settings_gate`;
+    /// a peer flooding with unparsable JSON, a forged HMAC or an unauthenticated
+    /// `file/chunk` never gets there. A limiter charged only in `dispatch` would
+    /// hand exactly that peer an unlimited supply of free parse attempts.
+    /// Charged at the reader, one frame costs one count whatever becomes of it
+    /// afterwards — which is exactly what `security::RateLimiter`'s tests assert
+    /// about its bucket.
+    ///
+    /// Bytes are charged here too, and only here: a frame's length is known
+    /// before parsing and never changes, and the count is what `dispatch` was
+    /// double-charging.
+    ///
+    /// Note that `check` charges before it decides, so a frame refused here has
+    /// still been billed. That is deliberate — see [`security::RateLimiter`].
+    ///
+    /// Returns `false` if the frame was dropped by the budget. `Ping`/`Close`
+    /// carry no payload and are answered by tungstenite, so they are neither
+    /// charged nor refused here.
+    async fn admit_frame(ctx: &WsContext, client_id: &str, msg: Message) -> bool {
+        match msg {
+            Message::Text(text) => {
+                let text = text.as_str();
+                let len = text.len();
+                if !ctx.rate_limiter.check(client_id, "", len as u64).await {
+                    warn!(
+                        "Transport budget exceeded by {} ({} bytes in window) — dropping frame",
+                        client_id,
+                        ctx.rate_limiter.window_bytes(client_id).await
+                    );
+                    return false;
+                }
+                let preview: String = text.chars().take(120).collect();
+                info!("Received from {}: {}...", client_id, preview);
+                Self::handle_message(text, client_id, ctx).await;
+                true
+            }
+            Message::Binary(bytes) => {
+                let len = bytes.len();
+                if !ctx.rate_limiter.check(client_id, "", len as u64).await {
+                    warn!(
+                        "Transport budget exceeded by {} — dropping {len}-byte binary frame",
+                        client_id
+                    );
+                    return false;
+                }
+                info!("Received binary frame from {}: {} bytes", client_id, len);
+                handlers::files::handle_binary_message(bytes.to_vec(), client_id, ctx).await;
+                true
+            }
+            Message::Pong(_) => {
+                info!("Received pong from {}", client_id);
+                true
+            }
+            _ => true,
+        }
+    }
+
     async fn handle_message(text: &str, client_id: &str, ctx: &WsContext) {
         // A relayed message is not this socket's traffic: it is another
         // device's, carried here. Unwrap it and re-enter as the sender the
@@ -755,8 +798,7 @@ impl WsServer {
                 server_version: Some(PROTOCOL_VERSION),
             };
             let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-            let clients_lock = ctx.clients.read().await;
-            if let Some(tx) = clients_lock.get(client_id) {
+            if let Some(tx) = answer_channel(ctx, client_id).await {
                 let _ = tx.send(err_resp);
             }
             return;
@@ -764,10 +806,25 @@ impl WsServer {
 
         let raw_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
-        if !ctx.rate_limiter.check(client_id, raw_type, 0).await {
-            warn!("Rate limited: {} (type: {})", client_id, raw_type);
-            return;
-        }
+        // Deliberately **not** charged to the global limiter here. This frame was
+        // already charged its one count and its bytes by the reader
+        // (`Self::admit_frame`); charging again against the same `client_id`
+        // bucket halved the real ceiling and killed every stream in the app.
+        //
+        // The reason that site is the right one is not only that it is first:
+        // everything below can refuse this frame — the JSON parse, the protocol
+        // version, the HMAC, `validate_message`, the auth gate, the type
+        // allowlist, `settings_gate` — and a peer that only ever sends refused
+        // frames would never reach a limiter placed here at all. Refused frames
+        // are charged at the reader instead, so the budget cannot be evaded by
+        // making the server reject your traffic.
+        //
+        // A relayed frame's *sender* is charged nothing here either, and that is
+        // also deliberate: the transport that carried it — the relay socket —
+        // was charged once in `admit_frame`, and the sender's own per-type
+        // budget, keyed by its device id, is charged below. Inventing a
+        // transport budget for a device that has no socket here would be a
+        // second accounting of the same bytes.
 
         let processed_msg = if raw_type == "encrypted" {
             let claimed_id = msg.get("source_device").and_then(|v| v.as_str());
@@ -895,9 +952,18 @@ impl WsServer {
                 server_version: None,
             };
             let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-            let clients_lock = ctx.clients.read().await;
-            if let Some(tx) = clients_lock.get(client_id) {
+            // `answer_channel`, not a bare `clients.get(client_id)`: a relayed
+            // sender's id is a device id, so the bare lookup missed and the
+            // phone was throttled into silence with nothing to log on its side.
+            // A sender with no socket here has no one to tell, which is logged.
+            if let Some(tx) = answer_channel(ctx, client_id).await {
                 let _ = tx.send(err_resp);
+            } else {
+                warn!(
+                    "Rate-limited {} (type: {}) has no socket on this desktop; \
+                     the relay is not told",
+                    client_id, msg_type
+                );
             }
             return;
         }
@@ -1068,8 +1134,7 @@ impl WsServer {
             ("pong", _) => {}
             ("ping", _) => {
                 let pong = serde_json::to_string(&Pong::new()).expect("Pong serializes");
-                let clients_lock = ctx.clients.read().await;
-                if let Some(tx) = clients_lock.get(client_id) {
+                if let Some(tx) = answer_channel(ctx, client_id).await {
                     let _ = tx.send(pong);
                 }
             }
@@ -1679,11 +1744,47 @@ async fn notification_post_allowed(ctx: &WsContext, msg: &Value) -> Result<(), &
     Ok(())
 }
 
+/// The socket to answer `id` on, if this desktop has one.
+///
+/// `ctx.clients` is keyed by **connection** id, so a direct lookup answers a LAN
+/// socket and nothing else. A relayed sender's `client_id` is the *device* id the
+/// relay authenticated (`handle_message` re-enters `dispatch` under it), and a
+/// device id is never a connection id — so every refusal aimed at a relayed peer
+/// (`rate_limited`, `invalid_message`, `not_authenticated`, a settings gate) was
+/// looked up, missed, and dropped on the floor: the peer was refused and never
+/// told why, which is indistinguishable from a dropped socket.
+///
+/// The second step is the same reverse walk of the pairing registry that
+/// `WsServer::send_to` already does to reach a device on the LAN, so a
+/// "how a device id is addressed" answer cannot exist in two places. Locks are
+/// taken in the same order as everywhere else (`clients` then
+/// `ws_to_device_id`).
+///
+/// `None` is the honest answer for a sender with no socket here at all: a
+/// relay-only peer can only be reached through the relay, which is a routing
+/// question for the relay, not something this map can answer.
+async fn answer_channel(ctx: &WsContext, id: &str) -> Option<ClientSender> {
+    let clients = ctx.clients.read().await;
+    if let Some(tx) = clients.get(id) {
+        return Some(tx.clone());
+    }
+    let connection = {
+        let registry = ctx.ws_to_device_id.read().await;
+        registry
+            .iter()
+            .find(|(_, device_id)| device_id.as_str() == id)
+            .map(|(connection_id, _)| connection_id.clone())
+    }?;
+    clients.get(&connection).cloned()
+}
+
 /// Tell the sender *why* its message was dropped, and say so in the log.
 ///
 /// A silent drop leaves the peer waiting for an ack that never arrives; an
 /// `error` frame with a stable `code` lets both sides record a meaningful
-/// reason. Unicast, so it also reaches a peer that is not paired yet.
+/// reason. Unicast, so it also reaches a peer that is not paired yet — via
+/// [`answer_channel`], which also reaches a *relayed* sender that happens to
+/// have a LAN socket.
 async fn send_error(ctx: &WsContext, client_id: &str, code: &str, detail: &str) {
     let err_resp = ErrorMessage {
         msg_type: "error".into(),
@@ -1692,9 +1793,10 @@ async fn send_error(ctx: &WsContext, client_id: &str, code: &str, detail: &str) 
         server_version: Some(PROTOCOL_VERSION),
     };
     let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-    let clients_lock = ctx.clients.read().await;
-    if let Some(tx) = clients_lock.get(client_id) {
+    if let Some(tx) = answer_channel(ctx, client_id).await {
         let _ = tx.send(err_resp);
+    } else {
+        warn!("Cannot answer {code} to {client_id}: it has no socket on this desktop");
     }
 }
 
@@ -3906,5 +4008,339 @@ mod tests {
         let route: Value = serde_json::from_str(&wire).expect("the route is JSON");
         assert_eq!(route["payload"]["type"], "sms");
         assert_eq!(route["payload"]["body"], "hi");
+    }
+
+    // -----------------------------------------------------------------
+    //  One frame, one count: the transport budget
+    //
+    //  The global limiter was charged twice for every inbound text frame —
+    //  once by the reader, once by `dispatch` — against the same `client_id`
+    //  bucket, so the real ceiling was half of `max_messages`. These drive
+    //  frames through `admit_frame`, which is the reader's body, and watch
+    //  the bucket itself rather than any handler's opinion of the traffic.
+    // -----------------------------------------------------------------
+
+    /// A context whose transport budget is a known, tiny number, so a test can
+    /// name the frame at which a connection must run out.
+    fn ctx_with_transport_budget(max_messages: u32, max_bytes: u64) -> WsContext {
+        let mut ctx = create_test_ctx();
+        ctx.rate_limiter = Arc::new(RateLimiter::new(security::RateLimitConfig {
+            max_messages,
+            max_bytes,
+            window: std::time::Duration::from_secs(60),
+        }));
+        ctx
+    }
+
+    fn text_frame(msg: serde_json::Value) -> Message {
+        Message::Text(
+            serde_json::to_string(&msg)
+                .expect("frame serializes")
+                .into(),
+        )
+    }
+
+    /// REGRESSION: one inbound text frame costs exactly one count.
+    ///
+    /// Asserted against the *bucket*, not against a handler: with the second
+    /// charge site in place, `budget` frames moved the counter by `2 × budget`
+    /// and the connection was cut off at frame `budget / 2` — which is how a
+    /// 100/10 s ceiling became ~5 msg/s and killed mirroring, audio and file
+    /// pushes alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_inbound_text_frame_costs_exactly_one_count() {
+        let budget = 8;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+
+        // `ping` is exempt from the auth gate, so it reaches `dispatch` and is
+        // charged by every site that has ever existed.
+        for i in 0..budget {
+            assert!(
+                WsServer::admit_frame(
+                    &ctx,
+                    "ws_phone",
+                    text_frame(serde_json::json!({
+                        "type": "ping", "seq": i
+                    }))
+                )
+                .await,
+                "frame {} of a {budget}-frame budget must be admitted; a second \
+                 charge site runs the connection dry at {}",
+                i + 1,
+                budget / 2
+            );
+        }
+        assert!(
+            !WsServer::admit_frame(
+                &ctx,
+                "ws_phone",
+                text_frame(serde_json::json!({"type": "ping", "seq": budget}))
+            )
+            .await,
+            "the first frame past the budget must be refused, so the budget is \
+             still a budget and not a formality"
+        );
+        assert_eq!(
+            ctx.rate_limiter.window_messages("ws_phone").await,
+            budget + 1,
+            "{budget} admitted frames plus one refused must cost {} counts in \
+             total — one each, and no more",
+            budget + 1
+        );
+    }
+
+    /// REGRESSION: a frame this desktop *refuses* still costs budget.
+    ///
+    /// Both halves matter, because they die in different places. An unparsable
+    /// frame dies at `serde_json::from_str`; a well-formed frame from an
+    /// unpaired peer dies at the auth gate. Both are *before* any handler, and
+    /// both would be free if the limiter only counted admitted messages — so a
+    /// peer could buy unlimited parse attempts by making the server reject its
+    /// traffic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_frames_still_consume_the_transport_budget() {
+        let budget = 4;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        // No pairing: every well-formed frame below is refused by the auth gate.
+        let tx = add_test_unpaired_client(&ctx, "ws_stranger").await;
+        let mut rx = tx.subscribe();
+
+        for i in 0..budget {
+            let frame = if i % 2 == 0 {
+                // Truncated JSON: never reaches `dispatch` at all.
+                Message::Text("{\"type\":".to_string().into())
+            } else {
+                // Valid, and refused by the auth gate.
+                text_frame(serde_json::json!({
+                    "type": "file", "action": "chunk", "id": "t1",
+                    "index": 0, "data": "AA=="
+                }))
+            };
+            assert!(
+                WsServer::admit_frame(&ctx, "ws_stranger", frame).await,
+                "refused frame {i} must still be within budget; the charge \
+                 happens before anything can reject it"
+            );
+        }
+        assert!(
+            !WsServer::admit_frame(
+                &ctx,
+                "ws_stranger",
+                text_frame(serde_json::json!({"type": "ping"}))
+            )
+            .await,
+            "a flood of frames this desktop refuses must still exhaust the \
+             budget — otherwise refusal is free"
+        );
+        assert_eq!(
+            ctx.rate_limiter.window_messages("ws_stranger").await,
+            budget + 1,
+            "every refused frame must be charged too"
+        );
+        // The frames really were refused for the *auth* reason while budget
+        // remained, not silently dropped by the budget.
+        let answered = rx.try_recv().expect("a refused frame must be answered");
+        assert!(
+            answered.contains("not_authenticated"),
+            "the first refusal must carry a reason the peer can read, got {answered}"
+        );
+    }
+
+    /// REGRESSION: ten seconds of screen mirroring fits one transport window.
+    ///
+    /// 30 fps × 2 messages is the documented ~60/s (15–30 frames/s measured), so
+    /// a ten-second window holds ~600 frames. They go in back to back with no
+    /// delay at all, which is strictly harder than the real stream: this asks
+    /// only whether the *transport* budget ends it. (Whether the per-type
+    /// budget would admit 600 inside a single millisecond is a different
+    /// question, answered by `security`'s own 120/s streaming tests.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ten_seconds_of_screen_mirroring_survives_the_transport_budget() {
+        let ctx = create_test_ctx(); // the production RateLimitConfig::default()
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+
+        let frames = 60 * security::RateLimitConfig::default().window.as_secs();
+        for i in 0..frames {
+            assert!(
+                WsServer::admit_frame(
+                    &ctx,
+                    "ws_phone",
+                    text_frame(serde_json::json!({
+                        "type": "screen_mirror", "action": "frame",
+                        "data": "AAAA", "seq": i
+                    }))
+                )
+                .await,
+                "mirror frame {} of a ~60/s ten-second stream must not be \
+                 dropped by the transport budget",
+                i + 1
+            );
+        }
+    }
+
+    /// REGRESSION, and the same question for the third stream: a phone→desktop
+    /// push is 64 KiB chunks at ~47/s, which the *byte* budget was explicitly
+    /// sized to admit (~3 MB/s). The count budget has to admit it too, or the
+    /// transfer stalls on a ceiling nobody was looking at.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_realistic_file_chunk_stream_survives_the_transport_budget() {
+        let ctx = create_test_ctx();
+        let tx = add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let mut rx = tx.subscribe();
+
+        // 64 KiB of payload, base64-encoded as the protocol carries it.
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 64 * 1024]);
+        let chunks = 47 * security::RateLimitConfig::default().window.as_secs();
+        for i in 0..chunks {
+            assert!(
+                WsServer::admit_frame(
+                    &ctx,
+                    "ws_phone",
+                    text_frame(serde_json::json!({
+                        "type": "file", "action": "chunk", "id": "t1",
+                        "index": i, "data": payload
+                    }))
+                )
+                .await,
+                "chunk {i} of a 64 KiB push must not be dropped by the \
+                 transport budget"
+            );
+        }
+
+        // End to end: a push this size must never be told to slow down.
+        let mut throttled = false;
+        while let Ok(frame) = rx.try_recv() {
+            throttled |= frame.contains("rate_limited");
+        }
+        assert!(
+            !throttled,
+            "a realistic file push must not be refused by any limiter, including \
+             the per-type one"
+        );
+    }
+
+    /// Binary frames are charged once, like text frames — and, unlike text
+    /// frames, they are charged **no** per-type budget.
+    ///
+    /// A binary frame has no `type` field until `handlers::files` decodes it as
+    /// a chunk envelope, which is after the dispatcher's per-type check, so
+    /// there is nothing to key a bucket on and `check_type_action_limit` is
+    /// never called for one. That is a real gap — the transport budget is the
+    /// only thing bounding a binary flood — and it is *reported* rather than
+    /// closed here, because the per-type `file` budget (3 000 / 60 s ≈ 50/s) sits
+    /// right on top of the documented chunk rate and applying it to this path is
+    /// a DoS-policy decision, not a lookup. Both halves are pinned here so the
+    /// "once" cannot regress silently and the gap stays visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_frames_are_charged_once_and_never_per_type_limited() {
+        let budget = 6;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+
+        // A short payload: too small to be a chunk envelope, so the handler
+        // logs and returns without touching the disk.
+        for i in 0..budget {
+            assert!(
+                WsServer::admit_frame(&ctx, "ws_phone", Message::Binary(vec![0u8; 4].into())).await,
+                "binary frame {} of a {budget}-frame budget must be admitted",
+                i + 1
+            );
+        }
+        assert!(
+            !WsServer::admit_frame(&ctx, "ws_phone", Message::Binary(vec![0u8; 4].into())).await,
+            "and the frame past the budget must be refused"
+        );
+        assert_eq!(
+            ctx.rate_limiter.window_messages("ws_phone").await,
+            budget + 1,
+            "a binary frame costs one count, like a text frame"
+        );
+
+        // Spend the whole per-type `file` budget, then show a binary frame is
+        // unaffected by it: it never reaches the per-type limiter at all.
+        let mut spent = 0;
+        while ctx
+            .per_type_limiter
+            .check_type_limit("ws_phone", "file")
+            .await
+        {
+            spent += 1;
+            assert!(
+                spent <= 10_000,
+                "the per-type file budget must stay bounded"
+            );
+        }
+        assert!(
+            WsServer::admit_frame(&ctx, "ws_other", Message::Binary(vec![0u8; 4].into())).await,
+            "a binary frame must not draw on the per-type `file` budget: it \
+             never reaches `dispatch` ({spent} text chunks went to that bucket)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    //  Answering a sender that is not a connection id
+    //
+    //  `ctx.clients` is keyed by connection id. A relayed sender's `client_id`
+    //  is the device id the relay authenticated, so every refusal addressed to
+    //  it missed the map and vanished.
+    // -----------------------------------------------------------------
+
+    /// REGRESSION: a throttled relayed sender is told, not just dropped.
+    ///
+    /// Dispatched under its **device** id, exactly as `handle_message` does
+    /// after unwrapping a `relay_delivery`. `pairing` is the cheapest budget to
+    /// exhaust (5/min) and it is exempt from the auth gate, so this drives the
+    /// real `rate_limited` arm without needing a stream to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_dispatched_sender_is_told_when_it_is_rate_limited() {
+        let ctx = create_test_ctx();
+        // The device's socket is registered under its connection id, as
+        // `accept_loop` does; the id it is *dispatched* under is the device id.
+        let tx = add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let mut rx = tx.subscribe();
+
+        let attempt = r#"{"type":"pairing","action":"request","token":"NOT-A-REAL-TOKEN"}"#;
+        for _ in 0..5 {
+            WsServer::handle_message(attempt, "dev_phone", &ctx).await;
+        }
+        WsServer::handle_message(attempt, "dev_phone", &ctx).await;
+
+        let answered = rx
+            .try_recv()
+            .expect("a sender throttled under its device id must be answered");
+        assert!(
+            answered.contains("rate_limited"),
+            "expected a rate_limited error for the device-id sender, got {answered}"
+        );
+    }
+
+    /// The half of that defect that is not a lookup, pinned so it cannot be
+    /// mistaken for fixed: a phone that is *only* reachable through the relay
+    /// has no socket here, so there is genuinely nowhere to send a refusal.
+    /// Reaching it needs the relay to route an `error` frame back to the device
+    /// it came from — a protocol and relay-side decision, not a map lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_sender_has_no_socket_to_be_answered_on() {
+        let ctx = create_test_ctx();
+        // Paired, but not connected: the state of every phone behind the relay.
+        ctx.sync_engine.write().await.add_client(ConnectedClient {
+            device_id: "dev_phone".to_string(),
+            device_name: "Phone".to_string(),
+            device_type: "phone".to_string(),
+            shared_secret: "22".repeat(32),
+            last_heartbeat: 0,
+            battery_level: None,
+        });
+        assert!(
+            answer_channel(&ctx, "dev_phone").await.is_none(),
+            "a device with no socket on this desktop cannot be answered; the \
+             relay is the only route to it"
+        );
+        assert!(
+            answer_channel(&ctx, "ws_nobody").await.is_none(),
+            "an unknown connection id has no channel either"
+        );
     }
 }

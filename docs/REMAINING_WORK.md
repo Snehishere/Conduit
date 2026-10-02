@@ -650,27 +650,41 @@ where the drift actually is. The items below are that drift.
   `automation.rs` instead, but the integration-level assertion is worth adding
   where the path is actually exercised.
 
-- [ ] **W3.11 (HIGH, new — found while fixing W3.1)** The per-type rate limit
-  caps screen mirroring at **1 fps**, and shares its bucket with `stop`.
-  `security.rs:156` sets `"screen_mirror" => TypeLimitConfig::new(60, 60)`, i.e.
-  60 messages per 60 seconds, under a comment reading
-  `// Screen mirror frames: ~30 fps × 2 msgs each` — a limit three orders of
-  magnitude away from the one the comment describes. `audio` has the same
-  numbers.
+- [x] **W3.24 (RESOLVED — HIGH, found by the cross-platform audit)** The per-type
+  rate limit capped screen mirroring at **1 fps** and shared its bucket with
+  `stop`. `security.rs` set `"screen_mirror" => TypeLimitConfig::new(60, 60)`, i.e.
+  60 messages per **60 seconds**, under a comment reading
+  `// Screen mirror frames: ~30 fps × 2 msgs each` — three orders of magnitude
+  away from the budget the comment describes. `audio` had the same numbers.
 
-  `check_type_limit` is inbound-only, so this throttles exactly the phone→hub
-  direction that W2.1's repair depends on: fixing delivery and then leaving this
-  in place produces a stream that renders at one frame a second.
+  The defect was the **window**, not the count, which is why "raise the number"
+  would not have worked: a 60-second window admits a one-second burst and then
+  refuses for 59 seconds. Streaming types now have per-second budgets sized to
+  their documented rate (`screen_mirror` 120/1 s, `audio` 100/1 s), and `file`
+  was raised to 3000/60 s against the 256 MiB/10 s byte budget it shares.
 
-  Worse, frames and `screen_mirror/stop` share the bucket. Once a stream fills
-  it, the user's `stop` is dropped too and capture continues with no way to halt
-  it from the desktop — the global limiter
-  (`security.rs` `RateLimitConfig::default`, 100 msgs / 10 s) is a second cap on
-  top.
+  **Control actions are separated into their own bounded bucket** — start, stop,
+  cancel, complete, capture_stopped and the pairing handshake steps. They were
+  sharing the frame budget, so the message that *stops* a stream was starved by
+  the stream itself, and capture could continue with no way to halt it from the
+  desktop. `pairing/request` is deliberately **not** exempt: it is the
+  brute-force vector, while `accept`/`local_auth` are authenticated by something
+  the sender must already hold.
 
-  **Do not fix this by relaxing the number.** The fix is a correctly-sized
-  per-type budget plus a control/action exemption, so a burst of frames can never
-  starve the message that stops them.
+  A second, separate ceiling sat on top and was also fixed: the **global**
+  limiter was charged twice per inbound text frame — by the reader and again by
+  the dispatcher, against the same bucket — giving a real ceiling of ~5 msg/s on
+  all types combined. The reader's charge is the one that survives, because it
+  happens before the parse: every frame costs one count whatever becomes of it,
+  so an unauthenticated peer cannot get free parse attempts. The transport
+  budget is now sized to exceed the sum of the per-type ceilings over the same
+  window, or the per-type budgets would be dead code for exactly the types they
+  were sized for.
+
+  Tests assert the window, the sustained throughput, and that a stream cannot
+  starve the action that stops it. `test_type_limit_config_values` previously
+  pinned `max_messages` and never asserted `.window`, which is how the drift
+  survived.
 
 - [ ] **W3.2 (HIGH)** `handlers/audio.rs` leaks live system-audio PCM to
   unpaired LAN sockets. Three sites iterate `ctx.clients` directly —
@@ -856,14 +870,43 @@ where the drift actually is. The items below are that drift.
   *Left to do:* add `get_automation_rules` and `get_automation_logs`, hydrate on
   mount, and broadcast `triggered` to clients.
 
-- [ ] **W4.3 (HIGH)** The Files surface shows a stale clipboard list.
-  Live `clipboard/sync` frames land in `useClipboard.history`
-  (`hooks/useClipboard.ts:82`), which `App.tsx:154-158` never destructures;
-  `refreshClipboard` (`hooks/useClipboardState.ts:59`) is never called by
-  `App.tsx:152` and is not routed from the message handler. Neither the new item
-  nor the peer device name ever appears.
-  *Left to do:* on `clipboard/sync`, call `refreshClipboard()` and resolve
-  `source_device` to a device name.
+- [x] **W4.3 (RESOLVED)** The Files surface showed a stale clipboard list — in
+  fact an empty one, permanently. **The stated cause was a symptom.** The real
+  one is upstream: `clipboard_history` was **never written at all**.
+  `save_clipboard` had exactly one production caller, `sync_clipboard`, and that
+  command had no caller. The `("clipboard","sync")` arm only broadcast; nothing
+  persisted. So `get_clipboard_history` always returned `[]`, the clear button
+  could never render (it requires a non-empty list), and the dock badge was
+  permanently 0.
+
+  An inbound sync now persists an entry for the sending device before fanning
+  out. Two details that are load-bearing:
+
+  - `source_device` records the **connection's registered identity**, not the
+    frame's own `source_device` field. A payload field is forgeable; a socket
+    identity was written by the hub at pairing time from a one-time token. Same
+    rule as `resolve_sender_secret`.
+  - `pinned` is left at the column default, so a remote peer cannot pin a row
+    that then survives `clear_clipboard_history`.
+
+  A wildly-future timestamp falls back to arrival time, because `save_clipboard`
+  prunes by `ORDER BY timestamp DESC` and an unbounded future stamp is a
+  retention attack. Persist happens before broadcast and outside the client-map
+  locks: the local row is the non-recoverable effect, so if we crash after
+  broadcasting, nothing re-sends that copy.
+
+  The UI half was a second, independent bug: `App.tsx:157` wired `onSynced` to
+  `refreshDevices()` — the *device* refresh. It now calls `refreshClipboard`.
+
+  `useClipboard.ts`'s in-memory `history` array remains dead state with zero
+  readers. Deliberately not wired up: `clipboardItems` now comes from the
+  database, which is pinned, ordered, prunable and has ids. A second
+  50-entry array with no ids and no persistence would be a competing source of
+  truth for the same data.
+
+  See also [CROSS-PLATFORM-GAPS.md](CROSS-PLATFORM-GAPS.md) D-F4, and note that
+  inbound clipboard content is still capped at 10 KB by `MAX_STRING_FIELD_LEN`
+  while the outbound command allows 5 MB — pre-existing and untouched.
 
 - [ ] **W4.4 (HIGH)** Notification read state is lost and never persisted.
   `mark_read` writes only to localStorage; the database has **no `read` column**
@@ -1727,16 +1770,24 @@ is W6.1, and bounded logging is part of W6.23.
   - The mobile pin is a single global field shared between the LAN hub and the
     relay, so a pin captured from one is compared against the other.
 
-- [ ] **W7.3 (MEDIUM)` The relay forwards a v2 payload that the desktop parses as
-  a 28-byte LAN chunk frame. **The first half is fixed** — the relay now re-frames
-  a binary delivery instead of stripping the v2 header, and the desktop unwraps a
-  v2 frame at `handle_binary_message` before the LAN chunk parser sees it, so the
-  two formats are no longer confused.
-  **The rest stands:** encrypted binary chunks have no AAD on either side, so
-  the 28-byte header is unauthenticated — an on-path peer can rewrite `index` or
-  `id` and still pass Poly1305. The desktop defends structurally
-  (`file_transfer.rs`) but the metadata itself is unsigned.
-  *Left to do:* set AAD to the metadata block on both sides.
+- [ ] **W7.3 (RESOLVED — was unreachable)** The relay forwards a v2 payload that
+  the desktop parses as a 28-byte LAN chunk frame. **Fixed, but it took three
+  passes to become actually reachable**, and the audit entry recorded only the
+  first:
+  - The relay re-frames a binary delivery instead of stripping the v2 header,
+    and the desktop unwraps the v2 frame before the LAN chunk parser sees it, so
+    the two formats are no longer confused.
+  - But the **16-byte target field is smaller than every device id the protocol
+    produces** (all 36-char UUIDs), and both the relay's exact lookup and the
+    desktop's string comparison refused every frame. The path was dead in both
+    directions, and the existing tests missed it because they all used short ids
+    like `device-1`. The field is now *defined* as the id's first 16 bytes in one
+    place, the relay resolves a prefix and **fails closed on zero matches and on
+    ambiguity** — a misdelivery would hand one device another's file.
+  - And the phone never built a frame at all, because the target device id was
+    never set. See [CROSS-PLATFORM-GAPS.md](CROSS-PLATFORM-GAPS.md) B-F3/G-R3.
+
+  **The residual is W7.11**, not this entry: the AAD gap.
 
 - [ ] **W7.4 (MEDIUM)` Unbounded audio queue fed by a remote peer
   (`audio.rs:38` `unbounded_channel`, pushed at `handlers/audio.rs:150` with
@@ -1763,7 +1814,7 @@ is W6.1, and bounded logging is part of W6.23.
   sender against its own registry and the `relay_server` id is never itself a
   trusted peer. Both facts are asserted by tests.
 
-- [ ] **W7.3 (MEDIUM)` Encrypted binary chunks have no AAD on either side, so
+- [ ] **W7.11 (MEDIUM)` Encrypted binary chunks have no AAD on either side, so
   the 28-byte LAN chunk header is unauthenticated — an on-path peer can rewrite
   `index` or `id` and still pass Poly1305. The desktop defends structurally
   (`file_transfer.rs`) but the metadata itself is unsigned.
@@ -1969,9 +2020,9 @@ standalone service into a library hosted by the desktop app.
 
 | Suite | Working directory | Command | Measured |
 |---|---|---|---|
-| Relay | repo root | `cargo test -p conduit-relay` | **235** passed, 1 ignored + 2 doctests |
-| Protocol | repo root | `cargo test -p conduit-protocol` | **270** passed + 1 doctest |
-| Desktop Rust | repo root | `cargo test -p conduit` | **748** passed |
+| Relay | repo root | `cargo test -p conduit-relay` | **247** passed, 1 ignored + 2 doctests |
+| Protocol | repo root | `cargo test -p conduit-protocol` | **281** passed + 1 doctest |
+| Desktop Rust | repo root | `cargo test -p conduit` | **799** passed |
 | Clippy | repo root | `cargo clippy --workspace --all-targets` | exit 0, zero warnings |
 | Rust format | repo root | `cargo fmt --all -- --check` | exit 0 |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
@@ -1979,8 +2030,8 @@ standalone service into a library hosted by the desktop app.
 | Desktop e2e | `apps/desktop` | `npm run test:e2e` | **31/31 fail** — no `playwright install` bootstrap (W5.13) |
 | Desktop codegen | `apps/desktop` | `npm run generate` | exit 0, clean tree |
 | npm audit | `apps/desktop` | `npm audit` | 0 vulnerabilities |
-| Mobile unit | `apps/mobile` | `flutter test` | **150** passed |
-| Mobile analyze | `apps/mobile` | `flutter analyze` | **367** infos, 0 errors, 0 warnings — 365 of them in the *generated* `lib/models/protocol.dart` |
+| Mobile unit | `apps/mobile` | `flutter test` | **190** passed |
+| Mobile analyze | `apps/mobile` | `flutter analyze` | **366** infos, 0 errors, 0 warnings — 365 of them in the *generated* `lib/models/protocol.dart` |
 | Lockfile | repo root | — | see W5.6 |
 
 ## Notes

@@ -150,7 +150,12 @@ class ScreenMirrorService(
                 croppedBitmap.recycle()
 
                 // Send frame to Flutter via EventChannel (Flutter relays to WS).
-                // Flutter must subscribe with EventChannel('com.conduit.mobile/events'), arg 'screen_mirror'.
+                // Flutter subscribes to this stream's own channel name,
+                // 'com.conduit.mobile/screen_mirror_events', with no argument.
+                // A FlutterEventChannel delivers every event to one sink per name,
+                // so sharing 'com.conduit.mobile/events' with notifications and
+                // calls meant whichever subscriber registered last silently replaced
+                // the others. See NativeScreenCapture.attachTo.
                 val frame = JSONObject()
                 frame.put("type", "screen_mirror")
                 frame.put("action", "frame")

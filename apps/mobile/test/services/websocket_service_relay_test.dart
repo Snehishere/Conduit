@@ -290,14 +290,12 @@ class _FakePeer {
   Future<void> stop() => _server.close(force: true);
 }
 
-/// A relayed file chunk, as the relay delivers one: a v2 frame carrying the
-/// hub's own chunk envelope.
-Future<Uint8List> relayedChunk({
-  required int sequence,
-  String targetId = phoneId,
-  String fromId = hubId,
-  String transferId = 'transfer-1',
-}) async {
+/// The hub's chunk envelope on its own: a 24-byte nonce, a 4-byte
+/// little-endian metadata length, the JSON metadata, then the ciphertext.
+///
+/// Split out from [relayedChunk] because the LAN path carries exactly these
+/// bytes with no v2 wrapper at all, and the two must stay distinguishable.
+Future<Uint8List> chunkEnvelope({String transferId = 'transfer-1'}) async {
   final metadata = utf8.encode(
     jsonEncode({'id': transferId, 'index': 0, 'total': 1}),
   );
@@ -306,17 +304,28 @@ Future<Uint8List> relayedChunk({
     EncryptionService.hexToBytes(vectorSecret),
     utf8.encode('chunk-bytes'),
   );
-  final payload = BytesBuilder()
-    ..add(nonce)
-    ..add(length.buffer.asUint8List())
-    ..add(metadata)
-    ..add(ciphertext);
+  return (BytesBuilder()
+        ..add(nonce)
+        ..add(length.buffer.asUint8List())
+        ..add(metadata)
+        ..add(ciphertext))
+      .toBytes();
+}
+
+/// A relayed file chunk, as the relay delivers one: a v2 frame carrying the
+/// hub's own chunk envelope.
+Future<Uint8List> relayedChunk({
+  required int sequence,
+  String targetId = phoneId,
+  String fromId = hubId,
+  String transferId = 'transfer-1',
+}) async {
   return buildBinaryFrame(
     routeKey: deriveRouteKey(EncryptionService.hexToBytes(vectorSecret), fromId),
     fromDeviceId: fromId,
     targetDeviceId: targetId,
     sequence: Uint32List.fromList([sequence]),
-    payload: payload.toBytes(),
+    payload: await chunkEnvelope(transferId: transferId),
   );
 }
 
@@ -332,6 +341,7 @@ void main() {
   /// handler seeing the accept is proof the ids are in place — the only order
   /// the production path produces them in.
   Future<void> acceptPairing({
+    String? deviceId = phoneId,
     String? hubDeviceId = hubId,
     Map<String, dynamic> extra = const {},
   }) async {
@@ -341,7 +351,11 @@ void main() {
         accepted.complete();
       }
     });
-    await peer.acceptPairing(hubDeviceId: hubDeviceId, extra: extra);
+    await peer.acceptPairing(
+      deviceId: deviceId ?? phoneId,
+      hubDeviceId: hubDeviceId,
+      extra: extra,
+    );
     await accepted.future;
   }
 
@@ -677,6 +691,162 @@ void main() {
       // Otherwise the socket just closes and the app reconnects every three
       // seconds forever with nothing ever said about why.
       expect(service.lastError, contains('invalid_token'));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  //  Who a relayed binary frame is addressed to.
+  //
+  //  The receiver compared the frame's *parsed* target — 16 bytes with the NUL
+  //  padding stripped — against this device's own full 36-character id. Those
+  //  are never equal, so every frame the relay had correctly resolved to this
+  //  phone was dropped on arrival, and a relayed file transfer could never
+  //  complete. The rule is `PROTOCOL.md` §5.1.4/§5.1.5 and the Rust reference
+  //  is `conduit_protocol::binary_target_matches`: compare the 16 wire bytes
+  //  against this device's own canonical field, padding included.
+  //
+  //  Every frame here is correctly tagged under the hub's route key, so the
+  //  identity check is the only thing that can drop a rejected one.
+  // -------------------------------------------------------------------------
+  group('which relayed frames this phone accepts', () {
+    /// The id a real device has: a 36-character UUID, which never fits in the
+    /// 16-byte field. This is the case that could not arrive at all before.
+    const uuid = '550e8400-e29b-41d4-a716-446655440000';
+
+    /// Another UUID, sharing no leading bytes with [uuid].
+    const otherUuid = 'cafebabe-dead-beef-cafe-babe-cafebabe';
+
+    late List<Map<String, dynamic>> delivered;
+
+    setUp(() {
+      delivered = [];
+      service.registerHandler('file', (message) {
+        if (message['action'] == 'chunk_binary') delivered.add(message);
+      });
+    });
+
+    /// Re-pair under [deviceId], then switch onto the relay.
+    Future<void> phoneAs(String deviceId) async {
+      await acceptPairing(deviceId: deviceId);
+      await openRelay();
+    }
+
+    test('accepts a frame addressed to this device by its own 36-character id',
+        () async {
+      await phoneAs(uuid);
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: uuid));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(
+        delivered.length,
+        1,
+        reason: 'the field carries this id\'s 16-byte prefix and that is the '
+            'whole field; comparing the prefix against the full id refused it',
+      );
+      expect(delivered.single['data'], utf8.encode('chunk-bytes'));
+    });
+
+    test('rejects a frame addressed to another device', () async {
+      await phoneAs(uuid);
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: otherUuid));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(
+        delivered.length,
+        0,
+        reason: 'the relay routes to one recipient, so this means the routing '
+            'table and the wire disagree',
+      );
+    });
+
+    test('accepts a short-id device on its own whole field', () async {
+      // §4.1 allows the short spellings, and an id of 16 bytes or fewer is
+      // carried whole — so the field really is the entire id, NUL-padded.
+      await phoneAs('b145d');
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: 'b145d'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(delivered.length, 1);
+    });
+
+    test('does not let `device-1` match `device-10`', () async {
+      // Both are carried whole, so the NUL padding is the only thing telling
+      // them apart — which is why it is compared rather than stripped.
+      await phoneAs('device-1');
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: 'device-10'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(
+        delivered.length,
+        0,
+        reason: "'device-10' must not be delivered to 'device-1'",
+      );
+
+      await peer.send(await relayedChunk(sequence: 2, targetId: 'device-1'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      expect(delivered.length, 1, reason: "a device's own field is its own");
+    });
+
+    test('does not let `device-10` match `device-1`', () async {
+      await phoneAs('device-10');
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: 'device-1'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(
+        delivered.length,
+        0,
+        reason: "'device-1' must not be delivered to 'device-10'",
+      );
+    });
+
+    test('does not let a padded short id match a longer id sharing its start',
+        () async {
+      // `b145d` is a whole id in a padded field; this phone's id is longer and
+      // begins with those same characters. The field is not this device's
+      // canonical field, so it is refused — a substring test would take it.
+      await phoneAs('b145d-longer-device');
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: 'b145d'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(delivered.length, 0);
+    });
+
+    test('rejects a field that is only a strict prefix of ours', () async {
+      // `550e8400` is a valid, correctly-tagged frame — addressed to the device
+      // whose id is exactly those eight characters — and those eight characters
+      // are the start of this phone's 36-character id. The phone must compare
+      // the whole 16-byte field, not a prefix of it, so this is not us.
+      await phoneAs(uuid);
+
+      await peer.send(await relayedChunk(sequence: 1, targetId: '550e8400'));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(delivered.length, 0);
+    });
+
+    test('accepts a bare hub envelope on a LAN connection, with no id check',
+        () async {
+      // The LAN path never parses a v2 frame: the hub's own envelope arrives
+      // bare, and its first 16 bytes are a random nonce that matches no device
+      // id whatsoever. If the identity check ever reached this path, every LAN
+      // file transfer would break.
+      await acceptPairing(deviceId: uuid);
+      final envelope = await chunkEnvelope();
+      expect(
+        binaryTargetMatches(uuid, envelope.sublist(0, binaryDeviceIdLen)),
+        isFalse,
+        reason: 'the LAN envelope opens with a nonce, not an id field',
+      );
+
+      await peer.send(envelope);
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+
+      expect(delivered.length, 1, reason: 'delivered over LAN, unwrapped');
     });
   });
 }

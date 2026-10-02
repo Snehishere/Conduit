@@ -368,6 +368,18 @@
         "hub_device_id": {
           "type": "string",
           "description": "The desktop's own device_id. A relayed v2 frame is verified under the sender's route key, and the sender's id is bound into that key's derivation, so a peer that does not know this cannot verify a relayed frame and must drop it. Absent when the sender predates it."
+        },
+        "relay_url": {
+          "type": "string",
+          "description": "A phone-facing address for the relay the desktop hosts, e.g. wss://192.168.1.50:9529. Always wss and never loopback: the plaintext listener is bound to 127.0.0.1 and carries the bearer token in clear. Absent when the desktop has no relay enabled, has not started it, or cannot determine a LAN address - absence is normal and must not be treated as an error."
+        },
+        "relay_token": {
+          "type": "string",
+          "description": "The relay's shared bearer credential. Presented once, in relay_auth, to open a connection; routing a frame additionally requires the sender's own route key, so holding this does not let a peer route as anyone else. Absent with relay_url."
+        },
+        "relay_cert_pin": {
+          "type": "string",
+          "description": "SPKI pin of the relay's OWN certificate, which is not the hub's - the relay generates its own TLS material. Must be kept in a separate slot from the hub's pin: a relay pin is never valid for the hub and vice versa. Absent with relay_url."
         }
       }
     },

@@ -335,14 +335,17 @@ void main() async {
     }
   });
 
-  // Subscribe to native capture frames for the whole app lifetime. Both
-  // natives push frames on the shared `com.conduit.mobile/events` channel with
-  // argument `screen_mirror`, and until something subscribes to that argument
-  // they are produced and dropped: the phone starts capturing and the desktop's
-  // canvas never fills. Registering here rather than inside the mirror screen
-  // is deliberate - the relay must outlive any one screen, because the desktop
-  // may ask for a stream while the user is elsewhere in the app. The handler is
-  // idempotent, so a second attach is harmless.
+  // Subscribe to native capture frames for the whole app lifetime. Both natives
+  // push frames on `com.conduit.mobile/screen_mirror_events`, which this stream
+  // now owns outright — an `EventChannel` delivers every event to a single sink
+  // per channel *name*, so the `com.conduit.mobile/events` channel this used to
+  // share with notifications and calls had each of its three subscribers
+  // silently cancel the other two. Nothing read this one at all, so the phone
+  // started capturing and every frame the native side produced was discarded:
+  // the desktop's canvas never fills. Registering here rather than inside the
+  // mirror screen is deliberate - the relay must outlive any one screen,
+  // because the desktop may ask for a stream while the user is elsewhere in the
+  // app. The handler is idempotent, so a second attach is harmless.
   NativeScreenCapture.attachTo(websocketService);
 
   // The desktop sends touch, key and scroll events for this phone to apply.

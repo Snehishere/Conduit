@@ -272,7 +272,14 @@ impl RelayHost {
     ///
     /// Idempotent, and safe to call from an app-exit path that may race a
     /// settings change that already stopped it.
+    ///
+    /// This is also the single place the "nothing is advertised" invariant is
+    /// established, unconditionally rather than on the branch where a handle
+    /// was found: every failure path in [`Self::start`] runs through here
+    /// first, so a relay that is not running can never leave an advertisement
+    /// behind for a peer to be told about a URL nothing is listening on.
     pub async fn stop(&self) {
+        withdraw_advertisement();
         if let Some(task) = self.key_refresh_task.lock().await.take() {
             task.abort();
         }
@@ -342,6 +349,21 @@ impl RelayHost {
                     status.wss_port.unwrap_or(0),
                     DEFAULT_RELAY_HEALTH_PORT
                 );
+                let lan_ip = lan_address();
+                match advertise_running_relay(&status, settings, &token, lan_ip.as_deref()) {
+                    Some(advertised) => info!(
+                        "Relay advertised to newly paired peers at {}",
+                        advertised.url
+                    ),
+                    // The relay is up, so this is only "we cannot describe where
+                    // it is": no LAN address, or the operator pinned a hostname
+                    // that is not one this machine answers to. Paired peers keep
+                    // whatever relay configuration they already had.
+                    None => warn!(
+                        "Relay is running but no phone-facing address could be built; \
+                         newly paired peers will not be told about it"
+                    ),
+                }
                 *self.status.write().await = Some(status);
                 *self.last_error.write().await = None;
                 *self.handle.lock().await = Some(handle);
@@ -379,6 +401,145 @@ impl RelayHost {
         });
         *self.key_refresh_task.lock().await = Some(task);
     }
+}
+
+/// What a freshly paired peer is told about the relay this desktop hosts.
+///
+/// The desktop is the only party that knows all three: it listens on the
+/// socket, it generated the bearer token (the peer cannot derive it, and it is
+/// in the OS keyring), and it is holding the relay's own certificate. A phone
+/// on a different network has no way to learn any of them otherwise, which is
+/// why `pairing/accept` carries them — see
+/// [`conduit_protocol::types::PairingAccept`].
+///
+/// Nothing here is published unless the relay actually came up: see
+/// [`advertise_running_relay`].
+#[derive(Clone)]
+pub(crate) struct RelayAdvertisement {
+    /// A `wss://` URL a peer on another network can dial — never
+    /// [`local_relay_url`], which only means anything on this machine.
+    pub(crate) url: String,
+    /// The bearer token every relay client presents during `relay_auth`.
+    pub(crate) token: String,
+    /// SPKI pin of the certificate **the relay** serves.
+    ///
+    /// The relay generates its own TLS material, so this is not the hub's pin
+    /// and is not `settings.relay_cert_pin` either — that one is a pin this
+    /// machine *enforces* on a relay it dials, a different role that is empty
+    /// in the normal hosting case. A peer keeps a separate pin slot per peer,
+    /// so the two cannot be confused at the far end.
+    pub(crate) cert_pin: Option<String>,
+}
+
+impl std::fmt::Debug for RelayAdvertisement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Hand-written for the same reason `Config`'s is: this value reaches
+        // `{:?}` through assert messages and log lines, and the token must not
+        // travel with it.
+        f.debug_struct("RelayAdvertisement")
+            .field("url", &self.url)
+            .field(
+                "token",
+                &format_args!("[REDACTED {} chars]", self.token.len()),
+            )
+            .field("cert_pin", &self.cert_pin)
+            .finish()
+    }
+}
+
+/// The relay this process is currently hosting, or `None` when it is not up.
+///
+/// A process-global rather than a field on [`RelayHost`]: there is exactly one
+/// relay per process — `AppState` owns the only [`RelayHost`] — and the reader
+/// is a pairing handler, which reaches the websocket server and nothing else.
+/// The alternative was a field threaded through `WsContext`, i.e. through
+/// `server/`, for a value with exactly one writer and one reader.
+///
+/// The invariant is one-directional and absolute: **no relay running implies
+/// nothing advertised.** It is established in [`RelayHost::stop`] and in the one
+/// success path of [`RelayHost::start`], nowhere else.
+static ADVERTISED_RELAY: std::sync::RwLock<Option<RelayAdvertisement>> =
+    std::sync::RwLock::new(None);
+
+/// Publish the running relay's address, token and pin for `pairing/accept`.
+///
+/// Returns `None` — and publishes nothing — unless the relay is serving TLS on
+/// a port, *and* a host a peer could actually dial exists. Both halves matter:
+/// `status.wss_port` and `status.tls_pin` are `Some` only when the TLS context
+/// initialised, and the `start()` that produced this status either bound the
+/// WSS listener or returned an error, so reaching here means the port in the
+/// URL is the port something is listening on.
+///
+/// `lan_ip` is passed in rather than discovered here so the whole decision is a
+/// function of its arguments and can be asserted on a machine with no network.
+fn advertise_running_relay(
+    status: &Status,
+    settings: &crate::commands::settings::ConduitSettings,
+    token: &str,
+    lan_ip: Option<&str>,
+) -> Option<RelayAdvertisement> {
+    let url = phone_relay_url(&settings.relay_hostname, status.wss_port?, lan_ip)?;
+
+    let advertisement = RelayAdvertisement {
+        url,
+        token: token.to_string(),
+        cert_pin: status.tls_pin.clone(),
+    };
+    let mut slot = match ADVERTISED_RELAY.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => {
+            // Neither writer can panic while holding this, so a poison is not
+            // evidence of anything about the value — and failing closed here
+            // would mean a running relay silently stops being advertised.
+            warn!("Relay advertisement lock was poisoned; recovering");
+            poisoned.into_inner()
+        }
+    };
+    *slot = Some(advertisement.clone());
+    Some(advertisement)
+}
+
+/// Forget the running relay, so nothing claims one exists.
+fn withdraw_advertisement() {
+    let mut slot = match ADVERTISED_RELAY.write() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *slot = None;
+}
+
+/// The relay a `pairing/accept` should describe, or `None` when there is none.
+pub(crate) fn advertised_relay() -> Option<RelayAdvertisement> {
+    match ADVERTISED_RELAY.read() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Serialises the tests that publish or withdraw the advertisement.
+///
+/// The advertisement is process-global, so two tests touching it concurrently
+/// would read each other's value. A tokio lock rather than a `std` one because
+/// the pairing tests hold it across `.await`.
+#[cfg(test)]
+pub(crate) fn advertisement_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    &LOCK
+}
+
+/// Publish `advertisement` as the relay this process hosts. Test-only: in
+/// production the only writer is [`advertise_running_relay`], reached from
+/// [`RelayHost::start`].
+#[cfg(test)]
+pub(crate) fn publish_advertisement_for_tests(advertisement: RelayAdvertisement) {
+    *ADVERTISED_RELAY.write().unwrap_or_else(|p| p.into_inner()) = Some(advertisement);
+}
+
+/// Withdraw the advertisement again. Test-only; production uses
+/// [`withdraw_advertisement`], which is the same thing.
+#[cfg(test)]
+pub(crate) fn withdraw_advertisement_for_tests() {
+    withdraw_advertisement();
 }
 
 /// What the status UI needs to know about the relay.
@@ -476,7 +637,17 @@ fn build_config(
         // the process working directory — which for a packaged app is a path
         // the OS chose and that is frequently not writable at all.
         hmac_secret_file: Some(app_data_dir().join("relay-hmac-secret")),
-        tls_hostname: Some(settings.relay_hostname.clone()),
+        // `Some(…)` while the operator has set a hostname, so the app's own
+        // setting still wins over `RELAY_TLS_HOSTNAME`; filtered to `None` when
+        // it is empty, which the setting documents as "localhost".
+        //
+        // Filtering here rather than letting the empty string through is the
+        // fix: `Config::resolve` does not filter it, and `subject_alt_names()`
+        // puts the configured name at the head of the list unconditionally, so
+        // the empty default produced a certificate valid for `["", "127.0.0.1",
+        // "::1"]` — a zero-length `dNSName` and no `localhost`. `config.rs` now
+        // fails safe as well; this keeps the empty string off the wire.
+        tls_hostname: Some(settings.relay_hostname.clone()).filter(|h| !h.trim().is_empty()),
         // Empty by default, which enforces nothing: this app hosts the relay,
         // so it is not authenticating a remote server and has no pin to check.
         // Set it to pin a certificate the operator is standing behind, and a
@@ -499,6 +670,80 @@ fn local_relay_port() -> u16 {
 /// The URL the desktop uses to reach its own relay.
 pub fn local_relay_url() -> String {
     format!("ws://127.0.0.1:{}", local_relay_port())
+}
+
+/// This machine's LAN IPv4 address, or `None` when it has none.
+///
+/// The same discovery the pairing QR code uses
+/// ([`crate::commands::get_local_ip`]), deliberately: that function already
+/// skips loopback and virtual adapters and refuses to answer with a
+/// placeholder, and two answers to "what is this machine called on the network"
+/// would eventually disagree.
+fn lan_address() -> Option<String> {
+    match crate::commands::get_local_ip() {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            debug!("No LAN address for the relay advertisement: {e}");
+            None
+        }
+    }
+}
+
+/// The relay URL a phone on another network can dial.
+///
+/// [`local_relay_url`] is not that, and sending it would be worse than sending
+/// nothing: it is `ws://127.0.0.1:9531`, which parses, looks like an address,
+/// and cannot reach anything from another machine — the phone's own loopback.
+/// Three things have to hold here:
+///
+///   * **`wss`, on the relay's TLS port.** The plaintext listener is bound to
+///     loopback *by construction* (see [`build_config`]) and carries the bearer
+///     token in the clear, so it is both unreachable and wrong to use from a
+///     peer. The TLS listener is the only one the relay binds to every
+///     interface, and the only one a peer should dial.
+///   * **A host the peer can resolve.** The operator's `relay_hostname` when
+///     they set one, this machine's LAN address otherwise. A loopback host is
+///     refused outright rather than passed along: it is syntactically valid, so
+///     nothing downstream complains, and it names the phone.
+///   * **The port the relay actually bound.** Taken from the running status
+///     rather than from the setting, so the URL cannot disagree with the
+///     listener.
+///
+/// `None` when there is no such host — no LAN address and no configured name.
+/// A relay the app cannot describe is better left undescribed.
+fn phone_relay_url(hostname: &str, port: u16, lan_ip: Option<&str>) -> Option<String> {
+    let host = match hostname.trim() {
+        "" => lan_ip?.trim(),
+        configured => configured,
+    };
+    if host.is_empty() || is_loopback_host(host) {
+        return None;
+    }
+    // An IPv6 literal is only an authority when bracketed. `get_local_ip` is
+    // IPv4-only, but `relay_hostname` is operator input and may be either — and
+    // may already have come bracketed.
+    let authority = if host.starts_with('[') || !host.contains(':') {
+        host.to_string()
+    } else {
+        format!("[{host}]")
+    };
+    Some(format!("wss://{authority}:{port}"))
+}
+
+/// Whether `host` names this machine's own loopback.
+///
+/// Both spellings, because a URL authority can carry either: the *name*
+/// `localhost`, which is what a certificate SAN usually lists and what an
+/// operator reaches for, and a loopback IP literal.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // A name that is not an address is somebody else's business.
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +808,73 @@ mod tests {
         let config = build_config("test-relay-token", &s).unwrap();
         assert_eq!(config.wss_port, 19529);
         assert_eq!(config.health_port, 19530);
+    }
+
+    /// A fresh install has to produce a certificate the relay's own clients can
+    /// verify.
+    ///
+    /// `relay_hostname` defaults to empty and its documented meaning is
+    /// "localhost". The value was handed to the relay verbatim, and the relay
+    /// does not filter it — `TlsParams::subject_alt_names` puts the configured
+    /// name first, unconditionally — so every fresh install generated a
+    /// certificate whose SANs were `["", "127.0.0.1", "::1"]`: a zero-length
+    /// `dNSName`, and no `localhost` to verify against. Nothing pinned it, so
+    /// the certificate was quietly wrong from the first launch.
+    #[test]
+    fn an_empty_relay_hostname_yields_a_certificate_valid_for_localhost() {
+        let config = build_config("test-relay-token", &settings()).unwrap();
+        let sans = config.tls.subject_alt_names();
+
+        assert_eq!(
+            config.tls.hostname, "localhost",
+            "an empty setting means localhost, as the setting documents"
+        );
+        assert!(
+            sans.contains(&"localhost".to_string()),
+            "localhost must be in the SAN list: {sans:?}"
+        );
+        assert!(
+            !sans.iter().any(String::is_empty),
+            "a zero-length dNSName is a certificate nothing can verify: {sans:?}"
+        );
+    }
+
+    /// The other half of the same rule: an operator who *does* name their relay
+    /// must still get that name, or the certificate is valid for a host nobody
+    /// dials.
+    #[test]
+    fn a_configured_relay_hostname_is_the_name_the_certificate_carries() {
+        let mut s = settings();
+        s.relay_hostname = "relay.example.com".to_string();
+        let config = build_config("test-relay-token", &s).unwrap();
+        let sans = config.tls.subject_alt_names();
+
+        assert_eq!(config.tls.hostname, "relay.example.com");
+        assert!(
+            sans.contains(&"relay.example.com".to_string()),
+            "the name a client will dial has to be in the certificate: {sans:?}"
+        );
+        assert!(
+            !sans.iter().any(String::is_empty),
+            "filtering the empty case must not have filtered everything: {sans:?}"
+        );
+    }
+
+    /// The empty string must not be able to reach a SAN through the *fallback*
+    /// layer either. With the setting empty the desktop pins no hostname, so
+    /// the resolver mixes in the environment — and a half-exported
+    /// `RELAY_TLS_HOSTNAME` there would land in the same SAN list.
+    #[test]
+    fn a_stray_environment_hostname_cannot_produce_an_empty_san() {
+        unsafe { std::env::set_var("RELAY_TLS_HOSTNAME", "   ") };
+        let config = build_config("test-relay-token", &settings()).unwrap();
+        unsafe { std::env::remove_var("RELAY_TLS_HOSTNAME") };
+
+        let sans = config.tls.subject_alt_names();
+        assert!(
+            !sans.iter().any(String::is_empty),
+            "a zero-length dNSName is a certificate nothing can verify: {sans:?}"
+        );
     }
 
     #[test]
@@ -774,5 +1086,209 @@ mod tests {
             generate_route_key().unwrap(),
             "a repeated key would sign for a device anyone else could guess"
         );
+    }
+
+    // -----------------------------------------------------------------
+    //  The phone-facing relay URL and the advertisement built from it
+    // -----------------------------------------------------------------
+
+    /// The status a relay reports once it is serving TLS: both `wss_port` and
+    /// `tls_pin` are populated, and only together do they mean "a phone can
+    /// reach this".
+    fn running_status() -> Status {
+        Status {
+            active_connections: 0,
+            registered_devices: 1,
+            cached_nonces: 0,
+            tls_pin: Some("sha256/QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=".into()),
+            wss_port: Some(DEFAULT_RELAY_PORT),
+            ws_port: Some(DEFAULT_RELAY_LOCAL_PORT),
+        }
+    }
+
+    /// The point of the whole helper: the URL a phone is told must be one a
+    /// phone can actually dial. `ws://127.0.0.1:9531` — this desktop's own way
+    /// into the relay — parses, looks like an address, and reaches nothing from
+    /// another machine.
+    #[test]
+    fn the_advertised_url_is_wss_on_the_lan_address_and_not_loopback() {
+        let url = phone_relay_url("", DEFAULT_RELAY_PORT, Some("192.168.1.50"))
+            .expect("a LAN address is enough to build the URL");
+
+        assert_eq!(url, "wss://192.168.1.50:9529");
+
+        let (scheme, authority) = url
+            .split_once("://")
+            .expect("a URL has a scheme and an authority");
+        assert_eq!(scheme, "wss", "the bearer token must never travel in clear");
+        let (host, port) = authority
+            .rsplit_once(':')
+            .expect("the relay's port must be in the URL");
+        assert_eq!(host, "192.168.1.50");
+        assert_eq!(
+            port.parse::<u16>().expect("a port"),
+            DEFAULT_RELAY_PORT,
+            "the relay's TLS port, not the loopback plaintext one"
+        );
+        assert_ne!(
+            url,
+            local_relay_url(),
+            "this must not be the desktop's own loopback URL"
+        );
+        assert!(
+            !url.contains("127.0.0.1") && !url.contains("localhost") && !url.contains("[::1]"),
+            "a loopback host names the phone, not the relay: {url}"
+        );
+        assert!(
+            !url.contains(&format!("ws://127.0.0.1:{}", DEFAULT_RELAY_LOCAL_PORT)),
+            "the plaintext loopback listener is neither reachable nor safe: {url}"
+        );
+    }
+
+    /// An operator who named their relay means it: a published hostname, a
+    /// tunnel name, a DNS record. The LAN address must not win over it.
+    #[test]
+    fn a_configured_hostname_is_what_the_phone_is_told_to_dial() {
+        let url = phone_relay_url("relay.example.com", 8443, Some("192.168.1.50"))
+            .expect("a configured hostname is enough on its own");
+        assert_eq!(url, "wss://relay.example.com:8443");
+
+        // …and it is enough *without* a LAN address, which is the point of
+        // configuring one.
+        assert_eq!(
+            phone_relay_url("relay.example.com", DEFAULT_RELAY_PORT, None).as_deref(),
+            Some("wss://relay.example.com:9529")
+        );
+    }
+
+    /// A loopback host is refused rather than sent. It is a syntactically valid
+    /// authority, so nothing downstream complains — it just cannot work.
+    #[test]
+    fn a_loopback_host_is_never_advertised() {
+        for host in ["localhost", "127.0.0.1", "::1", "  localhost  "] {
+            assert_eq!(
+                phone_relay_url(host, DEFAULT_RELAY_PORT, Some("192.168.1.50")),
+                None,
+                "{host:?} names the phone's own loopback, not the relay"
+            );
+        }
+        // And a LAN address that turns out to be loopback is refused too, so a
+        // regression in the address discovery cannot turn into a dead URL.
+        assert_eq!(
+            phone_relay_url("", DEFAULT_RELAY_PORT, Some("127.0.0.1")),
+            None
+        );
+    }
+
+    /// No configured name and no LAN address means there is nothing truthful to
+    /// send, so nothing is sent. An IPv6 literal is bracketed rather than
+    /// silently malformed.
+    #[test]
+    fn an_undescribable_relay_yields_no_url_at_all() {
+        assert_eq!(phone_relay_url("", DEFAULT_RELAY_PORT, None), None);
+        assert_eq!(
+            phone_relay_url("   ", DEFAULT_RELAY_PORT, Some("   ")),
+            None
+        );
+        assert_eq!(
+            phone_relay_url("[fd00::5]", 9529, None).as_deref(),
+            Some("wss://[fd00::5]:9529")
+        );
+    }
+
+    /// A running relay publishes what a `pairing/accept` needs, and stopping it
+    /// takes it away again — a relay that is not running must never leave a
+    /// peer holding a URL nothing is listening on.
+    #[tokio::test]
+    async fn a_running_relay_publishes_what_a_paired_peer_needs_and_stop_withdraws_it() {
+        let _guard = advertisement_test_lock().lock().await;
+        withdraw_advertisement_for_tests();
+
+        let advertisement = advertise_running_relay(
+            &running_status(),
+            &settings(),
+            "the-real-relay-token",
+            Some("192.168.1.50"),
+        )
+        .expect("a running relay with a LAN address is describable");
+
+        assert_eq!(advertisement.url, "wss://192.168.1.50:9529");
+        assert_eq!(
+            advertisement.token, "the-real-relay-token",
+            "the phone cannot derive the token, so this is the only copy it gets"
+        );
+        // The relay's *own* certificate, not the hub's and not the pin this
+        // machine enforces on a relay it dials.
+        assert_eq!(advertisement.cert_pin, running_status().tls_pin);
+        assert_eq!(
+            advertised_relay().map(|a| a.url).as_deref(),
+            Some("wss://192.168.1.50:9529")
+        );
+
+        withdraw_advertisement_for_tests();
+        assert!(
+            advertised_relay().is_none(),
+            "a relay that is not running must advertise nothing"
+        );
+    }
+
+    /// The other half: no TLS, no port, or no address a peer could dial, and
+    /// nothing is published at all.
+    #[tokio::test]
+    async fn a_relay_that_cannot_be_reached_publishes_nothing() {
+        let _guard = advertisement_test_lock().lock().await;
+        withdraw_advertisement_for_tests();
+        advertise_running_relay(
+            &running_status(),
+            &settings(),
+            "the-real-relay-token",
+            Some("192.168.1.50"),
+        )
+        .expect("precondition: something is advertised");
+
+        // TLS did not initialise: `Status` leaves both fields `None`, so the
+        // relay has no WSS listener and no certificate to pin.
+        let mut no_tls = running_status();
+        no_tls.tls_pin = None;
+        no_tls.wss_port = None;
+        assert!(advertise_running_relay(&no_tls, &settings(), "t", Some("192.168.1.50")).is_none());
+
+        // A relay up on a machine this process cannot name an address for.
+        assert!(
+            advertise_running_relay(&running_status(), &settings(), "t", None).is_none(),
+            "with no hostname and no LAN address there is no truthful URL"
+        );
+
+        // A relay on a machine whose address is not reachable from a phone.
+        assert!(
+            advertise_running_relay(&running_status(), &settings(), "t", Some("127.0.0.1"))
+                .is_none()
+        );
+
+        assert!(
+            advertised_relay().is_some(),
+            "an undescribable relay must not withdraw a previously published one"
+        );
+        withdraw_advertisement_for_tests();
+    }
+
+    /// The token is a credential, and this value reaches `{:?}` through assert
+    /// messages and log lines.
+    #[test]
+    fn the_advertisement_debug_form_carries_no_token() {
+        let advertisement = RelayAdvertisement {
+            url: "wss://192.168.1.50:9529".into(),
+            token: "0123456789abcdef".into(),
+            cert_pin: Some("sha256/QUJD".into()),
+        };
+        let rendered = format!("{advertisement:?}");
+
+        assert!(rendered.contains("RelayAdvertisement"));
+        assert!(rendered.contains("wss://192.168.1.50:9529"));
+        assert!(
+            !rendered.contains("0123456789abcdef"),
+            "Debug leaked the relay token: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED"));
     }
 }

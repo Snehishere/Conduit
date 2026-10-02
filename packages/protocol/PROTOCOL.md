@@ -169,9 +169,24 @@ interface of what is usually a laptop.
 | `RELAY_METRICS_TOKEN` | no | — | When set, `/metrics` requires it. |
 | `RELAY_NONCE_FILE` | no | platform data dir | Persisted replay-nonce cache. The desktop sets this to `app_data_dir()/relay-nonces.json`. |
 | `RELAY_CERT_DIR` | no | — | Directory holding the TLS certificate and key. The desktop sets this to `app_data_dir()/relay-certs`. |
-| `RELAY_TLS_HOSTNAME` | no | — | Hostname placed in the generated certificate. The desktop supplies `relay_hostname` through `Overrides` instead. |
+| `RELAY_TLS_HOSTNAME` | no | — | Hostname placed in the generated certificate. **It is a fallback, not an override**: the desktop pins `relay_hostname` through `Overrides` whenever that setting is non-empty, and this variable is consulted only when it is empty. |
 | `RELAY_TLS_EXTRA_SANS` | no | — | Extra subject alternative names for the generated certificate. |
-| `RELAY_TLS_EXTRA_SANS` | no | — | Extra subject alternative names for the generated certificate. |
+
+An **empty** `relay_hostname` means `localhost`, and it has to: the desktop's
+setting defaults to empty and most installs never change it, so the empty case
+is the common case rather than an error. Every path through `Config::resolve`
+therefore substitutes the default (`TlsParams::default().hostname`) for a
+hostname that is empty or whitespace-only, and the desktop filters the empty
+value out before the resolver sees it. It used to be passed through verbatim,
+and since `TlsParams::subject_alt_names()` puts the configured name at the head
+of the SAN list unconditionally, a fresh install generated a certificate whose
+SANs were `["", "127.0.0.1", "::1"]` — a zero-length `dNSName`, and no
+`localhost` at all. **No empty string may ever reach a SAN list**: the zero
+length entry is rejected by some TLS stacks and the missing `localhost` is a
+certificate no local client can verify.
+
+`RELAY_TLS_EXTRA_SANS` entries are trimmed and empty ones dropped
+(`TlsParams::subject_alt_names`), so the same rule holds for them.
 
 ### 2.4 Connection Lifecycle
 
@@ -339,15 +354,66 @@ Desktop replies with its public key after validating the token.
     "name": "Conduit Desktop",
     "type": "desktop",
     "os": "windows"
-  }
+  },
+  "device_id": "a1b2c3d4e5f6a7b8",
+  "hub_device_id": "0f1e2d3c4b5a6978",
+  "relay_url": "wss://192.168.1.50:9529",
+  "relay_token": "…64 hex characters…",
+  "relay_cert_pin": "sha256/…"
 }
 ```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `public_key` | string | yes | Desktop's X25519 public key, hex-encoded |
+| `device_info` | object | no | Desktop metadata for the peer to store |
+| `device_id` | string | no | The `devices.id` the desktop assigned to the peer. Absent when the sender predates assigned ids. |
+| `hub_device_id` | string | no | The desktop's own `device_id`. Absent when the sender predates it. |
+| `relay_url` | string | no | `wss://` URL of the relay **this sender hosts**. Absent when it hosts none, or its relay is not running. |
+| `relay_token` | string | no | Bearer token for that relay (`relay_auth`, §4.15.1). Absent under the same conditions as `relay_url`. |
+| `relay_cert_pin` | string | no | `sha256/<base64>` SPKI pin of the certificate **that relay** serves. Absent when the relay serves no certificate. |
 
 `PairingAccept` in `types.rs` does not declare a `token` field, but the desktop
 **requires** one: `security::validate_pairing_message` refuses an `accept`
 without a token, because `accept` registers a device and fires
 `DeviceConnect` automation triggers — it is a full pairing, not a passive
 reply.
+
+##### The relay fields
+
+The desktop hosts the relay in-process (§2.3), so it is the only party that
+knows all three of these and the peer cannot derive any of them: it listens on
+the socket, it *generated* the bearer token (kept in the OS keyring under
+account `relay_token`), and it holds the relay's certificate. Pairing is the
+only moment the peer is listening, so this frame is where they are delivered.
+**Absence is normal and must stay safe**: a desktop that does not host a relay,
+or whose relay failed to start, omits all three and the peer keeps whatever
+relay configuration it already had.
+
+* `relay_url` names the relay's **TLS** listener (`wss_port`, §2.3) — never the
+  loopback-only plaintext listener the desktop uses to join its own relay, which
+  a peer can neither reach nor should use (it carries the bearer token in clear).
+  The host is the sender's `relay_hostname` when it has one and its LAN address
+  otherwise. A **loopback host is never advertised**: it is a syntactically valid
+  authority, so nothing downstream complains, and from a phone it names the
+  phone. When neither a configured hostname nor a LAN address exists, the field
+  is omitted rather than filled with a plausible-looking value.
+* `relay_cert_pin` is the pin of the **relay's** certificate, not the hub's.
+  The relay generates its own TLS material (`conduit_relay::tls`), so a peer
+  must keep it in a **separate slot** from the hub's pin — a receiver that
+  accepted it for the hub would pin the wrong certificate everywhere else.
+  It is also not the `relay_cert_pin` *setting*, which is a pin this machine
+  enforces on a relay it dials and is empty in the normal hosting case.
+* **Disclosure boundary.** All three are sent only after the request presented a
+  valid one-time pairing token (`authorize_pairing`, which consumes it), to that
+  one connection. An unauthenticated peer gets `invalid_pairing_token` and
+  nothing else, so the token cannot be harvested by guessing. This does widen
+  what a successful pairing yields — it is now the way to reach the relay from
+  outside the LAN — and it is bounded: `relay_auth` uses the bearer token to
+  authenticate a *connection*, while routing a frame additionally requires the
+  sender's own route key, derived from that device's pairing secret and bound to
+  its id (§4.15.2.2). Possessing the token does not let a peer route as another
+  device.
 
 The shared secret is derived via X25519 ECDH from:
 - Sender's private key + Receiver's public key
@@ -1640,18 +1706,34 @@ device's own route key instead of the peer shared secret.
 
 ### 6.4 What Is Encrypted
 
-The envelope is opt-in per message type, and in this build almost nothing opts
-in. `seal_for_peer` (`apps/desktop/src-tauri/src/server/mod.rs:321-361`) wraps
-what the *hub* fans out, and it can only select a per-peer secret when the
-frame names a single recipient. Types the frontend sends straight through the
-hub, and types with no destination device id, go out unwrapped.
+The desktop hub wraps an outbound frame for a peer **whenever it knows that
+peer's shared secret** — it does not choose per message type. `seal_for_device`
+(`apps/desktop/src-tauri/src/server/mod.rs:355`, reached through `seal_for_peer`
+at `:321`) exempts exactly two types and seals the rest:
 
 | Message Type | Wrapped by the desktop hub? |
 |-------------|-----------|
 | `pairing/*` | No — establishes the secret |
-| `relay_auth`, `relay_auth_ok`, `relay_auth_rejected` | No |
-| `call` (answer, reject, forward) | Yes, via `send_encrypted_message` |
-| `sms`, `file`, `notification`, `clipboard`, `screen_mirror`, `remote_input`, `audio` | **No** — broadcast, or forwarded verbatim |
+| `encrypted` | No — already an envelope; re-wrapping produced `encrypted(encrypted(…))` |
+| `relay_auth`, `relay_auth_ok`, `relay_auth_rejected` | Yes, like any other frame |
+| everything else (`call`, `sms`, `file`, `notification`, `clipboard`, `screen_mirror`, `remote_input`, `audio`, …) | **Yes** |
+
+A destination with no registered secret gets the frame verbatim — that is the
+unpaired-reply path, and it is why `seal_for_peer` returns the input unchanged
+rather than guessing.
+
+> **This table previously said the opposite.** It claimed `sms`, `file`,
+> `notification`, `clipboard`, `screen_mirror`, `remote_input` and `audio` were
+> "broadcast, or forwarded verbatim", on the reasoning that
+> "types with no destination device id go out unwrapped". That described an
+> earlier design. The code has always exempted only `pairing` and `encrypted`,
+> and now applies the same rule on the relay egress as on the LAN egress
+> (`send_to` → `sealed_relay_route`, `server/mod.rs`). Note that
+> `apps/desktop/src/hooks/useEncryption.ts`'s `MESSAGE_PROTECTION` table still
+> records the *frontend's* per-type opinion and disagrees with both; that table
+> is a UI affordance (which actions offer to encrypt) rather than a description
+> of what the hub does, but the wording invites exactly this confusion and is
+> worth reconciling.
 
 This is hop encryption in any case, not end-to-end: the hub terminates the
 envelope either way. The desktop keeps the authoritative per-type table, with
@@ -1808,6 +1890,11 @@ is intended — the old forms are the vulnerability the change fixed.
 6. **Pair before anything except `pairing`, `ping` and `pong`** — `discovery`
    is now gated, and `pairing/local_auth` is mandatory for the desktop's own
    loopback webview.
+7. **Adopt `relay_url`, `relay_token` and `relay_cert_pin` from
+   `pairing/accept` when they are present** (§4.2), storing the pin in the slot
+   reserved for the **relay's** certificate rather than the hub's. When they are
+   absent — which is normal — keep whatever relay configuration you already had
+   and carry on; absence is not an error and must not clear a working relay.
 
 ### 9.3 Known gaps
 

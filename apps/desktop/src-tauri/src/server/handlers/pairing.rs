@@ -150,6 +150,26 @@ pub async fn handle_pairing_request(msg: Value, client_id: &str, ctx: &WsContext
         error!("Failed to persist paired device {}: {}", stable_id, e);
     }
 
+    // SECURITY: the relay address, bearer token and certificate pin, but only
+    // for a peer that has *just* presented a valid one-time pairing token.
+    // `authorize_pairing` above is the boundary: it consumes the token, so it
+    // cannot be replayed for a second device, and it is the out-of-band code
+    // the desktop displayed (or encoded in the QR the phone scanned). Nothing
+    // reaches this point unauthenticated — an unpaired connection cannot get
+    // this frame at all, and a rejected one is answered with
+    // `invalid_pairing_token` and nothing else.
+    //
+    // The token is a bearer credential guarding every relayed frame, so this
+    // does widen what a successful pairing yields: it is now the way to reach
+    // the relay from outside the LAN. That is the feature, and it is bounded —
+    // the relay authenticates a connection with this token but routes a frame
+    // only under the *sender's own* route key, derived from that device's
+    // pairing secret and bound to its id, so holding it does not let a peer
+    // route as anyone else. It is also only ever sent while the relay is
+    // actually up: `advertised_relay` is `None` otherwise, and the three fields
+    // are omitted rather than sent empty.
+    let relay = crate::relay::advertised_relay();
+
     let response = PairingAccept {
         msg_type: "pairing".into(),
         action: "accept".into(),
@@ -172,6 +192,15 @@ pub async fn handle_pairing_request(msg: Value, client_id: &str, ctx: &WsContext
         // forwards it: a relayed v2 frame is checked under the sender's route
         // key, and the sender's id is bound into that key's derivation.
         hub_device_id: Some(ctx.device_id.as_str().to_string()),
+        // How the peer reaches this desktop when it is on a different network:
+        // the relay we host, its bearer token, and the pin of the certificate
+        // *the relay* serves. Without all three the phone cannot establish the
+        // connection at all, so pairing is the only place it can learn them.
+        // `None` when the relay is not running, and the fields are then absent
+        // from the frame entirely.
+        relay_url: relay.as_ref().map(|r| r.url.clone()),
+        relay_token: relay.as_ref().map(|r| r.token.clone()),
+        relay_cert_pin: relay.as_ref().and_then(|r| r.cert_pin.clone()),
     };
     let response = serde_json::to_string(&response).expect("PairingAccept serializes");
 
@@ -389,6 +418,129 @@ mod tests {
         );
     }
 
+    /// The relay address, token and pin travel in the same frame as the
+    /// assigned id: both are things only the desktop can tell the phone, and
+    /// pairing is the only moment the phone is listening.
+    ///
+    /// This is also the one place a bearer credential leaves this process, so
+    /// the test pins *when* it happens — after a valid one-time token, never
+    /// before, and never for a connection that did not pair at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pairing_accept_carries_the_relay_endpoint_only_when_the_relay_is_up() {
+        // The advertisement is process-global, so this test owns it exclusively.
+        let _guard = crate::relay::advertisement_test_lock().lock().await;
+        crate::relay::withdraw_advertisement_for_tests();
+
+        /// Pair a fresh peer and return the `pairing/accept` frame it received.
+        async fn pair(ctx: &WsContext, client: &str, token: &str) -> serde_json::Value {
+            let ws_tx = add_test_unpaired_client(ctx, client).await;
+            let mut rx = ws_tx.subscribe();
+            let _keep = ws_tx;
+            ctx.token_store.insert(token.to_string()).await;
+
+            let peer_enc = crate::encryption::EncryptionManager::new_random();
+            handle_pairing_request(
+                serde_json::json!({
+                    "type": "pairing",
+                    "action": "request",
+                    "public_key": peer_enc.public_key_hex(),
+                    "token": token,
+                    "device_info": { "name": "Pixel 7", "type": "phone", "os": "android" }
+                }),
+                client,
+                ctx,
+            )
+            .await;
+
+            let reply = rx
+                .try_recv()
+                .expect("pairing must reply with an accept frame");
+            serde_json::from_str(&reply).expect("accept frame is JSON")
+        }
+
+        // ── The relay is not running: the fields must be absent, not empty ──
+        let ctx = create_test_ctx();
+        let accept = pair(&ctx, "client_down", "DOWN01").await;
+        for field in ["relay_url", "relay_token", "relay_cert_pin"] {
+            assert!(
+                accept.get(field).is_none(),
+                "{field} must be omitted when there is no relay, not sent as an empty \
+                 string — a peer that stores one adopts an endpoint it cannot dial: {accept}"
+            );
+        }
+
+        // ── The relay is up: the peer gets all three, verbatim ──
+        crate::relay::publish_advertisement_for_tests(crate::relay::RelayAdvertisement {
+            url: "wss://192.168.1.50:9529".to_string(),
+            token: "the-real-relay-token".to_string(),
+            cert_pin: Some("sha256/QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=".to_string()),
+        });
+
+        let ctx = create_test_ctx();
+        let accept = pair(&ctx, "client_up", "UP0001").await;
+        assert_eq!(
+            accept["relay_url"], "wss://192.168.1.50:9529",
+            "the peer must be told where to dial, in a form it can dial"
+        );
+        assert_eq!(
+            accept["relay_token"], "the-real-relay-token",
+            "the phone cannot derive the token, so this frame is the only copy"
+        );
+        assert_eq!(
+            accept["relay_cert_pin"], "sha256/QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU=",
+            "the pin must be the relay's own certificate, which is not the hub's"
+        );
+        crate::relay::withdraw_advertisement_for_tests();
+    }
+
+    /// The other half of the same boundary: a peer that fails the token check
+    /// gets an `invalid_pairing_token` error and nothing else, so the token
+    /// cannot be harvested by guessing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_pairing_is_told_nothing_about_the_relay() {
+        let _guard = crate::relay::advertisement_test_lock().lock().await;
+        crate::relay::publish_advertisement_for_tests(crate::relay::RelayAdvertisement {
+            url: "wss://192.168.1.50:9529".to_string(),
+            token: "the-real-relay-token".to_string(),
+            cert_pin: None,
+        });
+
+        let ctx = create_test_ctx();
+        let ws_tx = add_test_unpaired_client(&ctx, "attacker").await;
+        let mut rx = ws_tx.subscribe();
+        let _keep = ws_tx;
+        ctx.token_store.insert("VALID1".to_string()).await;
+
+        let peer_enc = crate::encryption::EncryptionManager::new_random();
+        handle_pairing_request(
+            serde_json::json!({
+                "type": "pairing",
+                "action": "request",
+                "public_key": peer_enc.public_key_hex(),
+                "token": "WRONG1",
+                "device_info": { "name": "Attacker", "type": "phone", "os": "android" }
+            }),
+            "attacker",
+            &ctx,
+        )
+        .await;
+
+        let frame = rx.try_recv().expect("the peer must be told why");
+        assert!(
+            frame.contains("invalid_pairing_token"),
+            "expected invalid_pairing_token, got: {frame}"
+        );
+        assert!(
+            !frame.contains("the-real-relay-token"),
+            "a rejected pairing must never carry the relay bearer token: {frame}"
+        );
+        assert!(
+            !frame.contains("192.168.1.50"),
+            "a rejected pairing must not even name the relay: {frame}"
+        );
+        crate::relay::withdraw_advertisement_for_tests();
+    }
+
     /// A desktop that predates assigned ids omits the field; the reply must
     /// still be well-formed rather than panicking or serialising `"null"`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -594,7 +746,6 @@ mod tests {
     }
 
     // ── handle_pairing_accept tests ───────────────────────────────────────────
-
     /// REGRESSION (CRITICAL): `pairing/accept` used to run with **no** token
     /// check. One frame was enough to become a paired device — a `devices` row,
     /// a `ConnectedClient`, a `ws_to_device_id` entry (which the auth gate

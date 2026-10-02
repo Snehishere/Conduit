@@ -10,6 +10,7 @@ import 'encryption_service.dart';
 import 'relay_route.dart'
     show
         BinaryFrame,
+        binaryTargetMatches,
         buildBinaryFrame,
         computeSpkiPin,
         deriveRouteKey,
@@ -878,7 +879,24 @@ class WebSocketService extends ChangeNotifier {
 
     // The relay only forwards to the named recipient, so a frame naming anyone
     // else means the routing table and the wire disagree.
-    if (frame.targetId != _deviceId) {
+    //
+    // Compared against this device's own *canonical field*, not against its
+    // full id. Every device id is a 36-character UUID and the field is 16
+    // bytes, so the field can only ever carry the id's prefix — which is
+    // exactly what the relay resolved to reach this phone. The check used to
+    // compare the parsed 16-byte target against the whole id, so it was never
+    // true and every correctly-routed frame was dropped on arrival.
+    //
+    // `binaryTargetMatches` mirrors `conduit_protocol::binary_target_matches`
+    // (PROTOCOL.md §5.1.4/§5.1.5), the same definition the relay's router and
+    // the desktop receiver use, so this accepts exactly the frames the relay
+    // resolved to this device.
+    final deviceId = _deviceId;
+    if (deviceId == null || deviceId.isEmpty) {
+      debugPrint('WS: relay frame arrived with no device id of our own');
+      return;
+    }
+    if (!binaryTargetMatches(deviceId, frame.targetField)) {
       debugPrint('WS: relay frame addressed to ${frame.targetId}, not us');
       return;
     }

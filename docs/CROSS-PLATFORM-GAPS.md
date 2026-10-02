@@ -14,6 +14,63 @@ against code on both sides.
 > including entries in that document that are wrong. Where the two disagree, the
 > evidence is here.
 
+## Status
+
+Findings are marked as they are closed. **Every fix below was verified by an
+adversarial pass first** — a separate agent whose only job was to try to refute
+the finding — and **two headline claims were refuted**, which is why the
+severity ordering below is not the same as the order the findings were first
+reported in.
+
+### Fixed
+
+| Finding | Closed in |
+|---|---|
+| **G-R2** — the phone's entire relay egress was dead (`_targetDeviceId` always null) | `da66802` + the follow-up commit |
+| **G-R4** — the phone handled none of the relay's answers (19 error codes, both auth results) | `da66802` |
+| **G-R7** — inbound relayed frames all rejected as replays after any reconnect | `da66802` |
+| **G-R16** — no way to point a phone at a relay | `da66802` (mobile) + follow-up (desktop delivers it at pairing) |
+| **G-R17** — the phone could not produce a real `ping`/`pong` on a relay socket | `da66802` |
+| **B-F3 / G-R3** — the relay could not route a binary frame to anybody | `da66802` (relay + desktop); phone receiver in the follow-up |
+| **B-F4** — `handle_lan_chunk` looked a device id up in a client-id-keyed map | `da66802` (covered by the target-field work + tests) |
+| **C-F9** — no `error` handler on the phone | `da66802` |
+| **D-F1** — `relay_enabled` defaulted to off; a fresh install never started the relay | `da66802` |
+| **D-F4** — the clipboard history table was never written | `da66802` |
+| **B-F2** — the per-type rate limit was 60 per *60 seconds*, and `stop` shared the frame budget | `da66802` |
+| **G-R8** — directed frames were not sealed on the relay egress | `da66802` |
+| **E-F1** — three EventChannel subscribers shared one channel name, so two were dead | `da66802` |
+| **Global limiter double-charge** — ~5 msg/s ceiling on all types | follow-up commit |
+
+### Refuted or corrected before any code was written
+
+- **G-R1 (port 9531 collision) — REFUTED on Windows.** Measured, not inferred:
+  `0.0.0.0:P` and `127.0.0.1:P` bind successfully together, and each listener
+  receives its own traffic. It survives as a **portability risk on Linux/macOS**
+  (the POSIX rule differs and `SO_REUSEADDR` is not set), not a live bug. The
+  "both outcomes are fatal" framing was also wrong: the hub's arm is
+  warn-and-continue.
+- **G-R8's framing was wrong**, though the mechanism held. "Every desktop→phone
+  relayed frame is plaintext" was true but nearly vacuous, because `send_to` is
+  the only egress and most types are plaintext *by design on every transport*.
+  The real defect was narrower: directed frames were unsealed on the relay path
+  only. The cited `ARCHITECTURE.md:60` does not contain the claim at all.
+- **"No inbound frame is deserialised into a protocol struct" — REFUTED.** There
+  are 11 such parses; it is a deliberate two-tier split. See the structural
+  finding above for the corrected version.
+- **iOS: `NEHotspotNetwork` is not an independent blocker.** It is downstream of
+  the missing Xcode target and dissolves itself if the project is restored from
+  the current Flutter template (deployment target 15.0). So §F's "three
+  independent reasons" is the accurate count, not four.
+
+### Still open
+
+Everything else in this document, plus the items listed at the end. The largest
+remaining are the ones no single boundary could see: **iOS cannot build or
+launch** (three independent blockers), **`remote_input` into the phone is
+unreachable on both platforms**, **screen capture and remote input into the
+desktop are broken on Linux**, and **all phones behind a relay share one
+rate-limit bucket**.
+
 ## How to read this
 
 Each finding carries a **verdict**, because "these two sides differ" is not
@@ -575,36 +632,46 @@ callback on API 34) and H-F31 (Wayland `Enigo::new` error-vs-no-op).
 
 ---
 
-## What is worth doing first
+## What is worth doing next
 
-Not a schedule — a dependency order, because several findings are one root cause
-wearing different clothes.
+The first six items below are **done**. What remains, in dependency order —
+because several of the rest are one root cause wearing different clothes.
 
-1. **The relay is not usable by a phone at all** (G-R2, G-R16, and the 9531
-   collision G-R1). Everything else about the relay is downstream of a phone
-   that cannot authenticate usefully, wrap a single frame, or be pointed at a
-   relay. G-R16 is the smallest honest slice: a way to configure `relay_url` and
-   `relay_token` at all.
-2. **The desktop's own relay path leaks plaintext and shares one rate-limit
-   bucket** (G-R8, G-R11) — both are small, self-contained, and affect every
-   relayed frame.
-3. **Fix the two 16-byte/36-character mismatches** (B-F3, B-F4, G-R3) together.
-   They are one design error: a fixed-width target field against variable-width
-   ids, with truncation that neither side checks.
-4. **The phone's EventChannel is a single shared name** (E-F1). Notifications and
-   calls are dead today because three subscribers were added to one channel.
-   Per-channel-name channels, or one Dart demultiplexer.
-5. **iOS cannot launch** (F-F1/2/3, H-F1/2). Three independent blockers; none is
-   subtle once you know to look.
-6. **The relay_enabled default** (D-F1) is a one-line fix that ships the product's
-   stated behaviour, and the two tests that should have caught it need to be
-   pointed at `Storage::get_settings()`.
+1. **iOS cannot build or launch.** Three independent blockers: the pbxproj has no
+   `PBXNativeTarget` (a stub someone wrote and committed — one commit has ever
+   touched it, and it was 112 lines from the start), `Base.lproj` is empty so
+   `AppDelegate.swift:86` force-casts nil, and `flutter_local_notifications`
+   throws before `runApp` because only `InitializationSettings.android` is
+   passed. Restoring the project from the current Flutter template fixes the
+   first two and raises the deployment target to 15.0, which also dissolves the
+   `NEHotspotNetwork` availability error for free. **This is the single largest
+   block of functionality in the project and none of it is subtle once you know
+   to look.**
+2. **All phones behind a relay share one rate-limit bucket** (G-R11), keyed on
+   the literal `"relay_server"`. One relayed file transfer throttles every other
+   phone's relayed traffic. Needs a per-device key, which means the relay must
+   attribute the frame before it spends the budget.
+3. **`remote_input` into the phone is unreachable on both platforms** (E-F5,
+   F-F13). On Android the accessibility service is declared but nothing ever
+   walks the user to enabling it; on iOS there is no public injection API at all.
+   Android is a one-line fix plus a settings entry.
+4. **Screen capture and remote input into the desktop are broken on Linux**
+   (H-F31, H-F32): `xcap` is X11-only, and `Enigo::new(...).unwrap()` *panics*
+   inside the tokio task on Wayland.
+5. **A relay-only peer cannot be told why it was refused** (G-R11 follow-up). A
+   device with no local socket has nowhere to receive an `error` frame, so
+   `PROTOCOL.md` §8.3's "relay-side limiting is silent" is currently accurate by
+   necessity rather than by choice. Routing refusals back is a protocol change.
+6. **The structural finding** (top of this document). Nothing enforces agreement
+   between the four representations, which is why three rounds of fixes produced
+   ~40 findings. Wiring the generated Dart model up, or deleting it and admitting
+  there are three representations, would stop the class recurring.
 
-Two things are *not* worth doing first, and the reasons are recorded above:
-narrowing `is_desktop_executable` (trades five false successes for seven), and
-relaxing the per-type rate limit (the number is wrong; the fix is a
-correctly-sized budget plus a control exemption, and any change must move a value
-a test currently pins).
+Two things are *not* worth doing, and the reasons are recorded above: narrowing
+`is_desktop_executable` (trades five false successes for seven), and simply
+raising the per-type rate limits (the *window* was wrong, not the count — a
+60-second window admits a one-second burst and then refuses for 59 seconds).
+
 
 ## A note on the numbers in `REMAINING_WORK.md`
 

@@ -24,16 +24,16 @@ common source of "command not found" / "no such package" in this project.
 
 ```bash
 # repository root
-cargo test -p conduit-protocol     # 270 passed, 0 failed, plus 1 doctest
-cargo test -p conduit-relay        # 235 passed, 0 failed, 1 ignored, plus 2 doctests
-cargo test -p conduit              # 748 passed, 0 failed
+cargo test -p conduit-protocol     # 281 passed, 0 failed, plus 1 doctest
+cargo test -p conduit-relay        # 247 passed, 0 failed, 1 ignored, plus 2 doctests
+cargo test -p conduit              # 799 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
-| `packages/protocol` | `conduit-protocol` | repository root | 270 passed, 0 failed, plus 1 doctest |
-| `services/relay` | `conduit-relay` | repository root | 235 passed, 0 failed, 1 ignored, plus 2 doctests |
-| `apps/desktop/src-tauri` | `conduit` | repository root | 748 passed, 0 failed |
+| `packages/protocol` | `conduit-protocol` | repository root | 281 passed, 0 failed, plus 1 doctest |
+| `services/relay` | `conduit-relay` | repository root | 247 passed, 0 failed, 1 ignored, plus 2 doctests |
+| `apps/desktop/src-tauri` | `conduit` | repository root | 799 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
 [DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem).
@@ -73,8 +73,8 @@ and a typecheck disagree.
 
 ```bash
 # apps/mobile
-flutter test                        # 150 passed
-dart analyze                       # 0 errors, 0 warnings (367 infos)
+flutter test                        # 190 passed
+dart analyze                       # 0 errors, 0 warnings (366 infos)
 dart format --output=none --set-exit-if-changed lib test integration_test
 flutter test integration_test       # needs a device or running emulator
 ```
@@ -115,11 +115,11 @@ until the failure in §5 is fixed.
 
 ## 2. What each suite covers
 
-### `conduit-protocol` — 270 tests, plus 1 doctest
+### `conduit-protocol` — 281 tests, plus 1 doctest
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/types.rs` | 215 | Serde round-trips for every message type; optional `protocol_version`; `const` tag serialisation; snake_case vs camelCase field naming; the port constants; the binary frame layout constants; **the 5 schema-sync invariants**; `PROTOCOL.md` content assertions; the mobile port mirror |
+| `src/types.rs` | 226 | Serde round-trips for every message type; optional `protocol_version`; `const` tag serialisation; snake_case vs camelCase field naming; the port constants; the binary frame layout constants; **the 5 schema-sync invariants**; `PROTOCOL.md` content assertions; the mobile port mirror |
 | `src/lib.rs` (`mod hmac`) | 55 | HMAC signing and verification, key derivation with a domain-separated KDF, per-device route-key derivation and the `RouteKeyring` (including a key id that disagrees with the sender, a key belonging to another device, and forgetting an unpaired device), and the replay-protection nonce cache (including cross-restart behaviour, per-device quota isolation under the global ceiling, and a store that fails closed when it cannot be read) |
 
 There is also 1 doctest: a `compile_fail` case pinning the deleted unscoped
@@ -150,7 +150,7 @@ example advertises `"wss_port": 9531`, and that
 `kLanWssPort = 9531` / `kLanWsPort = 9527` and hard-codes neither number in any
 call site.
 
-### `conduit-relay` — 235 tests, plus 2 doctests
+### `conduit-relay` — 247 tests, plus 2 doctests
 
 The crate is a library with no `src/main.rs` and no `[[bin]]`. Its tests live in
 four places: `src/suite.rs` is the in-crate suite written against the relay as a
@@ -162,9 +162,9 @@ remaining modules (`connection.rs`, `route.rs`, `state.rs`, `health.rs`,
 
 | File | Tests | Covers |
 |---|---|---|
-| `src/suite.rs` | 172 | Auth and the `relay_auth` handshake; the auth timeout **and the total auth deadline**; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; the text and binary frame size ceilings at both the read and the application layer, each answered `message_too_large`; the outbound queue's per-connection byte budget; the release of the routing read lock before a slow forward; a superseded connection's inability to deregister the live one; inbound `protocol_version` enforcement; and an end-to-end WebSocket lifecycle against a real listener |
+| `src/suite.rs` | 181 | Auth and the `relay_auth` handshake; the auth timeout **and the total auth deadline**; `relay_route` HMAC verification under a per-device key resolved through the `RouteKeys` trait; binary frame v2 parsing and the rejection of version `0x01`; replay protection and nonce persistence; health / metrics / `/pin` endpoints and the bearer-token behaviour that actually applies to each of them (`/health` and `/` always; `/metrics` only when a metrics token is configured); the `Overrides` → environment → default precedence and its fail-closed paths; rate and connection limits; the text and binary frame size ceilings at both the read and the application layer, each answered `message_too_large`; the outbound queue's per-connection byte budget; the release of the routing read lock before a slow forward; a superseded connection's inability to deregister the live one; inbound `protocol_version` enforcement; and an end-to-end WebSocket lifecycle against a real listener |
 | `src/tls.rs` | 43 | Self-signed certificate generation and SAN handling, including the bounded validity window and the asserted key usages; `load_tls_context` refusing an expired or not-yet-valid supplied certificate, with the parser cross-checked against the `openssl` fixture; PKCS#8 / PKCS#1 / SEC1 key detection; the "no private key found in key PEM" path; key/cert mismatch refusal; `0600` tightening; SPKI extraction cross-checked against `openssl` |
-| `src/config.rs` | 11 | The `MIN_SECRET_LEN` floor on every secret, the derived rather than copied health token, the empty-expected-token guard in `bearer_token_authorized`, `env_port` failing closed on an unparseable value, and the redacting `Debug` |
+| `src/config.rs` | 14 | The `MIN_SECRET_LEN` floor on every secret, the derived rather than copied health token, the empty-expected-token guard in `bearer_token_authorized`, `env_port` failing closed on an unparseable value, and the redacting `Debug` |
 | `src/service.rs` | 10 | The TLS handshake budget, the WebSocket upgrade budget and its disarm on first write, admission ordering (rate limit → guard → cap) and the fact that every early return drops its connection slot |
 
 `cargo test -p conduit-relay -- --list` reports 43 for `tls.rs` on Windows; the
@@ -182,22 +182,22 @@ and it hosts the relay in-process — `src/relay.rs` has its own 16 tests for th
 `conduit` crate, not here, so nothing in `conduit-relay`'s own suite exercises
 the crate the way that consumer does. See §3.
 
-### `conduit` (desktop Rust) — 748 tests, all passing
+### `conduit` (desktop Rust) — 799 tests, all passing
 
 Test count per module, as reported by `cargo test -p conduit -- --list`
-(748 total):
+(799 total):
 
 | Module | Tests | What it protects |
 |---|---|---|
-| `src/server/` | 202 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 57 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
+| `src/server/` | 227 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 82 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
 | `src/commands/` | 123 | Every Tauri command, via `tauri::test::mock_builder` |
 | `src/automation.rs` | 104 | Rule evaluation, the shell allowlist gate, trigger dispatch, and **the honest reporting of actions with no implementation** — five of seven actions used to return `success: true` while doing nothing |
 | `src/encryption.rs` | 86 | Key resolution across keyring and 0600 key file, secret reuse, migration back into a recovered keyring |
-| `src/storage.rs` | 70 | SQLCipher persistence, migrations, settings round-trips, the keyring-loss data path |
+| `src/storage.rs` | 72 | SQLCipher persistence, migrations, settings round-trips, the keyring-loss data path |
 | `src/file_transfer.rs` | 53 | Chunking, path-traversal rejection, download-path validation |
-| `src/security.rs` | 46 | Rate limiters, file-request validation, `allowed_commands` parsing (fail-closed) |
+| `src/security.rs` | 60 | Rate limiters, file-request validation, `allowed_commands` parsing (fail-closed) |
 | `src/discovery.rs` | 20 | mDNS advertisement contents, the TXT-record consumption decision, and character-boundary-safe device-id truncation |
-| `src/relay.rs` | 17 | The `RelayHost`: building `conduit_relay::Overrides` from the desktop settings, resolving the keyring-backed relay token and the desktop's own route key, and the `RouteKeys` implementation |
+| `src/relay.rs` | 27 | The `RelayHost`: building `conduit_relay::Overrides` from the desktop settings, resolving the keyring-backed relay token and the desktop's own route key, and the `RouteKeys` implementation |
 | `src/main.rs` → `mod integration_tests` | 13 | Bind address / port invariants |
 | `src/sync.rs` | 6 | Sync engine state |
 | `src/audio.rs` | 3 | Audio stream and playback state |
@@ -254,7 +254,7 @@ project, `chromium`. Its own header comment states the constraint:
 > Tauri IPC calls are not available in the browser environment, so the app
 > must gracefully degrade when `invoke()` fails.
 
-### Mobile — `flutter test`, 150 tests in 26 files
+### Mobile — `flutter test`, 190 tests in 26 files
 
 All under `apps/mobile/test/`:
 

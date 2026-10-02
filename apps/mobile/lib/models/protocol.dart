@@ -47,6 +47,23 @@ class Protocol {
     ///and the sender's id is bound into that key's derivation, so a peer that does not know
     ///this cannot verify a relayed frame and must drop it. Absent when the sender predates it.
     final String? hubDeviceId;
+    
+    ///SPKI pin of the relay's OWN certificate, which is not the hub's - the relay generates its
+    ///own TLS material. Must be kept in a separate slot from the hub's pin: a relay pin is
+    ///never valid for the hub and vice versa. Absent with relay_url.
+    final String? relayCertPin;
+    
+    ///The relay's shared bearer credential. Presented once, in relay_auth, to open a
+    ///connection; routing a frame additionally requires the sender's own route key, so holding
+    ///this does not let a peer route as anyone else. Absent with relay_url.
+    final String? relayToken;
+    
+    ///A phone-facing address for the relay the desktop hosts, e.g. wss://192.168.1.50:9529.
+    ///Always wss and never loopback: the plaintext listener is bound to 127.0.0.1 and carries
+    ///the bearer token in clear. Absent when the desktop has no relay enabled, has not started
+    ///it, or cannot determine a LAN address - absence is normal and must not be treated as an
+    ///error.
+    final String? relayUrl;
     final String? reason;
     final String? content;
     final String? mime;
@@ -115,7 +132,6 @@ class Protocol {
     final String? code;
     final dynamic message;
     final int? serverVersion;
-    final String? relayToken;
     
     ///Complete JSON message to forward
     ///
@@ -151,6 +167,9 @@ class Protocol {
         this.publicKey,
         this.token,
         this.hubDeviceId,
+        this.relayCertPin,
+        this.relayToken,
+        this.relayUrl,
         this.reason,
         this.content,
         this.mime,
@@ -203,7 +222,6 @@ class Protocol {
         this.code,
         this.message,
         this.serverVersion,
-        this.relayToken,
         this.payload,
         this.fromDeviceId,
         this.hmac,
@@ -229,6 +247,9 @@ class Protocol {
         publicKey: json["public_key"],
         token: json["token"],
         hubDeviceId: json["hub_device_id"],
+        relayCertPin: json["relay_cert_pin"],
+        relayToken: json["relay_token"],
+        relayUrl: json["relay_url"],
         reason: json["reason"],
         content: json["content"],
         mime: json["mime"],
@@ -281,7 +302,6 @@ class Protocol {
         code: json["code"],
         message: json["message"],
         serverVersion: json["server_version"],
-        relayToken: json["relay_token"],
         payload: Map.from(json["payload"]!).map((k, v) => MapEntry<String, dynamic>(k, v)),
         fromDeviceId: json["from_device_id"],
         hmac: json["hmac"],
@@ -307,6 +327,9 @@ class Protocol {
         "public_key": publicKey,
         "token": token,
         "hub_device_id": hubDeviceId,
+        "relay_cert_pin": relayCertPin,
+        "relay_token": relayToken,
+        "relay_url": relayUrl,
         "reason": reason,
         "content": content,
         "mime": mime,
@@ -359,7 +382,6 @@ class Protocol {
         "code": code,
         "message": message,
         "server_version": serverVersion,
-        "relay_token": relayToken,
         "payload": Map.from(payload!).map((k, v) => MapEntry<String, dynamic>(k, v)),
         "from_device_id": fromDeviceId,
         "hmac": hmac,

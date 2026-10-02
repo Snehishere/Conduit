@@ -19,22 +19,82 @@ use crate::error::ConduitError;
 /// Configuration for the per-client rate limiter.
 pub struct RateLimitConfig {
     /// Maximum messages allowed per window.
+    ///
+    /// A **transport** budget, charged once per inbound frame against the
+    /// connection's bucket — see [`TRANSPORT_MAX_MESSAGES`] for why this is not
+    /// the small number it looks like it should be, and
+    /// [`PerTypeRateLimiter`] for the budgets that are actually policy.
     pub max_messages: u32,
     /// Maximum *bytes* of inbound payload allowed per window, per client.
     ///
     /// A message-count limit alone is not a bandwidth limit: with
     /// [`MAX_MESSAGE_SIZE`] accepted per message, a peer sitting just under
     /// `max_messages` could still push gigabytes. This is the per-connection
-    /// byte counter that closes that gap.
+    /// byte counter that closes that gap — and it is the budget that bounds
+    /// CPU, so it is deliberately left alone by any change to `max_messages`.
     pub max_bytes: u64,
     /// Window length.
     pub window: Duration,
 }
 
+/// Messages per [`RateLimitConfig::window`] admitted from one socket, across
+/// **all** message types.
+///
+/// # What this budget is for
+///
+/// It is the *transport* ceiling, and it exists to bound the two things the
+/// per-type limiter never sees:
+///
+/// 1. Frames refused **before** a type is known — unparsable JSON, an
+///    unsupported protocol version, a failed HMAC, an unauthenticated
+///    `file/chunk`. These are charged one count each at the reader
+///    (`server::WsServer::admit_frame`) precisely so that a peer gets no free
+///    parse attempts, and this number is the ceiling on how many it may try.
+/// 2. Per-frame overhead for a peer that stays under it, however small its
+///    frames are.
+///
+/// It is deliberately **not** the policy for what a peer may send.
+/// [`PerTypeRateLimiter`] is that, and it is what keeps `pairing` at 5/min
+/// while admitting a 60/s screen mirror.
+///
+/// # Why it therefore cannot be small
+///
+/// That division only holds if this ceiling is at least the **sum** of the
+/// per-type budgets, over the same window. Otherwise the per-type budgets are
+/// dead code for exactly the types they were sized for — the global cap
+/// refuses first, and all the reasoning about `screen_mirror` vs `pairing`
+/// is describing a limiter that never runs.
+///
+/// | type | per-type budget | per second |
+/// |---|---|---|
+/// | `screen_mirror` | 120 / 1 s | 120 |
+/// | `audio` | 100 / 1 s | 100 |
+/// | `file` (chunks) | 3 000 / 60 s | 50 |
+/// | everything else | ≤ 100 / 10 s | ~16 |
+///
+/// = ~2 860 per 10 s window. This was `100` per 10 s — 10 msg/s, and half of
+/// that again because the frame was charged twice on its way through
+/// `server::WsServer::dispatch`. At ~5 msg/s every one of those three streams
+/// died within seconds: mirroring runs at 15–30 frames/s, audio at 10–50/s, and
+/// a 64 KiB-chunked file push at ~47/s.
+///
+/// 6 000 per 10 s ≈ 600 msg/s is roughly 2× that sum, so a peer saturating one
+/// streaming budget still has room for the others and it is the per-type budget
+/// — not this one — that ends a stream.
+///
+/// # What raising it does not cost
+///
+/// The bandwidth ceiling is [`RateLimitConfig::max_bytes`] and it is unchanged:
+/// 256 MiB / 10 s ≈ 25 MB/s, which is what actually bounds parse, HMAC and
+/// decrypt work. 600 frame parses per second is not a threat to a core, so the
+/// count ceiling widening from 10/s to 600/s does not widen the worst case a
+/// flooder can reach — a flooder spends bytes, and bytes are still capped.
+const TRANSPORT_MAX_MESSAGES: u32 = 6_000;
+
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            max_messages: 100,
+            max_messages: TRANSPORT_MAX_MESSAGES,
             // 256 MiB / 10 s ≈ 25 MB/s. Comfortably above the ~3 MB/s a
             // 64 KiB-chunk file transfer needs, and far below "sit under the
             // message cap and push until the process dies".
@@ -53,6 +113,20 @@ struct Bucket {
 /// Global per-client rate limiter — serves as a fallback cap across all message
 /// types for a single client.  Prevents any single client from flooding the
 /// server regardless of message type, in both message count and byte volume.
+///
+/// This is the **transport** budget and it is charged in exactly one place:
+/// once per inbound frame, in `server::WsServer::admit_frame`, keyed by the
+/// *connection* id. Two properties follow from that and both are load-bearing:
+///
+///  * **One frame costs one count.** It used to also be charged in
+///    `WsServer::dispatch`, against the same bucket, so every text frame cost
+///    two and the effective ceiling was half of `max_messages`.
+///  * **A frame that is later refused still costs.** The charge happens before
+///    the frame is parsed, so an unauthenticated or unparsable flood is bounded
+///    by this budget too. Charging only admitted messages would make it free.
+///
+/// The type-aware budgets are [`PerTypeRateLimiter`]'s job; this one is
+/// deliberately type-agnostic so a renamed type cannot buy a fresh budget.
 pub struct RateLimiter {
     buckets: Arc<RwLock<HashMap<String, Bucket>>>,
     config: RateLimitConfig,
@@ -81,6 +155,11 @@ impl RateLimiter {
 
     /// Account one inbound message of `bytes` bytes against `client_id`'s window
     /// and report whether it is within both the message cap and the byte cap.
+    ///
+    /// One call is one frame's whole charge: the count **and** the bytes are
+    /// incremented together, before the verdict is computed, so a refused frame
+    /// has still been paid for. Callers must therefore call this exactly once
+    /// per inbound frame — see [`Self`]'s doc comment.
     ///
     /// `msg_type` is accepted for symmetry with [`PerTypeRateLimiter`] and for
     /// future per-type budgets; the global cap is intentionally type-agnostic so
@@ -114,6 +193,22 @@ impl RateLimiter {
             .await
             .get(client_id)
             .map_or(0, |b| b.bytes)
+    }
+
+    /// Messages charged to `client_id` in the current window (test/diagnostic
+    /// use).
+    ///
+    /// This is what pins "one frame costs one count": the transport-budget
+    /// tests drive N frames through the reader and assert the bucket moved by
+    /// exactly N, which a second charge site anywhere in the path would make
+    /// 2N. `#[cfg(test)]` because nothing on a running desktop needs to ask.
+    #[cfg(test)]
+    pub async fn window_messages(&self, client_id: &str) -> u32 {
+        self.buckets
+            .read()
+            .await
+            .get(client_id)
+            .map_or(0, |b| b.count)
     }
 
     pub async fn remove_client(&self, client_id: &str) {
@@ -1945,6 +2040,127 @@ mod tests {
         assert!(
             cfg.max_bytes > 0,
             "the default limiter must cap bytes, not just messages"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Transport budget vs. per-type budgets
+    //
+    // `RateLimitConfig::max_messages` and `type_limit_for` are two layers, and
+    // the lower one silently deletes the upper one if it is the smaller number.
+    // These pin the arithmetic that keeps them compatible.
+    // -----------------------------------------------------------------------
+
+    /// `type_limit_for(ty)`'s ceiling expressed as messages per transport
+    /// window, so the two budgets can be compared without a unit conversion
+    /// being done by hand at each call site.
+    fn per_transport_window(ty: &str) -> u64 {
+        let per_type = type_limit_for(ty);
+        let window = RateLimitConfig::default().window;
+        per_type.max_messages as u64 * window.as_secs() / per_type.window.as_secs()
+    }
+
+    /// The transport ceiling must be at least the sum of the per-type ceilings,
+    /// or the per-type limiter is dead code for every streaming type.
+    ///
+    /// This is the assertion the old `100 / 10 s` failed: the streaming three
+    /// alone need 2 700 messages per 10 s (120/s mirror + 100/s audio + 50/s
+    /// chunks), so a 100-message global window refused every one of them
+    /// within the first second, whatever the per-type budgets said.
+    #[test]
+    fn the_transport_budget_covers_the_sum_of_the_per_type_budgets() {
+        let streaming = per_transport_window("screen_mirror")
+            + per_transport_window("audio")
+            + per_transport_window("file");
+        assert_eq!(
+            streaming, 2_700,
+            "the streaming arithmetic in TRANSPORT_MAX_MESSAGES; if a per-type \
+             budget moved, this number and that comment must move together"
+        );
+        let everything: u64 = [
+            "screen_mirror",
+            "audio",
+            "file",
+            "notification",
+            "clipboard",
+            "status",
+            "automation",
+            "pairing",
+            "anything_else",
+        ]
+        .iter()
+        .map(|ty| per_transport_window(ty))
+        .sum();
+
+        let cfg = RateLimitConfig::default();
+        assert!(
+            u64::from(cfg.max_messages) > streaming,
+            "the transport budget ({}) must exceed the streaming sum ({streaming}), \
+             or it — not the per-type limiter — decides when a stream ends",
+            cfg.max_messages
+        );
+        assert!(
+            u64::from(cfg.max_messages) > everything,
+            "the transport budget ({}) must exceed every per-type budget at once \
+             ({everything}), so saturating one type cannot starve the others",
+            cfg.max_messages
+        );
+    }
+
+    /// REGRESSION, stated as a throughput rather than as a budget: ten seconds
+    /// of screen mirroring at the documented peak (30 fps × 2 messages) has to
+    /// fit inside one transport window.
+    ///
+    /// The count is absolute on purpose — asserting against
+    /// `max_messages` would re-assert whatever is configured and this test
+    /// would keep passing at 100, which is the defect.
+    #[test]
+    fn ten_seconds_of_screen_mirroring_fits_one_transport_window() {
+        let cfg = RateLimitConfig::default();
+        let frames_at_peak = 60 * cfg.window.as_secs();
+        assert!(
+            u64::from(cfg.max_messages) >= frames_at_peak,
+            "a mirror sends ~60 frames/s for 10 s ({} frames); the transport \
+             window allows {}",
+            frames_at_peak,
+            cfg.max_messages
+        );
+    }
+
+    /// The same for a phone→desktop file push: ~47 chunks/s of 64 KiB for ten
+    /// seconds, which is what the byte budget is explicitly sized to admit.
+    #[test]
+    fn ten_seconds_of_file_pushes_fits_one_transport_window() {
+        let cfg = RateLimitConfig::default();
+        let chunks = 47 * cfg.window.as_secs();
+        assert!(
+            u64::from(cfg.max_messages) >= chunks,
+            "a 64 KiB-chunk push sends ~47/s for 10 s ({chunks} frames); the \
+             transport window allows {}",
+            cfg.max_messages
+        );
+    }
+
+    /// One call is one count, whatever the verdict: the bucket is charged before
+    /// the cap is consulted, which is what makes a refused frame cost the
+    /// attacker anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn limiter_charges_one_count_per_call_including_refused_ones() {
+        let limiter = byte_capped_limiter(3, 1_000_000);
+        for expected in 1..=3 {
+            assert!(limiter.check("c", "ping", 1).await);
+            assert_eq!(
+                limiter.window_messages("c").await,
+                expected,
+                "call {expected} must cost exactly one count"
+            );
+        }
+        assert!(!limiter.check("c", "ping", 1).await);
+        assert_eq!(
+            limiter.window_messages("c").await,
+            4,
+            "a refused frame must still be paid for, or an unauthenticated \
+             flood gets free parse attempts"
         );
     }
 

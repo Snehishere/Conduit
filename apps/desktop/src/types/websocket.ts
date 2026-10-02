@@ -88,6 +88,9 @@ export interface PairingAcceptMessage {
   device_info?: DeviceInfo;
   device_id?: string;
   hub_device_id?: string;
+  relay_url?: string;
+  relay_token?: string;
+  relay_cert_pin?: string;
 }
 
 export interface PairingRevokeMessage {

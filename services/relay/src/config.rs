@@ -478,7 +478,7 @@ impl Config {
         // way a self-hosted relay appears to work and then does not.
         let tls = match (o.tls_hostname, o.tls_extra_sans, o.tls_cert_dir) {
             (Some(hostname), extra, cert_dir) => crate::tls::TlsParams {
-                hostname: hostname.trim().to_string(),
+                hostname: usable_hostname(&hostname),
                 extra_sans: extra.unwrap_or_default(),
                 cert_dir: cert_dir.unwrap_or_else(|| {
                     std::env::var("RELAY_CERT_DIR")
@@ -495,8 +495,8 @@ impl Config {
                 let base = crate::tls::TlsParams::from_env();
                 crate::tls::TlsParams {
                     hostname: hostname
-                        .map(|h| h.trim().to_string())
-                        .filter(|h| !h.is_empty())
+                        .as_deref()
+                        .map(usable_hostname)
                         .unwrap_or(base.hostname),
                     extra_sans: extra.unwrap_or(base.extra_sans),
                     cert_dir: cert_dir.unwrap_or(base.cert_dir),
@@ -526,6 +526,32 @@ impl Config {
                 .filter(|p| !p.is_empty()),
         };
         Ok(config.with_derived_health_token())
+    }
+}
+
+/// The name a generated certificate has to be valid for, or the default when
+/// the host supplied nothing usable.
+///
+/// An empty hostname is not a name, and it is not harmless either.
+/// [`crate::tls::TlsParams::subject_alt_names`] puts this value at the head of
+/// the SAN list unconditionally, so an empty one produced a zero-length
+/// `dNSName` *and* displaced `localhost` — leaving a certificate valid for
+/// nothing at all, which every real client refuses. This arm of the resolver
+/// did not filter it, so "leave it empty to mean localhost" only worked if
+/// every host remembered to spell that out; the desktop, whose `relay_hostname`
+/// setting defaults to empty, did not.
+///
+/// So an empty or whitespace-only hostname resolves to the same default the
+/// environment path and [`crate::tls::TlsParams::default`] use. Fail-safe in
+/// the direction that matters: the alternative is a certificate no client can
+/// verify, which fails closed at the handshake instead of quietly serving
+/// something unusable.
+fn usable_hostname(hostname: &str) -> String {
+    let trimmed = hostname.trim();
+    if trimmed.is_empty() {
+        crate::tls::TlsParams::default().hostname
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -1080,5 +1106,115 @@ mod config_tests {
             rendered.contains("9528"),
             "non-secret values must stay readable: {rendered}"
         );
+    }
+
+    // ---------------------------------------------------------------
+    //  An empty TLS hostname must not become a zero-length SAN
+    // ---------------------------------------------------------------
+
+    /// The bug this closes: the `(Some(hostname), …)` arm took the value
+    /// verbatim, and `TlsParams::subject_alt_names` puts it at the head of the
+    /// SAN list unconditionally. A host that passes `Some(String::new())` —
+    /// which is exactly what the desktop did with its default `relay_hostname`
+    /// — therefore got `["", "127.0.0.1", "::1"]`: a zero-length `dNSName` and
+    /// no `localhost`, so the generated certificate verified against nothing.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_tls_hostname_still_yields_a_certificate_valid_for_localhost() {
+        with_env_snapshot(|| {
+            unsafe {
+                std::env::set_var("RELAY_TOKEN", STRONG_TOKEN);
+                std::env::set_var("HMAC_SECRET", STRONG_SECRET);
+            }
+
+            for empty in ["", "   ", "\t"] {
+                let cfg = Config::resolve(Some(Overrides {
+                    tls_hostname: Some(empty.to_string()),
+                    tls_cert_dir: Some(PathBuf::from("./certs")),
+                    ..Overrides::default()
+                }))
+                .expect("an empty hostname is not a config error; it means the default");
+
+                assert_eq!(
+                    cfg.tls.hostname, "localhost",
+                    "{empty:?} must resolve to the documented default, not to itself"
+                );
+                let sans = cfg.tls.subject_alt_names();
+                assert!(
+                    sans.contains(&"localhost".to_string()),
+                    "the certificate must be valid for localhost: {sans:?}"
+                );
+                assert!(
+                    !sans.iter().any(|s| s.is_empty()),
+                    "a zero-length dNSName is what broke certificate verification: {sans:?}"
+                );
+            }
+        });
+    }
+
+    /// The counterpart: a hostname an operator *did* set still reaches the
+    /// certificate. Filtering the empty case must not become filtering
+    /// everything.
+    #[test]
+    #[serial_test::serial]
+    fn a_configured_tls_hostname_reaches_the_certificate_unchanged() {
+        with_env_snapshot(|| {
+            unsafe {
+                std::env::set_var("RELAY_TOKEN", STRONG_TOKEN);
+                std::env::set_var("HMAC_SECRET", STRONG_SECRET);
+                // A stray environment value must not shadow the host's own.
+                std::env::set_var("RELAY_TLS_HOSTNAME", "environment.example.com");
+            }
+
+            let cfg = Config::resolve(Some(Overrides {
+                tls_hostname: Some(" relay.example.com ".to_string()),
+                tls_cert_dir: Some(PathBuf::from("./certs")),
+                ..Overrides::default()
+            }))
+            .expect("resolve");
+
+            assert_eq!(
+                cfg.tls.hostname, "relay.example.com",
+                "the host's own setting must win over the environment, trimmed"
+            );
+            assert!(
+                cfg.tls
+                    .subject_alt_names()
+                    .contains(&"relay.example.com".to_string()),
+                "the name the relay is reached by must be in its certificate"
+            );
+            assert!(
+                !cfg.tls
+                    .subject_alt_names()
+                    .contains(&"environment.example.com".to_string()),
+                "the environment is a fallback for values the host did not pin, not an override"
+            );
+        });
+    }
+
+    /// The same guarantee has to hold on the fallback path: with no
+    /// `tls_hostname` at all the resolver mixes the environment in with the
+    /// host's other TLS fields, and a whitespace-only `RELAY_TLS_HOSTNAME`
+    /// must not slip through that arm either.
+    #[test]
+    #[serial_test::serial]
+    fn an_empty_environment_hostname_cannot_produce_an_empty_san_either() {
+        with_env_snapshot(|| {
+            unsafe {
+                std::env::set_var("RELAY_TOKEN", STRONG_TOKEN);
+                std::env::set_var("HMAC_SECRET", STRONG_SECRET);
+                std::env::set_var("RELAY_TLS_HOSTNAME", "   ");
+            }
+
+            let cfg = Config::resolve(Some(Overrides {
+                // `tls_cert_dir` is set, so this takes the partial arm.
+                tls_cert_dir: Some(PathBuf::from("./certs")),
+                ..Overrides::default()
+            }))
+            .expect("resolve");
+
+            assert_eq!(cfg.tls.hostname, "localhost");
+            assert!(!cfg.tls.subject_alt_names().iter().any(String::is_empty));
+        });
     }
 }

@@ -36,7 +36,7 @@
 library;
 
 import 'dart:convert';
-import 'dart:math' show Random;
+import 'dart:math' show Random, min;
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
@@ -235,6 +235,70 @@ const int binaryHeaderLen = binaryTagOffset + binaryTagLen; // 53
 /// Separator between the sender id and the frame in the MAC input.
 const int binaryMacSeparator = 0x1f;
 
+/// The 16 wire bytes that name [deviceId] in a v2 binary frame.
+///
+/// **The rule, in one sentence:** the first [binaryDeviceIdLen] bytes of the
+/// id's UTF-8 encoding, NUL-padded — no hashing, no case folding, no
+/// separators removed, no length field.
+///
+/// Byte-for-byte the Dart counterpart of
+/// `conduit_protocol::binary_target_field`
+/// (`packages/protocol/src/types.rs`), which is the *only* definition of those
+/// bytes: the desktop's `build_binary_frame`, the relay's router, this phone's
+/// [buildBinaryFrame] and this phone's [binaryTargetMatches] all call it, so
+/// the four parties cannot disagree about what the field means.
+///
+/// Truncation is by **byte**, not by character, so an id whose UTF-8 encoding
+/// straddles byte 16 is split mid-character — the same result the Rust function
+/// produces, deliberately.
+///
+/// Every device id this protocol produces is a 36-character UUID, so a real
+/// frame's field is a *prefix*: `550e8400-e29b-41` for
+/// `550e8400-e29b-41d4-a716-446655440000`. The shorter spellings §4.1 still
+/// allows (`b145d`, `device-1`) are carried whole and NUL-padded. See
+/// `PROTOCOL.md` §5.1.4 for why a prefix, and §5.1.5 for how the relay resolves
+/// one to exactly one device.
+Uint8List binaryTargetField(String deviceId) {
+  final bytes = utf8.encode(deviceId);
+  final n = min(bytes.length, binaryDeviceIdLen);
+  final field = Uint8List(binaryDeviceIdLen);
+  field.setRange(0, n, bytes);
+  return field;
+}
+
+/// Whether [field] — the 16 target bytes exactly as they arrived — names
+/// [deviceId].
+///
+/// The receiver-side identity check, and the same predicate the relay's router
+/// and the desktop's `unwrap_relay_binary_frame` apply. Byte-for-byte the Dart
+/// counterpart of `conduit_protocol::binary_target_matches`: a field is a
+/// device's name if and only if it equals that device's [binaryTargetField],
+/// compared over all 16 bytes including the NUL padding.
+///
+/// Two consequences that the previous `targetId == _deviceId` comparison got
+/// backwards, and that the Rust side's comment calls out explicitly:
+///
+/// * Equality on the canonical field, not a substring test. `device-1`'s field
+///   does not match `device-10` — the padding is what tells them apart — and a
+///   frame naming `device-1` does not match a longer id that merely begins with
+///   it.
+/// * A field *shorter* than [binaryDeviceIdLen] matches nothing at all, so a
+///   truncated or strict-prefix field is refused rather than treated as a
+///   partial match.
+///
+/// Compared without early exit, like the Rust original. Nothing secret is on
+/// either side of this — a frame's target is public to everyone the relay
+/// routes between — so timing is not the reason; it is one loop either way.
+bool binaryTargetMatches(String deviceId, List<int> field) {
+  if (field.length != binaryDeviceIdLen) return false;
+  final expected = binaryTargetField(deviceId);
+  var diff = 0;
+  for (var i = 0; i < binaryDeviceIdLen; i++) {
+    diff |= expected[i] ^ field[i];
+  }
+  return diff == 0;
+}
+
 /// The exact byte string a binary frame's tag is computed over.
 Uint8List binaryMacInput(String fromDeviceId, List<int> headerAndPayload) {
   final idBytes = utf8.encode(fromDeviceId);
@@ -268,13 +332,17 @@ Uint8List buildBinaryFrame({
   final frame = Uint8List(binaryHeaderLen + payload.length);
   frame[0] = binaryFrameVersion;
 
-  // The 16-byte field truncates a longer id. A real device id fits, and a
-  // truncated id simply will not resolve on the far side.
-  final targetBytes = utf8.encode(targetDeviceId);
-  final n = targetBytes.length < binaryDeviceIdLen
-      ? targetBytes.length
-      : binaryDeviceIdLen;
-  frame.setRange(1, 1 + n, targetBytes.sublist(0, n));
+  // The target field is the canonical prefix of the full id, so an over-long id
+  // is *canonicalised*, not rejected: the field holds its first 16 bytes, the
+  // tag covers exactly those bytes, and the relay resolves them back to one
+  // connected device. [binaryTargetField] is the single definition of those
+  // bytes, shared with the relay's router and with this phone's own identity
+  // check, so the producer and the receiver cannot drift apart. See
+  // `PROTOCOL.md` §5.1.4 for the field and §5.1.5 for the relay's resolution:
+  // it forwards only when exactly one connected device has that field, and
+  // drops the frame when none or two do.
+  final targetField = binaryTargetField(targetDeviceId);
+  frame.setRange(1, 1 + binaryDeviceIdLen, targetField);
 
   final seqBytes = ByteData(4)..setUint32(0, sequence[0], Endian.big);
   frame.setRange(
@@ -299,13 +367,30 @@ Uint8List buildBinaryFrame({
 /// A parsed, not-yet-verified v2 binary frame.
 class BinaryFrame {
   const BinaryFrame({
+    required this.targetField,
     required this.targetId,
     required this.sequence,
     required this.payload,
     required this.tag,
   });
 
-  /// The recipient device id, zero-padding stripped.
+  /// The 16 target bytes exactly as they arrived, NUL padding included.
+  ///
+  /// This, not [targetId], is what an identity check must compare: see
+  /// [binaryTargetMatches]. The bytes are kept rather than re-derived from
+  /// [targetId] because reading them back is lossy in one direction — a field
+  /// that is not valid UTF-8 (a producer splitting a multi-byte character at
+  /// byte 16) decodes with replacement characters rather than failing, so the
+  /// parsed id can name bytes the field never carried.
+  final Uint8List targetField;
+
+  /// The recipient device id as it reads, zero-padding stripped.
+  ///
+  /// For logs and error messages only. It is a *prefix* of the full id whenever
+  /// that id is longer than 16 bytes, which for every real device it is, so
+  /// comparing it against a full device id refuses every correctly-addressed
+  /// frame. Mirrors `conduit_protocol::parse_binary_target_field`, which is the
+  /// one place the padding is stripped.
   final String targetId;
 
   /// The per-connection frame counter, for replay detection.
@@ -335,7 +420,8 @@ BinaryFrame parseBinaryFrame(Uint8List frame) {
   }
 
   final idField = frame.sublist(1, 1 + binaryDeviceIdLen);
-  // NUL is the padding, not part of the id.
+  // NUL is the padding, not part of the id. Kept for `targetId`; `targetField`
+  // keeps the padding, because that is what the identity check compares.
   var end = idField.length;
   while (end > 0 && idField[end - 1] == 0) {
     end--;
@@ -349,6 +435,7 @@ BinaryFrame parseBinaryFrame(Uint8List frame) {
   ).getUint32(0, Endian.big);
 
   return BinaryFrame(
+    targetField: Uint8List.fromList(idField),
     targetId: targetId,
     sequence: sequence,
     tag: Uint8List.fromList(

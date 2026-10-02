@@ -157,6 +157,16 @@ pub struct PairingRequest {
 /// secret by that field when it opens the envelope. A peer that does not know
 /// its own id cannot send a single encrypted frame. This is optional on the
 /// wire so a pre-existing peer keeps parsing; the desktop always sets it.
+///
+/// [`PairingAccept::relay_url`], [`PairingAccept::relay_token`] and
+/// [`PairingAccept::relay_cert_pin`] describe the relay the *sender* hosts, for
+/// a peer that is on a different network and cannot reach the desktop directly.
+/// They are the desktop's own knowledge — the address it listens on, the bearer
+/// token it generated, and the pin of the certificate the relay itself serves —
+/// so the peer cannot derive any of them and has to be told. All three are
+/// optional and **absence is normal**: a sender that does not host a relay, or
+/// whose relay is not running, omits them, and the peer keeps whatever relay
+/// configuration it already had.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PairingAccept {
     #[serde(rename = "type")]
@@ -186,6 +196,32 @@ pub struct PairingAccept {
     /// chunk, so it would have to drop every one of them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hub_device_id: Option<String>,
+    /// `wss://` URL of the relay this desktop hosts, for a peer that cannot
+    /// reach the desktop directly.
+    ///
+    /// It names the **TLS** listener on the **relay** port, never the
+    /// loopback-only plaintext listener the desktop uses to join its own relay:
+    /// a peer is on another machine, so the plaintext listener is unreachable
+    /// and carries the bearer token in the clear. The host is the sender's
+    /// configured relay hostname when it has one, and its LAN address
+    /// otherwise — never a loopback address, which a peer can never dial.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Bearer token this relay's clients present during `relay_auth`.
+    ///
+    /// Generated and stored by the desktop, so the peer cannot derive it. It is
+    /// only ever sent to a peer that has just presented a valid one-time pairing
+    /// token, i.e. one that completed pairing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_token: Option<String>,
+    /// `sha256/<base64>` SPKI pin of the certificate **the relay** serves.
+    ///
+    /// The relay generates its own TLS material, so this is not the hub's pin
+    /// and must not be stored in the slot a receiver keeps for the hub's: a
+    /// peer that accepted it for the hub would pin the wrong certificate
+    /// everywhere else. `None` when the relay serves no certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_cert_pin: Option<String>,
 }
 
 /// `type: "pairing", action: "revoke"`
@@ -2507,6 +2543,9 @@ mod tests {
             device_info: None,
             device_id: None,
             hub_device_id: None,
+            relay_url: None,
+            relay_token: None,
+            relay_cert_pin: None,
         };
         let restored = roundtrip(&msg);
         assert_eq!(restored.public_key, "ccdd");
@@ -2527,6 +2566,9 @@ mod tests {
             }),
             device_id: Some("assigned-1".into()),
             hub_device_id: Some("hub-1".into()),
+            relay_url: None,
+            relay_token: None,
+            relay_cert_pin: None,
         };
         let restored = roundtrip(&msg);
         assert_eq!(restored.device_info.unwrap().os, Some("macos".into()));
@@ -2536,6 +2578,90 @@ mod tests {
         // So does the hub's own id: without it the peer cannot derive the key
         // that verifies a relayed frame, and drops every one of them.
         assert_eq!(restored.hub_device_id.as_deref(), Some("hub-1"));
+    }
+
+    /// The three relay fields are new, and an already-shipped peer deserialises
+    /// `PairingAccept` with a fixed field list. Absence — not an empty string —
+    /// has to be a valid frame, or every pairing with an older peer breaks.
+    #[test]
+    fn pairing_accept_without_the_relay_fields_still_deserialises() {
+        let restored: PairingAccept =
+            serde_json::from_str(r#"{"type":"pairing","action":"accept","public_key":"aabb"}"#)
+                .expect("an accept from a peer that predates the relay fields must still parse");
+
+        assert_eq!(restored.public_key, "aabb");
+        assert_eq!(restored.relay_url, None);
+        assert_eq!(restored.relay_token, None);
+        assert_eq!(restored.relay_cert_pin, None);
+    }
+
+    /// …and they must not appear at all when they are absent. `null` is not the
+    /// same thing: a client that reads `message['relay_url']` and hands it
+    /// straight to `Uri.parse` gets a different failure than one that finds the
+    /// key missing and keeps what it had.
+    #[test]
+    fn the_relay_fields_are_omitted_rather_than_null() {
+        let json = serde_json::to_value(PairingAccept {
+            msg_type: "pairing".into(),
+            action: "accept".into(),
+            protocol_version: None,
+            public_key: "aabb".into(),
+            device_info: None,
+            device_id: None,
+            hub_device_id: None,
+            relay_url: None,
+            relay_token: None,
+            relay_cert_pin: None,
+        })
+        .expect("serializes");
+        let object = json.as_object().expect("an accept frame is an object");
+        for field in ["relay_url", "relay_token", "relay_cert_pin"] {
+            assert!(
+                !object.contains_key(field),
+                "{field} must be omitted when absent, not serialised as null: {json}"
+            );
+        }
+    }
+
+    /// The other direction: a desktop that *does* host a relay has to be able to
+    /// say so, and all three values have to survive the wire intact. Dropping
+    /// the token or the pin here is exactly the bug this feature exists to fix —
+    /// the peer would have a URL it cannot authenticate to.
+    #[test]
+    fn pairing_accept_roundtrips_the_relay_fields() {
+        let msg = PairingAccept {
+            msg_type: "pairing".into(),
+            action: "accept".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            public_key: "aabb".into(),
+            device_info: None,
+            device_id: Some("assigned-1".into()),
+            hub_device_id: Some("hub-1".into()),
+            relay_url: Some("wss://192.168.1.50:9529".into()),
+            relay_token: Some("0123456789abcdef".into()),
+            relay_cert_pin: Some("sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into()),
+        };
+
+        let restored = roundtrip(&msg);
+        assert_eq!(
+            restored.relay_url.as_deref(),
+            Some("wss://192.168.1.50:9529")
+        );
+        assert_eq!(restored.relay_token.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(
+            restored.relay_cert_pin.as_deref(),
+            Some("sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        );
+
+        // The URL must not have absorbed the hub's own port or been rewritten
+        // to the plaintext listener: it is the one a peer on another network
+        // dials.
+        let json = serde_json::to_value(&msg).expect("serializes");
+        assert_eq!(json["relay_url"], "wss://192.168.1.50:9529");
+        assert!(
+            json.get("relay_token").and_then(|v| v.as_str()) == Some("0123456789abcdef"),
+            "the token must be present when it is Some"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -5630,6 +5756,9 @@ mod tests {
                     device_info: None,
                     device_id: None,
                     hub_device_id: None,
+                    relay_url: None,
+                    relay_token: None,
+                    relay_cert_pin: None,
                 })
                 .unwrap(),
             ),

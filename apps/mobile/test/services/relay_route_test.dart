@@ -710,6 +710,239 @@ void main() {
     });
   });
 
+  // -------------------------------------------------------------------------
+  //  `binaryTargetField` / `binaryTargetMatches` — this phone's half of the
+  //  contract in `conduit_protocol::binary_target_field` /
+  //  `binary_target_matches`.
+  //
+  //  The receiver used to compare the *parsed* target against its own full
+  //  36-character id, which is never equal, so it dropped every frame the relay
+  //  had correctly routed to it. These pin the replacement: canonical 16 bytes,
+  //  compared over all of them, NUL padding included.
+  // -------------------------------------------------------------------------
+
+  /// A 36-character UUID — the shape of every real device id, and therefore the
+  /// shape whose field is always a *prefix*.
+  const uuid36 = '550e8400-e29b-41d4-a716-446655440000';
+
+  /// A second UUID agreeing with [uuid36] on its first 16 characters.
+  const uuid36Twin = '550e8400-e29b-41d4-b716-446655440000';
+
+  group('binaryTargetField', () {
+    Uint8List addressedTo(String target) => buildBinaryFrame(
+      routeKey: deriveRouteKey(
+        EncryptionService.hexToBytes(vectorSecret),
+        'deadbeef',
+      ),
+      fromDeviceId: 'deadbeef',
+      targetDeviceId: target,
+      sequence: Uint32List.fromList([1]),
+      payload: utf8.encode('x'),
+    );
+
+    test('is the first 16 bytes of the id, NUL-padded', () {
+      expect(binaryTargetField(uuid36), ascii.encode('550e8400-e29b-41'));
+      // A short id is carried whole, and the field is still 16 bytes wide, so
+      // the padding is part of the value rather than absent.
+      expect(binaryTargetField('b145d'), hasLength(binaryDeviceIdLen));
+      expect(
+        binaryTargetField('b145d'),
+        [
+          ...ascii.encode('b145d'),
+          ...List<int>.filled(binaryDeviceIdLen - 'b145d'.length, 0),
+        ],
+      );
+      expect(
+        List<int>.from(binaryTargetField('b145d')).skip('b145d'.length),
+        everyElement(0),
+        reason: 'a 5-byte id is followed by 11 NULs of padding',
+      );
+    });
+
+    test('is always 16 bytes wide, whatever the id', () {
+      for (final id in ['', 'b', uuid36, 'x' * 40, 'ünïcödé-device-id']) {
+        expect(
+          binaryTargetField(id),
+          hasLength(binaryDeviceIdLen),
+          reason: 'id ${id.length} bytes',
+        );
+      }
+    });
+
+    test('truncates by byte, not by character', () {
+      // `é` is two bytes, so the eighth character starts at byte 14 and is cut
+      // in half at byte 16. The Rust function does the same, because it slices
+      // `device_id.as_bytes()` rather than a list of characters.
+      final field = binaryTargetField('é' * 9);
+      expect(field, hasLength(binaryDeviceIdLen));
+      expect(field.sublist(0, 14), utf8.encode('é' * 7));
+      expect(field[14], 0xC3, reason: 'the first byte of the 8th character');
+      expect(field[15], 0xA9, reason: 'the second, and the last, byte');
+    });
+
+    test('is the same definition the producer writes into a frame', () {
+      // `buildBinaryFrame` must not carry a second copy of this rule: two
+      // implementations of one wire field is how the producer and the receiver
+      // would come to disagree about what 16 bytes mean.
+      for (final target in [
+        uuid36,
+        'device-1',
+        'device-10',
+        'b145d',
+        'z' * 20,
+      ]) {
+        expect(
+          addressedTo(target).sublist(1, 1 + binaryDeviceIdLen),
+          binaryTargetField(target),
+          reason: 'producer and canonical field disagree for $target',
+        );
+      }
+    });
+  });
+
+  group('binaryTargetMatches', () {
+    const uuid = uuid36;
+    const twin = uuid36Twin;
+    const hub = 'cafebabe-dead-beef-cafe-babe-cafebabe';
+
+    test('accepts a field carrying this device\'s own id', () {
+      // The case that fails with `targetId == deviceId`: the parsed target is
+      // the 16-byte prefix, the id is 36 characters, and the two can never be
+      // equal.
+      expect(binaryTargetMatches(uuid, binaryTargetField(uuid)), isTrue);
+
+      final frame = buildBinaryFrame(
+        routeKey: deriveRouteKey(
+          EncryptionService.hexToBytes(vectorSecret),
+          'deadbeef',
+        ),
+        fromDeviceId: 'deadbeef',
+        targetDeviceId: uuid,
+        sequence: Uint32List.fromList([1]),
+        payload: utf8.encode('x'),
+      );
+      final parsed = parseBinaryFrame(frame);
+      expect(
+        parsed.targetId,
+        isNot(uuid),
+        reason: 'which is exactly why the comparison has to be on the bytes',
+      );
+      expect(binaryTargetMatches(uuid, parsed.targetField), isTrue);
+    });
+
+    test('rejects another device\'s field', () {
+      expect(binaryTargetMatches(uuid, binaryTargetField(hub)), isFalse);
+      expect(binaryTargetMatches(hub, binaryTargetField(uuid)), isFalse);
+      expect(binaryTargetMatches(uuid, binaryTargetField('b145d')), isFalse);
+      expect(binaryTargetMatches('b145d', binaryTargetField(uuid)), isFalse);
+      expect(
+        binaryTargetMatches(uuid, binaryTargetField(twin)),
+        isTrue,
+        reason: 'but a twin sharing all 16 bytes is indistinguishable on the '
+            'wire, which is the relay\'s ambiguity case to refuse, not ours',
+      );
+    });
+
+    test('accepts a short id on its own whole field', () {
+      expect(binaryTargetMatches('b145d', binaryTargetField('b145d')), isTrue);
+      expect(binaryTargetMatches('phone-1', binaryTargetField('phone-1')),
+          isTrue);
+    });
+
+    test('does not let `device-1` match `device-10`', () {
+      // Both are carried whole, so the NUL padding is the only thing that
+      // separates them — which is why the padding must be compared.
+      expect(
+        binaryTargetMatches('device-1', binaryTargetField('device-10')),
+        isFalse,
+      );
+      expect(
+        binaryTargetMatches('device-10', binaryTargetField('device-1')),
+        isFalse,
+      );
+      expect(binaryTargetMatches('device-1', binaryTargetField('device-1')),
+          isTrue);
+      expect(
+        binaryTargetMatches('device-10', binaryTargetField('device-10')),
+        isTrue,
+      );
+    });
+
+    test('does not let a shorter id match a longer one with that start', () {
+      // `b145d` is a whole id carried in a padded field; a field naming it must
+      // not be accepted by a device whose id merely begins with those bytes.
+      expect(
+        binaryTargetMatches('b145d-longer-device', binaryTargetField('b145d')),
+        isFalse,
+        reason: 'the field is not this device\'s own canonical field',
+      );
+      expect(
+        binaryTargetMatches(
+          'b145d-longer-device-id-that-is-long',
+          binaryTargetField('b145d'),
+        ),
+        isFalse,
+      );
+    });
+
+    test('rejects a field that is a strict prefix of our own id', () {
+      // The phone must compare the whole 16-byte field, never a prefix of it: a
+      // field short of 16 bytes names no device at all, and a field holding
+      // only the first 8 bytes of this id is not this device either.
+      expect(
+        binaryTargetMatches(uuid, ascii.encode('550e8400')),
+        isFalse,
+      );
+      expect(
+        binaryTargetMatches(uuid, binaryTargetField(uuid.substring(0, 8))),
+        isFalse,
+      );
+      expect(
+        binaryTargetMatches(uuid, ascii.encode('550e8400-e29b-41d')),
+        isFalse,
+        reason: '15 bytes is still not the canonical 16-byte field',
+      );
+    });
+
+    test('rejects a field longer or shorter than 16 bytes', () {
+      final field = binaryTargetField(uuid);
+      expect(binaryTargetMatches(uuid, field.sublist(0, 15)), isFalse);
+      expect(binaryTargetMatches(uuid, [...field, 0]), isFalse);
+      expect(binaryTargetMatches(uuid, const []), isFalse);
+    });
+
+    test('rejects an all-NUL field for every real id', () {
+      expect(binaryTargetMatches(uuid, List<int>.filled(16, 0)), isFalse);
+      expect(binaryTargetMatches('b145d', List<int>.filled(16, 0)), isFalse);
+    });
+
+    test('mirrors `binary_target_matches` on the Rust side', () {
+      // The whole set of properties `packages/protocol/src/types.rs` pins for
+      // `binary_target_matches` at the same ids, so the two cannot drift.
+      expect(binaryTargetMatches(uuid, binaryTargetField(uuid)), isTrue);
+      expect(binaryTargetMatches(twin, binaryTargetField(uuid)), isTrue);
+      expect(binaryTargetMatches(uuid, binaryTargetField(twin)), isTrue);
+      expect(binaryTargetMatches(uuid, binaryTargetField(hub)), isFalse);
+      expect(binaryTargetMatches(hub, binaryTargetField(uuid)), isFalse);
+      expect(
+        binaryTargetMatches(hub, binaryTargetField('device-1')),
+        isFalse,
+      );
+      expect(
+        binaryTargetMatches('device-1', binaryTargetField('device-1')),
+        isTrue,
+      );
+      expect(
+        binaryTargetMatches('device-1', binaryTargetField('device-10')),
+        isFalse,
+      );
+      expect(
+        binaryTargetMatches('device-10', binaryTargetField('device-1')),
+        isFalse,
+      );
+    });
+  });
+
   group('field offsets', () {
     test('match the Rust constants exactly', () {
       // A drift here silently produces frames the relay misparses.
