@@ -332,6 +332,32 @@ where the drift actually is. The items below are that drift.
   desktop, so `apps/mobile/lib/services/automation_service.dart:178` and
   `main.dart:290-295` are unreachable.
 
+- [x] **W1.17 (RESOLVED)** A routed `error` had no client requirement, so the
+  phone received one and dropped it. **Fixed on both sides**, and the desktop
+  half had to land first or the client half would have had nothing to receive.
+
+  The gap was invisible because a LAN refusal and a relayed refusal are the same
+  `error` frame on the wire and arrive by different routes. On the LAN the phone's
+  socket-level listener sees a bare `type: "error"` and returns. Through the
+  relay the *outer* type is `relay_delivery`, so that listener never sees it: the
+  frame reaches `_handleMessage`, which had no `error` arm and fell through to
+  `_messageHandlers['error']` — which no caller registers. So a phone behind the
+  relay was throttled, refused, and told nothing, while still reporting itself
+  connected.
+
+  `relay_delivery` has never been documented in `PROTOCOL.md` — it is a
+  relay-produced envelope (`packages/protocol/src/types.rs`, produced only after
+  `handle_relay_route` returns `Ok`) and the spec has no section for it at all.
+  §9.2 of `PROTOCOL.md` now carries the requirement in words: **a client must
+  handle `error` inside `relay_delivery`, after unwrapping, whether the payload
+  arrived sealed or in the clear.** `pairing` is exempt from sealing because it is
+  what establishes the secret, so a refusal about pairing arrives unwrapped and a
+  refusal about anything else arrives sealed; both shapes are live and both are
+  pinned.
+
+  Implementation is W2.27. The desktop egress that made a routed refusal
+  possible at all is W3.27.
+
 ---
 
 ## W2 — Mobile client
@@ -375,6 +401,13 @@ where the drift actually is. The items below are that drift.
   `relay_route` — the auth boundary, and a design decision rather than a fix.
   Pinned as a known gap by
   `known_gap_a_relay_only_target_cannot_be_asked_to_start`.
+  > **Narrowed by W3.25, still open.** `fan_out_to_relay` now reaches every
+  > paired device with no socket here, so anything the desktop *originates* —
+  > including the `screen_mirror/frame` the viewer would then be receiving —
+  > arrives. What is still missing is the **directed request**: `start` is
+  > addressed to a device, and `resolve_target_client` still resolves it against
+  > a connection map. The gap test above is untouched by that change and still
+  > describes the code.
   Android capture still lives in an activity rather than
   `ConduitForegroundService`, so an Android rotation still ends mirroring
   (`MainActivity.kt:634, 643-649`).
@@ -607,6 +640,35 @@ where the drift actually is. The items below are that drift.
   (`automation_service.dart:84`), `for (var i = 0; i < 10000; i++)`
   (`file_service.dart:481`). Hoist to named constants.
 
+- [x] **W2.27 (RESOLVED)** The phone had no `error` arm on the relayed path, so
+  a refusal sent through the relay was received and silently dropped. **Fixed.**
+  Desktop side: W3.27. Client requirement: W1.17.
+
+  `websocket_service.dart` already handled a bare `error` (C-F9, `da66802`) — but
+  only the socket-level listener does, and that listener never sees a relayed
+  frame. The relay wraps **every** payload it forwards in `relay_delivery`, so a
+  refusal the desktop routes back arrives as `relay_delivery` → unwrap →
+  `_handleMessage`, which then looked the type up in `_messageHandlers` and found
+  nothing registered for it. A phone behind the relay was therefore throttled,
+  refused, and told nothing: no screen, no log, still `connected: true` — which
+  is indistinguishable from a dropped socket.
+
+  The new `type == 'error'` arm sits in `_handleMessage`
+  (`websocket_service.dart:1253`) rather than in either unwrap helper, because
+  that is the single funnel every *inner* message passes through —
+  `_handleAttributed` for an unwrapped payload and `_handleEncrypted` for a
+  sealed one. An arm in either would cover one path and miss the other, and the
+  two are not redundant: the desktop seals its ordinary outbound traffic
+  (everything except `pairing`), so which shape carries a given refusal depends
+  on what the refusal is about.
+
+  4 tests, all driving the real `WebSocketService` over a real socket: unwrap +
+  decrypt + dispatch of a relayed `clipboard/sync` (the desktop's fan-out seen
+  from the far end), a **sealed** `error` with `code: "rate_limited"` surfacing
+  in `lastError`, an **unsealed** `error` with `code: "not_authenticated"` doing
+  the same, and the attribution of the frame to the sender the relay
+  authenticated rather than the self-reported `source_device` inside the payload.
+
 ---
 
 ## W3 — Desktop backend
@@ -697,15 +759,20 @@ where the drift actually is. The items below are that drift.
   *"should be unreachable"* — this is the assumption that is violated.
   *Left to do:* replace all three loops with `broadcast_to_others`.
 
-- [ ] **W3.3 (HIGH)** `handlers/files.rs:66-75` has the same bypass plus a
+- [ ] **W3.3 (HIGH)** `handlers/files.rs:197-206` has the same bypass plus a
   device-id/connection-id confusion. The `to.is_empty()` branch is unfiltered,
   so unpaired sockets receive `file/request` (filenames, sizes, MIME types);
   and `clients_lock.get(to)` treats `to` — a stable *device* id
   (`types.rs:289-291`) — as a per-connection UUID (`server/mod.rs:241`), so a
   targeted file request delivers nothing. The same class of bug is documented as
-  fixed in `WsServer::send_to` (`server/mod.rs:948-977`).
+  fixed in `WsServer::send_to` (`server/mod.rs:1368-1432`).
   *Left to do:* use `broadcast_to_others` for the empty case; resolve `to`
   through `ws_to_device_id` as `send_to` already does.
+  > **⚠ CITATIONS HAVE MOVED, AND ONE WAS ON THE WRONG FUNCTION.** The entry said
+  > `handlers/files.rs:66-75`, which by `e6ca781` was the candidate-sender
+  > enumeration inside `unwrap_relay_binary_frame` — the function W3.28 is about
+  > — and `server/mod.rs:948-977` for `send_to`, which is now at `:1368`. Both
+  > had drifted before this round; the lines above are re-read.
 
 - [ ] **W3.4 (HIGH)** Migrations are executed from the filesystem at startup.
   `storage.rs:299-339` scans `manifest_dir/src/migrations`,
@@ -843,6 +910,362 @@ where the drift actually is. The items below are that drift.
   requests those capabilities. On macOS 14+ both audio capture and screen
   capture fail silently behind a `warn!`. `tauri.conf.json:50` also names
   `./Entitlements.plist` while the file is `entitlements.plist`.
+
+- [x] **W3.25 (RESOLVED — HIGH, found by the cross-platform audit)** No fan-out
+  reached a relay-only peer. **Fixed**, and the recipient set had to come from the
+  wrong map to make it work at all.
+
+  Both fan-out functions walked `ctx.clients`, and the relay is **not** a member
+  of it: `relay_tx` is an `mpsc::Sender<String>`, because the relay socket is
+  outbound-only and the desktop *hosts* the relay. So a phone reachable only
+  through the relay received nothing from any of the seventeen handlers that
+  fan out — clipboard, notifications, SMS, calls, discovery/remove, and every
+  file-transfer control frame — and it failed **silently**, because iterating an
+  empty set is indistinguishable from success. Directed sends already worked
+  (`send_to` has had a relay arm since the relay moved in-process); that
+  asymmetry is what made the feature look intermittent rather than broken.
+
+  **The recipient set cannot be `SyncEngine`, and that is the whole difficulty.**
+  `SyncEngine` is a *liveness* map: `handle_client` removes a device from it the
+  moment its LAN socket closes. The flagship scenario — pair on the LAN, then
+  walk out of range — is precisely the case where the device is absent from it, so
+  a fan-out built on `SyncEngine` produces an empty recipient set for the one
+  device the feature exists for, and passes every test that models the device as
+  connected. `DeviceRouteKeys::routable_device_ids()` (`relay.rs:197`) enumerates
+  the **pairing registry** instead, which is refreshed from the device table and
+  refreshed again every `KEY_REFRESH_INTERVAL` — and which is the same set the
+  relay keys its own verification against, so enumeration cannot name a device the
+  relay would then drop.
+
+  Three exclusions, each load-bearing and each with its own test:
+
+  - **This desktop.** `DeviceRouteKeys::refresh` registers the desktop under its
+    own id, so an unfiltered enumeration has it route a frame to itself — which
+    the relay delivers straight back, `unwrap_relay_delivery` accepts, `dispatch`
+    re-enters, and *that* fans out again. Multiplicative, until the 1024-slot
+    queue fills and then hub-wide.
+  - **Devices with a live socket here**, which the LAN loop that called us
+    already serves. Without this a phone that is on the LAN *and* joined to the
+    relay — exactly what a network transition looks like — gets every
+    notification twice, and duplicated file chunks corrupt a transfer.
+  - **The sender**, compared as a **device id**, because that is what the relay
+    addresses. `sender_id` is overloaded in this hub: a per-connection UUID from
+    the accept loop, or a relay-authenticated device id once `handle_message` has
+    unwrapped the delivery. Comparing the raw string excluded nothing for a
+    relayed sender and handed the phone its own notification back.
+
+  **The egress half was a plaintext leak, and had to land with it.** The relay
+  egress resolved the recipient's secret from `SyncEngine`, so every frame routed
+  to a socket-less device fell through to cleartext — already true of directed
+  `file/chunk` frames, base64 payload and all, and about to become true of
+  clipboard bodies and SMS. `seal_for_device` now reads `handlers::peer_secret`
+  (`handlers/mod.rs:108`), which consults `SyncEngine` first so every device with
+  a live socket keeps byte-identical behaviour, and falls back to the pairing
+  registry. `build_sealed_route` is now the single builder both egresses call, so
+  the LAN writer and the relay route cannot drift apart again.
+
+  Also fixed in the same place, because it was the same bug wearing a different
+  hat: `relay_route_to` uses `try_send`, never `send().await`. The queue is
+  bounded at 1024 and the writer behind it can stall, and this is reached from
+  broadcast paths that hold `ctx.clients` and `ws_to_device_id` readers — parking
+  on an await there converts one slow relay into a hub-wide stall of registration,
+  pairing and every LAN broadcast, because tokio's `RwLock` is write-preferring.
+  And `send_to`'s relay arm no longer holds the `relay_tx` read guard across an
+  await.
+
+  `build_sealed_route` **fails closed** (`server/mod.rs:1486-1532`). It returns
+  `Option<String>`, so a payload that will not parse refuses the route instead of
+  substituting `Value::Null` — and a null payload is not a harmless default. The
+  relay does not inspect payloads, so it would have forwarded the literal string
+  `null`, counted it as `messages_routed`, and the recipient, whose envelope
+  parser requires a map, would have dropped it with no error on either side. A
+  signed, counted-as-delivered frame that vanishes is the same silent-failure
+  class this egress exists to remove. The branch is unreachable in practice —
+  `seal_for_device` returns either the caller's own JSON or an
+  `EncryptedEnvelope` serialisation, both of which parse — which is the argument
+  for handling it rather than asserting it cannot happen: `unwrap_or` is what
+  makes "cannot happen" true.
+
+  7 tests. The one that would catch a regression to the liveness map is
+  `a_relay_only_peer_receives_a_broadcast`: the device has a registry row and
+  **no socket**, and the route's payload must open with the phone's own secret to
+  exactly the bytes a LAN peer would receive.
+  `the_desktops_own_broadcast_reaches_a_relay_only_peer` is the other half of the
+  same defect and arrived with the fix round: `WsServer::broadcast` is the path
+  every desktop-originated frame takes
+  (`commands::notifications::forward_to_peers_checked` reaches it for a
+  dismissal, a reply and a clipboard sync), and a fix that taught only
+  `broadcast_to_others` about the relay would have left the desktop's own
+  notifications and clipboard on the LAN and nowhere else.
+
+- [x] **W3.26 (RESOLVED)** Relayed frames were charged nothing. **Fixed — and
+  the audit's description of the defect was wrong in a way that made it look
+  smaller than it was.**
+
+  [CROSS-PLATFORM-GAPS.md](CROSS-PLATFORM-GAPS.md) G-R11 recorded this as *"All
+  phones behind the relay share **one** rate-limit bucket keyed on the literal
+  `"relay_server"`"*, and the previous commit's message repeated it. There was no
+  such bucket. `admit_frame` has exactly one caller — `handle_client`, the LAN
+  reader — and the relay read loop calls `handle_message` directly, so the
+  `"relay_server"` bucket was **never created**: relayed frames were charged no
+  count *and no bytes* by the transport limiter, by any phone, at all.
+  `max_bytes`, the field `security::RateLimitConfig` documents as "the budget that
+  bounds CPU", did not exist on this path.
+
+  The per-type limiter was already per-device, because the same re-entry dispatches
+  under the sender (`server/mod.rs:878` → `:1069`). So one phone could not
+  throttle another — and neither could be throttled. The fix is therefore
+  **strictly more accounting than before, not a repartition of an existing
+  charge**, which is the opposite of what the audit described and is recorded as
+  such on the code.
+
+  One relayed frame, one charge:
+
+  - a delivery whose sender is named and trusted is charged to **that sender's**
+    device id, once, before dispatch (`server/mod.rs:864`);
+  - a frame no device can be named for — malformed, or claiming an id this
+    desktop has not paired — is charged to the **transport** instead
+    (`server/mod.rs:894`), so "refusal is free" does not become true on this path
+    either. These are precisely the frames that never reach a handler at all, so
+    without it an unauthenticated peer has an unlimited supply of parse attempts.
+  - a relayed **binary** frame is charged to the transport (`admit_relay_binary`,
+    `server/mod.rs:424`), because a v2 frame names its **recipient**, not its
+    sender — the format gives no sender to charge. It is charged at all only
+    because it previously was not: the text arm was metered and the binary arm,
+    the cheaper flood, was not.
+
+  5 tests. Four are regression tests, each verified to fail with its fix removed:
+  exactly one count on the sender's budget and **zero** on the transport's; a peer
+  saturating its own budget not throttling a second peer (the fairness property
+  the audit was reaching for, and the one that would fail if the charge were still
+  keyed on the transport); a refused relayed frame still costing its sender; and
+  three forged `relay_delivery` frames from unknown senders costing the transport.
+
+  The fifth,
+  `a_relayed_binary_frame_is_charged_to_the_transport_budget`, is a **guard, not a
+  regression test**, and is labelled as one on the code
+  (`server/mod.rs:5321-5343`). It cannot be one: a relayed binary frame has to be
+  charged through the relay read loop, that loop needs a live WebSocket, so the
+  accounting was extracted into `admit_relay_binary` (`server/mod.rs:424`) to be
+  reachable at all — and a test on the extracted function passes whether or not
+  the loop calls it. Deleting the call site would leave it green. That gap is
+  real, and it is the argument for the one test this round cannot have: a
+  single-process phone-encoder → real relay socket → real dispatcher round trip
+  (W8.11, and `docs/TESTING.md` §7 item 5). What the test buys is that the
+  accounting is written down and correct at the seam rather than a line inside a
+  `select!` nobody can reach.
+
+- [x] **W3.27 (RESOLVED)** A relay-only peer was refused in silence. **Fixed,
+  and it was never a protocol change.**
+
+  The previous commit's message, and the test that went with it, both recorded
+  this as unfixable without one: *"a device with no socket here has nowhere to
+  receive an `error` frame … routing refusals back is a protocol change."* It is
+  not. `relay_route.payload` is an arbitrary JSON message and the relay forwards
+  it without inspecting it, so an `error` was always legal to route; the relay
+  wraps it in `relay_delivery` exactly as it does any other payload. The route
+  simply was not being taken. Nothing about the wire format changed, and no
+  `PROTOCOL.md` compatibility entry is needed — which is why §9.1 does not list
+  it.
+
+  `answer_channel` answers **sockets only**, and that is now the deliberate half
+  of the answer rather than the whole of it: the question it answers is "which
+  socket is this id on?", and a caller that wants the relay has to say so. The
+  new `answer()` (`server/mod.rs:2179`) tries the socket first and otherwise
+  routes a signed, sealed route, and replaced `answer_channel`'s use at every
+  refusal site: `rate_limited`, `invalid_message`, `not_authenticated`,
+  `unsupported_protocol_version`, the settings gates, `send_error`, and the
+  `ping`/`pong` reply — so a relay-only device is now probeable for reachability
+  as well as refusable.
+
+  **The one thing this must not become is a pre-auth signing oracle.**
+  `send_error` is reachable from `not_authenticated`, so routing refusals
+  unconditionally would let a stranger make the desktop mint a signed, encrypted
+  route per refused frame just by sending junk. `relay_route_to` therefore gates
+  on `is_trusted_peer` — the same predicate the auth gate uses, so the two cannot
+  disagree about who a device is — and a refusal aimed at an unpaired id gets no
+  route at all. There is a test for that specific shape, labelled as the guard it
+  is rather than dressed up as a regression.
+
+  **One refusal site was missed, and it was the one that mattered most.**
+  `handlers::handle_file_request` did not go through `answer_channel` or
+  `send_error` at all — it resolved the `file_accept_disabled` refusal with a bare
+  `clients.get(client_id)` (`handlers/files.rs:172`). `client_id` is a **device**
+  id for a relayed sender, and `clients` is keyed by connection id, so the lookup
+  never matched: a phone behind the relay pushing a file with `auto_accept_files`
+  off was declined, buffered nothing, and was told nothing — on the one path where
+  the peer is actively waiting for an ack that will now arrive. It calls
+  `send_error_to` now. It is the same defect as every other refusal here, and it
+  survived the first pass because it is a refusal that does not look like one.
+
+  4 tests: a relay-only sender is told `rate_limited` (driven through six
+  `pairing/request` frames, because `pairing` is exempt from the auth gate and
+  has the cheapest budget to exhaust); a relay-only device gets its `pong`; a
+  refusal for an unknown id gets no signed route and the transport id never
+  acquires peer authority; and `answer_channel_still_answers_sockets_only`, split
+  out from the test that used to pin the absence of this capability so the two
+  claims cannot be confused — *"this map cannot reach a relay-only device"* was
+  true and stayed true; *"so nothing can"* was the bug.
+
+  **The `file_accept_disabled` fix is the one part of this item with no test.**
+  `file_request_invalid_declined_sends_error_frame_to_sender`
+  (`handlers/files.rs:522`) covers it, but through `add_test_client`, which
+  registers a `ws_to_device_id` entry — so it exercises the socket arm and would
+  still pass with the bare `clients.get` back in place. What is missing is the
+  relay-only shape, and `add_test_relay` now makes it a two-line test.
+
+  The client half is W2.27 and would have made this invisible without it.
+
+- [x] **W3.28 (RESOLVED)** Every relayed binary file chunk was dropped, after the
+  relay had verified its tag. **Fixed**, and it was found while fixing the
+  fan-out rather than looked for.
+
+  `handle_lan_chunk` receives a **device** id when the frame was relayed and a
+  **connection** id on the LAN, and it looked that id up in `ws_to_device_id`,
+  which is keyed the other way. `unwrap_or_default()` produced `""`, the secret
+  lookup missed, and the chunk was discarded — after the relay had already
+  verified its tag, so the drop looked like corruption rather than a lookup bug.
+  It resolved through the registry first and fell back to the id itself, which
+  handles both transports and is the same one-line resolution
+  `persist_inbound_clipboard` and `handle_status_update` already used. The text
+  path had this right; the binary path threw the id away and re-resolved it.
+
+  The same diff introduced **`handlers::peer_secret`** (`handlers/mod.rs:108`),
+  one resolver replacing five separate reads of `SyncEngine` as a trust registry
+  (`is_trusted_peer`, `seal_for_device`, `unwrap_relay_delivery`,
+  `resolve_sender_secret`, `handle_lan_chunk`). They read two maps that mean
+  different things and disagreed: `SyncEngine` is liveness, the pairing registry
+  is identity. Order is deliberate and not arbitrary — `SyncEngine` first, so
+  every device with a live socket keeps byte-identical behaviour including the
+  case where a re-pair has written a fresh secret there and the relay's copy is
+  up to 5 s behind. That disagreement was not theoretical: a phone that paired on
+  the LAN and moved networks was refused **on arrival** by
+  `unwrap_relay_delivery`, so the egress fix would have delivered into a socket
+  whose inbound refused everything.
+
+  Two lock-order inversions were removed while in there. `is_trusted_peer` and
+  `resolve_sender_secret` held the `sync_engine` guard across the
+  `ws_to_device_id` read, which is the inverse of the order `broadcast_to_others`
+  uses — harmless while every holder is a reader, a deadlock the moment a writer
+  queues. Both now release one guard before taking the other.
+
+  **There were two defects on this path, and the first fix only closed one.**
+  `unwrap_relay_binary_frame` enumerated its candidate senders from `SyncEngine`
+  (`handlers/files.rs:93-116`), the same liveness map — so a relay-only sender's
+  frame was refused with *"no paired device to attribute this frame to"* one
+  layer **above** the id resolution above, and the fix described in this item
+  never ran for exactly the sender it was written for. It enumerates
+  `route_keys.routable_device_ids()` now, which is the registry, and which is the
+  right set on its own terms: these are the devices whose route keys the relay
+  will verify, and the loop skips any id with no key, so it cannot widen what is
+  accepted.
+
+  `a_relay_only_senders_binary_frame_is_attributed_to_it` (`server/mod.rs:5416`) covers
+  both halves and separates them on purpose: it asserts attribution first, on its
+  own, so a failure says which of the two defects it belongs to; then it asserts
+  delivery on the file engine's byte count, because "did it arrive" was the whole
+  defect and a log line would not distinguish a drop from a decrypt failure. The
+  transfer is deliberately partial (`total: 2`) — a single chunk would finalize on
+  arrival and remove the entry, after which `received_bytes` reads 0 and the
+  assertion could not tell a delivered chunk from a finalized one.
+
+- [x] **W3.29 (RESOLVED — HIGH, found reviewing W3.28)** A revoked device stayed
+  routable **and** trusted for up to 5 s. **Fixed**, and it is a window W3.28
+  itself opened.
+
+  `handlers::peer_secret` falling back to `DeviceRouteKeys` is what turned the
+  route-key registry from a routing detail into an authority for the auth gate —
+  and that registry refreshes on a timer (`spawn_key_refresh`, `relay.rs:499-516`,
+  every `KEY_REFRESH_INTERVAL`, 5 s at `relay.rs:79`). `SyncEngine`, which
+  `peer_secret` consults first, drops a device synchronously, so **unpairing used
+  to take effect at once**; after W3.28 it would have taken up to five seconds,
+  through the fallback. Both halves of that are exposure, not inconvenience: the
+  device is still a fan-out recipient, and it is still `is_trusted_peer`, so
+  `pairing/accept`'s copy keeps delivering clipboard and notification bodies to a
+  phone the user has just unpaired.
+
+  `DeviceRouteKeys::forget` (`relay.rs:244-251`) clears **both** maps in one call,
+  so there is no window in which the device is unroutable but still trusted, and
+  `WsServer::disconnect_client` calls it at `server/mod.rs:1843` beside the
+  `clients` and `sync_engine` removals rather than waiting for a tick. It is
+  idempotent, and a no-op for an id that was never registered.
+
+  **What it deliberately does not do** is withdraw the device from the *relay*,
+  which keeps its own copy of the registry and answers `unknown_device` from
+  that. That copy refreshes on the relay's schedule, not this process's.
+
+  **No test.** `relay.rs`'s 27 tests pin the `refresh()` filter
+  (`an_unpaired_or_revoked_device_cannot_route`,
+  `a_device_that_is_not_in_the_registry_cannot_route`) and neither exercises
+  `forget`. The missing test is short: seed both maps through `register_for_tests`,
+  call `forget` once, and assert that `routable_device_ids()` and `secret_for()`
+  both stop naming the id.
+
+- [x] **W3.30 (RESOLVED — HIGH, found reviewing W3.28)** The registry could
+  publish a device as routable before its secret was published. **Fixed**, and the
+  fix is an ordering.
+
+  `DeviceRouteKeys` holds two maps and the egress reads both:
+  `routable_device_ids()` reads `keys`, `secret_for` reads `secrets`, and the
+  fan-out does "enumerate a target, then seal for it"
+  (`server/mod.rs:1677-1692`). `refresh` published `keys` first, so a reader
+  landing between the two writes would see a device in the recipient set whose
+  secret was not there yet — and `seal_for_device` takes its no-secret path and
+  puts the frame on the wire **in plaintext**. Not a leak that needs an attacker:
+  it needs a thread scheduled in the wrong place.
+
+  It writes `secrets` first, then `keys` (`relay.rs:299-311`). That makes the
+  transient state the safe one: a target whose secret is missing is simply never
+  named, because `refresh` builds both maps from the same rows in one pass, so
+  `keys ⊆ secrets` holds at every observable moment. The original order made a
+  plaintext egress reachable by scheduling alone.
+
+  No test, and honestly none is available: the property is a claim about the order
+  of two writes, and observing it from outside needs a hook between them. It is
+  documented at the writes instead.
+
+- [x] **W3.31 (RESOLVED — HIGH, found reviewing the fan-out)** One padded
+  broadcast from a paired peer could close the relay connection for every peer.
+  **Fixed at the fan-out; the validation gap that made it reachable is not.**
+
+  `fan_out_to_relay` had no size ceiling, and sealing hex-encodes the payload, so
+  a frame of *n* plaintext bytes leaves as roughly 2*n* plus the envelope. The
+  relay's read ceiling is `MAX_TEXT_SIZE = 1 MiB`
+  (`services/relay/src/limits.rs:20`, installed as `max_message_size` at
+  `connection.rs:99-103`), and crossing it does not drop one frame: the handler
+  answers `message_too_large`, lingers, and returns
+  (`connection.rs:163-175`), which drops the socket. So anything over about half
+  a megabyte took **every relay-only peer offline** for the length of that
+  sender's reconnect backoff, and one peer chose when.
+
+  It was reachable because `validate_message` closes no field set for the types
+  that fan out. `sms`, `call`, `screen_mirror` and `remote_input` have no
+  validation arm at all (`security.rs:748-750`), and `clipboard` (`:963-969`),
+  `notification` (`:901-915`) and every `file` action (`:917-961`) bound the
+  fields they know but never call `reject_unknown_fields`. A paired peer sends
+  `{"type":"sms","action":"new","body":"x","pad":"<9 MB>"}` and it is accepted.
+  Before the fan-out existed that frame cost only memory on a local
+  `broadcast::Sender`; routing it turned a validation gap into an availability
+  bug on a resource every peer shares.
+
+  The guard is `MAX_RELAY_BROADCAST_BYTES = 256 * 1024` (`server/mod.rs:1459`),
+  checked once per broadcast rather than per recipient so the cost is not
+  multiplied by the peer count (`server/mod.rs:1663-1671`). Generous rather than
+  tight on purpose: the largest legitimate broadcast is a `file/progress` at about
+  100 bytes, and the alternative to being under this number is not "a smaller
+  frame" but "no relay at all, for any peer".
+
+  `an_oversized_broadcast_is_refused_before_it_can_kill_the_relay_leg`
+  (`server/mod.rs:4979`) asserts the refusal **and** that an ordinary frame still
+  routes, so the guard cannot quietly become a blanket ban.
+
+  *Left to do:* close the field sets. That is the better fix and it is not this
+  one — the guard bounds the shared relay leg, while an open field set is still a
+  validation gap on the LAN path, where the same padded frame reaches every
+  paired socket. Add `reject_unknown_fields` to
+  `validate_notification_message`, `validate_file_message` and
+  `validate_clipboard_message`, and give `sms` and `call` arms that bound what
+  their handlers read.
 
 ---
 
@@ -1891,6 +2314,13 @@ is W6.1, and bounded logging is part of W6.23.
   `command_not_allowed` currently looks like nothing happened.
   *Left to do:* register a central `error` handler in both frontends, surfacing
   `code` + `message`.
+  > **⚠ PARTLY STALE.** "Neither frontend implements it" was already false when
+  > this entry was written: the mobile client has had a central `error` handler
+  > since C-F9 (`da66802`), and W2.27 closed the one route it did not cover — an
+  > `error` that arrived inside `relay_delivery`, which the socket-level listener
+  > never sees. Both routes now have tests. The desktop frontend still has no
+  > `error` handler at all, and the codes above are still silently dropped there,
+  > so the item's substance stands on the desktop half alone.
 
 - [ ] **W8.6 (MEDIUM)` No generated-file drift guard of its own. The `codegen`
   CI job does run `generate && git diff --exit-code` (`ci.yml:435-447`), but
@@ -1920,6 +2350,22 @@ is W6.1, and bounded logging is part of W6.23.
   (`relay/src/tls.rs:271-298`), the hand-rolled base64 encoder
   (`tls.rs:884-897`), or the v2 binary-frame parser.
 
+- [ ] **W8.11 (HIGH)` No single-process relay round trip against a real client.
+  Every relay test builds its frames by hand. The relay's end-to-end lifecycle
+  tests assert the wire format a real client depends on, and the desktop crate
+  drives the real `"relay_server"` connection id through the real dispatcher, but
+  no single test puts a real encoder on a real socket and runs
+  phone → relay → desktop in one process. This is the gap a non-functional relay
+  shipped through, and it is why
+  `a_relayed_binary_frame_is_charged_to_the_transport_budget` is a guard rather
+  than a regression test (W3.26): the accounting had to be extracted out of the
+  relay read loop to be reachable at all, and a test on the extracted function
+  cannot tell whether the loop calls it. `docs/TESTING.md` §7 item 5 tracks the
+  same gap from the coverage side.
+  *Left to do:* stand up an in-process relay listener, feed it the output of the
+  mobile `relay_route.dart` encoder, and assert on what the desktop dispatcher
+  receives.
+
 ---
 
 ## W9 — Documentation accuracy
@@ -1930,6 +2376,17 @@ is W6.1, and bounded logging is part of W6.23.
   `CHANGELOG.md:125`, `.github/workflows/ci.yml:228`.
   Cause: the per-module table at `docs/TESTING.md:162-175` omits
   `src/audio.rs` (3 tests). Every other module count is correct.
+  > **⚠ BOTH HALVES NOW STALE, AND THE CITATIONS HAVE MOVED.** The figure is
+  > **817**, and it was already wrong in a second way: the per-module *totals* in
+  > `docs/TESTING.md` were right but the split beneath them was not — the
+  > handler tree has held **158** tests, not 145, and `server/mod.rs` held 69, not
+  > 82, both measured on the unmodified tree. The `file:line` list above points
+  > at lines that no longer carry those counts, and the `CHANGELOG.md` one names a
+  > line in the `0.1.0` entry's relay bullet. `README.md` was worse: every figure
+  > in its testing table was the 0.1.0 figure (187/275/724/222/87/362). All of
+  > them are re-measured now; `CHANGELOG.md`'s `0.1.0` entry and
+  > `.github/workflows/ci.yml` are not, so what remains here is the CI banner and
+  > the historical release entry.
 
 - [ ] **W9.2 (HIGH)` Three documents cite commit `eed58bd`, which **does not
   exist** in this repository. `docs/DEVELOPMENT.md:174`,
@@ -2022,7 +2479,7 @@ standalone service into a library hosted by the desktop app.
 |---|---|---|---|
 | Relay | repo root | `cargo test -p conduit-relay` | **247** passed, 1 ignored + 2 doctests |
 | Protocol | repo root | `cargo test -p conduit-protocol` | **281** passed + 1 doctest |
-| Desktop Rust | repo root | `cargo test -p conduit` | **799** passed |
+| Desktop Rust | repo root | `cargo test -p conduit` | **817** passed |
 | Clippy | repo root | `cargo clippy --workspace --all-targets` | exit 0, zero warnings |
 | Rust format | repo root | `cargo fmt --all -- --check` | exit 0 |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
@@ -2030,9 +2487,17 @@ standalone service into a library hosted by the desktop app.
 | Desktop e2e | `apps/desktop` | `npm run test:e2e` | **31/31 fail** — no `playwright install` bootstrap (W5.13) |
 | Desktop codegen | `apps/desktop` | `npm run generate` | exit 0, clean tree |
 | npm audit | `apps/desktop` | `npm audit` | 0 vulnerabilities |
-| Mobile unit | `apps/mobile` | `flutter test` | **190** passed |
-| Mobile analyze | `apps/mobile` | `flutter analyze` | **366** infos, 0 errors, 0 warnings — 365 of them in the *generated* `lib/models/protocol.dart` |
+| Mobile unit | `apps/mobile` | `flutter test` | **194** passed |
+| Mobile analyze | `apps/mobile` | `flutter analyze` | **370** infos, 0 errors, 0 warnings — 365 of them in the *generated* `lib/models/protocol.dart` |
 | Lockfile | repo root | — | see W5.6 |
+
+Three of those rows moved, and one of them was **already wrong before** this
+change rather than moved by it. Desktop Rust 799 → 817 is this change (17 new
+relay tests, all in `server/mod.rs`, three of them from the fix round rather than
+from the fan-out). Mobile unit 190 → 194 is this change (4 new relayed-frame
+tests). Mobile analyze was recorded as 366 and measured 370 on the **unmodified**
+tree, so that one was four behind and this change added no new infos; `dart
+analyze` reports the same 370 as `flutter analyze`.
 
 ## Notes
 

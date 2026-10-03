@@ -343,11 +343,25 @@ impl WsServer {
     ///    the secret; encrypting it would make it undecryptable at the peer.
     ///
     /// A peer with no shared secret — the desktop's own webview
-    /// (`local_desktop`), which has no key pair, or a device id that is not in
-    /// the registry at all — receives plaintext by necessity. That is sound
+    /// (`local_desktop`), which has no key pair, or a device id that is not
+    /// paired at all — receives plaintext by necessity. That is sound
     /// because reaching the first state requires the per-launch capability, and
     /// because broadcasts are filtered on pairing, so a stranger never gets
     /// here.
+    ///
+    /// # Why the secret comes from `peer_secret` and not from `SyncEngine`
+    ///
+    /// It used to read `SyncEngine` directly, which is a **liveness** map:
+    /// `handle_client` drops a device from it the moment its LAN socket closes.
+    /// A phone that paired on the LAN and then moved networks is therefore
+    /// absent from `SyncEngine` while still paired — so every frame routed to
+    /// it over the relay fell through the line below and went out **in
+    /// cleartext**. That was already true of directed `file/chunk` frames,
+    /// base64 payload and all, and it would have become true of clipboard and
+    /// SMS bodies the moment fan-out learned to reach that device.
+    ///
+    /// `peer_secret` falls back to the pairing registry, which outlives the
+    /// socket, so the egress can seal for a device it cannot see a socket for.
     ///
     /// Keyed by device id rather than connection id because one caller has no
     /// connection: `send_to`'s relay egress addresses a device that is by
@@ -356,15 +370,15 @@ impl WsServer {
         if message_type_is(msg_text, "pairing") || message_type_is(msg_text, "encrypted") {
             return msg_text.to_string();
         }
-        let Some(client) = ctx.sync_engine.read().await.get_client(stable_id).cloned() else {
+        let Some(shared_secret) = handlers::peer_secret(ctx, stable_id).await else {
             return msg_text.to_string();
         };
-        match ctx.encryption.encrypt(&client.shared_secret, msg_text) {
+        match ctx.encryption.encrypt(&shared_secret, msg_text) {
             Ok((nonce, ciphertext)) => {
                 let data_hex = hex::encode(ciphertext);
                 let hmac_hex = ctx
                     .encryption
-                    .generate_hmac(&client.shared_secret, &data_hex)
+                    .generate_hmac(&shared_secret, &data_hex)
                     .unwrap_or_default();
                 let envelope = EncryptedEnvelope {
                     msg_type: "encrypted".into(),
@@ -386,6 +400,41 @@ impl WsServer {
                 drop_message(msg_text)
             }
         }
+    }
+
+    /// Charge one relayed **binary** frame to the transport budget, and report
+    /// whether it is within it.
+    ///
+    /// A v2 relay frame names its **recipient**, not its sender, so there is no
+    /// device id to charge a per-sender budget against — the tag is verified
+    /// against every paired device's key in turn by
+    /// `unwrap_relay_binary_frame` precisely because the frame does not say who
+    /// sent it. That is a property of the format, not a gap to paper over, so
+    /// this charges the only subject the frame does name.
+    ///
+    /// It is not the same subject as the text arm on the same socket, which
+    /// charges the *sender* because a text delivery does name one. So a socket
+    /// carrying binary traffic has a transport budget and a text-only one does
+    /// not — which is worth stating, because it used to charge neither.
+    ///
+    /// Split out of `spawn_relay_client`'s read loop rather than inlined there so
+    /// the accounting is reachable by a test. The loop itself needs a live
+    /// WebSocket, and "the relay transport is charged" is exactly the kind of
+    /// invariant that is untestable and therefore untrue.
+    async fn admit_relay_binary(ctx: &WsContext, bytes: &[u8]) -> bool {
+        if !ctx
+            .rate_limiter
+            .check(Self::RELAY_CLIENT_ID, "", bytes.len() as u64)
+            .await
+        {
+            warn!(
+                "Transport budget exceeded on the relay socket — dropping \
+                 {}-byte relayed binary frame",
+                bytes.len()
+            );
+            return false;
+        }
+        true
     }
 
     async fn handle_client<S>(stream: S, ctx: WsContext, client_id: String, peer: SocketAddr)
@@ -571,32 +620,41 @@ impl WsServer {
         client_id: &str,
         claimed_id: Option<&str>,
     ) -> Option<String> {
-        let engine = ctx.sync_engine.read().await;
-
         // A relayed message arrives already attributed: `client_id` is the
         // device the relay authenticated, not a connection id. It is resolved
-        // directly against the registry, and it is not overridable by the
-        // envelope's own `source_device` claim — a device that is not paired
-        // yields no secret at all.
+        // directly, and it is not overridable by the envelope's own
+        // `source_device` claim — a device that is not paired yields no secret
+        // at all.
         //
         // This tier comes first because a relayed id is a stronger statement
         // than anything the socket itself can say: it is what the relay
         // established during `relay_auth` and re-checked against the signature.
-        if let Some(secret) = engine
-            .get_client(client_id)
-            .map(|c| c.shared_secret.clone())
+        //
+        // `peer_secret` rather than a bare `SyncEngine` lookup, which is the
+        // fourth read of a *liveness* map as if it were a trust registry. It is
+        // why a relay-only phone could receive a frame this desktop correctly
+        // routed to it and then fail to decrypt it here — silently, one line
+        // after the relay had authenticated the sender.
+        if let Some(secret) = handlers::peer_secret(ctx, client_id)
+            .await
             .filter(|s| !s.is_empty())
         {
             return Some(secret);
         }
 
         // Otherwise this is a LAN socket, and its identity is whatever the hub
-        // wrote at pairing time.
+        // wrote at pairing time. Read and released *before* any registry
+        // lookup: holding a `sync_engine` guard across this read is the inverse
+        // of the order the fan-out uses, and harmless only while every holder is
+        // a reader.
         let connection_id = ctx.ws_to_device_id.read().await.get(client_id).cloned();
-        let by_connection = connection_id
-            .as_deref()
-            .and_then(|id| engine.get_client(id))
-            .map(|c| c.shared_secret.clone());
+        let by_connection = match connection_id {
+            Some(id) => handlers::peer_secret(ctx, &id).await,
+            None => None,
+        };
+        if let Some(secret) = by_connection {
+            return Some(secret);
+        }
 
         // The claim is consulted only when the socket's own identity did not
         // resolve. A *live* connection identity always wins, so one socket has
@@ -610,9 +668,10 @@ impl WsServer {
         // caller still has to produce a valid HMAC over the ciphertext with
         // whatever secret comes back. Resolving to a device you are not does
         // not let you read its traffic.
-        by_connection.or_else(|| {
-            claimed_id.and_then(|id| engine.get_client(id).map(|c| c.shared_secret.clone()))
-        })
+        match claimed_id {
+            Some(id) => handlers::peer_secret(ctx, id).await,
+            None => None,
+        }
     }
 
     /// The client id the outbound relay connection is dispatched under.
@@ -645,12 +704,18 @@ impl WsServer {
         // device has a route key at all, so this is nearly always redundant. It
         // is still the difference between "the relay said so" and "the desktop
         // verified it", and an unpaired sender must never reach a handler.
-        let trusted = ctx
-            .sync_engine
-            .read()
+        //
+        // Resolved through `peer_secret`, which falls back to the pairing
+        // registry. It used to read `SyncEngine`, which meant the refusal below
+        // fired for the one device this whole mechanism exists for: a phone that
+        // paired on the LAN and then moved networks had been dropped from
+        // `SyncEngine` by its own disconnect, so every frame the desktop
+        // correctly routed to it was thrown away on arrival. The egress fix and
+        // this have to move together — an egress that delivers into a socket
+        // whose inbound is refused is unobservable.
+        let trusted = handlers::peer_secret(ctx, from)
             .await
-            .get_client(from)
-            .is_some_and(|c| !c.shared_secret.is_empty());
+            .is_some_and(|secret| !secret.is_empty());
         if !trusted {
             warn!("Refusing a relay_delivery from unpaired device {from}");
             return None;
@@ -663,7 +728,14 @@ impl WsServer {
     /// Charge one inbound frame to the connection's transport budget, and handle
     /// it if it is within it.
     ///
-    /// **This is the only place the global (`RateLimiter`) budget is charged.**
+    /// **This is the only place the global (`RateLimiter`) budget is charged for a
+    /// frame arriving on a LAN socket**, because it is the only place a LAN socket
+    /// is read. `spawn_relay_client`'s read loop calls `handle_message` directly
+    /// and so never reaches this function; a relayed *text* frame is charged
+    /// against the **device** that sent it, in `handle_message`'s relay arm, or
+    /// against the transport when no device can be named for it. Those are the two
+    /// arms of one `match` and the first returns, so a given frame is charged
+    /// exactly once either way — the accounting is per *subject*, not per hop.
     ///
     /// It used to be charged here *and* again inside [`Self::dispatch`], against
     /// the same `client_id`-keyed bucket, so every inbound text frame cost two
@@ -751,6 +823,53 @@ impl WsServer {
         if client_id == Self::RELAY_CLIENT_ID {
             match Self::unwrap_relay_delivery(text, ctx).await {
                 Some((sender, payload)) => {
+                    // The transport budget, charged against the **device** that
+                    // sent this frame rather than the socket that carried it.
+                    //
+                    // Every other inbound frame is charged in `admit_frame`,
+                    // ahead of any work, because the subject of the budget there
+                    // is the socket and a socket is known before a byte is
+                    // looked at. Here the subject has to be the device, and the
+                    // device is named inside the frame — so this is the first
+                    // point at which it is both known and checked against the
+                    // pairing registry (`unwrap_relay_delivery` refuses an
+                    // unpaired sender outright).
+                    //
+                    // # Why this is a charge and not a split
+                    //
+                    // The audit recorded this as "every phone behind the relay
+                    // shares one bucket keyed on `"relay_server"`, so one file
+                    // transfer throttles every other phone". The mechanism was
+                    // wrong and the defect was worse. `admit_frame` has exactly
+                    // one caller — `handle_client`, the LAN reader — and this
+                    // read loop calls `handle_message` directly. So the
+                    // `"relay_server"` bucket was **never created**: relayed
+                    // frames were charged no count *and no bytes* by the
+                    // transport limiter, by any phone, at all. The commit
+                    // message's claim that "the relay socket was charged once in
+                    // `admit_frame`" described an accounting the code did not
+                    // have.
+                    //
+                    // What is left is the per-type limiter, which was already
+                    // per-device because this same re-entry dispatches under the
+                    // sender. So one phone *could* not throttle another — it
+                    // could also not be throttled at all. `max_bytes`, the field
+                    // `security::RateLimitConfig` documents as "the budget that
+                    // bounds CPU", did not exist on this path.
+                    //
+                    // Charging per sender is therefore strictly *more*
+                    // accounting than before, not a repartition of an existing
+                    // charge. The transport still keeps its own budget below, for
+                    // frames no device can be named for.
+                    if !ctx.rate_limiter.check(&sender, "", text.len() as u64).await {
+                        warn!(
+                            "Transport budget exceeded by relayed device {} ({} bytes in \
+                             window) — dropping frame",
+                            sender,
+                            ctx.rate_limiter.window_bytes(&sender).await
+                        );
+                        return;
+                    }
                     let forwarded = payload.to_string();
                     // Not a recursive call: an unwrapped delivery is dispatched
                     // once, as the sender, and a second envelope inside it is
@@ -762,6 +881,18 @@ impl WsServer {
                     // Not a delivery, or a sender we do not trust. `ping`/`pong`
                     // still have to work on this socket, so fall through to the
                     // normal dispatcher, which will refuse anything else.
+                    //
+                    // No device can be named, so this frame is charged to the
+                    // transport instead. That keeps "a frame this desktop refuses
+                    // still costs something" true on the relay path too — which
+                    // matters most precisely here, because these are the frames
+                    // that never reach a handler at all. The relay applies its
+                    // own per-connection limit to this socket before a byte
+                    // arrives, so the parse this charge follows is bounded.
+                    let _ = ctx
+                        .rate_limiter
+                        .check(Self::RELAY_CLIENT_ID, "", text.len() as u64)
+                        .await;
                 }
             }
         }
@@ -798,9 +929,7 @@ impl WsServer {
                 server_version: Some(PROTOCOL_VERSION),
             };
             let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-            if let Some(tx) = answer_channel(ctx, client_id).await {
-                let _ = tx.send(err_resp);
-            }
+            answer(ctx, client_id, &err_resp).await;
             return;
         }
 
@@ -819,12 +948,13 @@ impl WsServer {
         // are charged at the reader instead, so the budget cannot be evaded by
         // making the server reject your traffic.
         //
-        // A relayed frame's *sender* is charged nothing here either, and that is
-        // also deliberate: the transport that carried it — the relay socket —
-        // was charged once in `admit_frame`, and the sender's own per-type
-        // budget, keyed by its device id, is charged below. Inventing a
-        // transport budget for a device that has no socket here would be a
-        // second accounting of the same bytes.
+        // A relayed frame's *sender* is charged nothing here, and that is also
+        // deliberate: the transport budget is charged in exactly one place per
+        // frame, and on the relay that place is `handle_message`'s relay arm —
+        // against the sender's device id, once the delivery has been unwrapped
+        // and the sender checked against the pairing registry. Inventing a
+        // second transport charge here would double-bill the same frame against
+        // the same device, which is the defect `admit_frame`'s doc describes.
 
         let processed_msg = if raw_type == "encrypted" {
             let claimed_id = msg.get("source_device").and_then(|v| v.as_str());
@@ -952,16 +1082,14 @@ impl WsServer {
                 server_version: None,
             };
             let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-            // `answer_channel`, not a bare `clients.get(client_id)`: a relayed
-            // sender's id is a device id, so the bare lookup missed and the
-            // phone was throttled into silence with nothing to log on its side.
-            // A sender with no socket here has no one to tell, which is logged.
-            if let Some(tx) = answer_channel(ctx, client_id).await {
-                let _ = tx.send(err_resp);
-            } else {
+            // `answer`, not a bare `clients.get(client_id)`: a relayed sender's
+            // id is a device id, so the bare lookup missed and the phone was
+            // throttled into silence with nothing to log on its side. A sender
+            // with no socket here has the relay as its only route back.
+            if !answer(ctx, client_id, &err_resp).await {
                 warn!(
-                    "Rate-limited {} (type: {}) has no socket on this desktop; \
-                     the relay is not told",
+                    "Rate-limited {} (type: {}) could not be answered: no socket on \
+                     this desktop and no route to it through the relay",
                     client_id, msg_type
                 );
             }
@@ -1134,9 +1262,10 @@ impl WsServer {
             ("pong", _) => {}
             ("ping", _) => {
                 let pong = serde_json::to_string(&Pong::new()).expect("Pong serializes");
-                if let Some(tx) = answer_channel(ctx, client_id).await {
-                    let _ = tx.send(pong);
-                }
+                // Also how a relay-only device gets its `pong`: `handle_message`
+                // dispatches its delivery under the device id, which is in no
+                // connection map.
+                answer(ctx, client_id, &pong).await;
             }
             // ── Relay control plane ───────────────────────────────────────────
             //
@@ -1192,13 +1321,27 @@ impl WsServer {
         }
     }
 
-    /// Fan a message out to every **paired** connection.
+    /// Fan a message out to every **paired** connection, and to every paired
+    /// device that has no socket here at all.
     ///
     /// Unpaired connections are skipped. Every accepted socket used to be in
     /// `ctx.clients` unconditionally, and because the per-socket encryption
     /// only fires when `ws_to_device_id` yields a peer with a shared secret, an
     /// unpaired socket was handed the **raw plaintext** of every broadcast.
-    pub async fn broadcast(&self, message: String) {
+    ///
+    /// The relay arm is [`Self::fan_out_to_relay`] and it runs *first*, outside
+    /// both guards, because it awaits and this loop holds `clients` and
+    /// `ws_to_device_id` readers for its whole duration. This is the path every
+    /// desktop-originated frame takes — `commands::notifications`'s
+    /// `forward_to_peers_checked` reaches it for a dismissal, a reply and a
+    /// clipboard sync — so without the arm the desktop's own notifications and
+    /// clipboard reached the LAN and nothing else.
+    ///
+    /// `exclude` is `None`: nothing here has a sender, because a broadcast
+    /// originates on the desktop itself rather than from a peer.
+    pub(crate) async fn broadcast(&self, message: String) {
+        Self::fan_out_to_relay(&self.ctx, None, &message).await;
+
         let ids: Vec<String> = self.ctx.clients.read().await.keys().cloned().collect();
         for id in ids {
             if !handlers::has_identity(&self.ctx, &id).await {
@@ -1255,38 +1398,66 @@ impl WsServer {
         drop(clients);
 
         // 3. Not connected directly — try the relay.
-        let relay_lock = self.ctx.relay_tx.read().await;
-        if let Some(relay_tx) = &*relay_lock {
-            // Signing uses this desktop's *own* route key, never the relay
-            // token. The token authenticates the connection; the key proves
-            // which device is speaking. Conflating the two let anyone who had
-            // seen the token route as anyone, and left `from_device_id`
-            // unsigned, so the relay could not tell a spoof from the truth.
-            let from_device_id = self.ctx.device_id.as_str().to_string();
-            let Some(route_key) = self.ctx.route_keys.signing_key(&from_device_id) else {
-                error!(
-                    "Cannot route through the relay: no route key is registered for this \
-                     desktop ({from_device_id}). The device registry has not been read yet."
-                );
-                return false;
-            };
+        //
+        // The sender is cloned out and the guard dropped before any await, for
+        // the reason given below the clone.
+        let Some(relay_tx) = self.ctx.relay_tx.read().await.clone() else {
+            return false;
+        };
+        // Signing uses this desktop's *own* route key, never the relay
+        // token. The token authenticates the connection; the key proves
+        // which device is speaking. Conflating the two let anyone who had
+        // seen the token route as anyone, and left `from_device_id`
+        // unsigned, so the relay could not tell a spoof from the truth.
+        let from_device_id = self.ctx.device_id.as_str().to_string();
+        let Some(route_key) = self.ctx.route_keys.signing_key(&from_device_id) else {
+            error!(
+                "Cannot route through the relay: no route key is registered for this \
+                 desktop ({from_device_id}). The device registry has not been read yet."
+            );
+            return false;
+        };
 
-            // Sealed for the recipient exactly as the LAN writer seals it.
-            let relay_msg_str = self
-                .sealed_relay_route(device_id, &message, &route_key)
-                .await;
-            if let Err(e) = relay_tx.send(relay_msg_str).await {
-                warn!("Failed to route message through relay: {}", e);
-                return false;
-            }
-            return true;
+        // Sealed for the recipient exactly as the LAN writer seals it.
+        let Some(route) =
+            Self::build_sealed_route(&self.ctx, device_id, &message, &route_key).await
+        else {
+            return false;
+        };
+        if let Err(e) = relay_tx.send(route).await {
+            warn!("Failed to route message through relay: {}", e);
+            return false;
         }
-        false
+        true
     }
 
+    /// Thin wrapper over [`Self::build_sealed_route`], which needs the context
+    /// and nothing else, so the pre-existing egress tests can drive it through a
+    /// `WsServer` without restating the context argument at each call site.
+    #[cfg(test)]
+    async fn sealed_relay_route(
+        &self,
+        to_device_id: &str,
+        message: &str,
+        route_key: &[u8],
+    ) -> String {
+        Self::build_sealed_route(&self.ctx, to_device_id, message, route_key)
+            .await
+            .expect("a relay route always serialises")
+    }
+
+    /// Largest plaintext frame [`WsServer::fan_out_to_relay`] will route.
+    ///
+    /// Well under the relay's 1 MiB read ceiling, so that hex-encoding the payload
+    /// — which doubles it — plus the route and envelope overhead still fits.
+    /// Nothing that legitimately broadcasts comes close: the largest is a
+    /// `file/progress` at about 100 bytes.
+    const MAX_RELAY_BROADCAST_BYTES: usize = 256 * 1024;
+
     /// Build the signed `relay_route` that carries one directed frame to
-    /// `to_device_id`, with the payload sealed exactly as the LAN socket writer
-    /// would have sealed it.
+    /// `to_device_id`, sealed exactly as the LAN socket writer would have.
+    ///
+    /// `None` on any failure, so no caller can route a half-built frame.
     ///
     /// # Why the sealing has to happen here
     ///
@@ -1296,40 +1467,213 @@ impl WsServer {
     /// existed, `send_to`'s two paths behaved differently: a frame destined for
     /// a device on the LAN arrived wrapped in an `encrypted` envelope, and the
     /// *same* frame destined for the same device through the relay arrived as
-    /// raw JSON. `send_to` is the only desktop→relay egress (`relay_tx` has one
-    /// reader), so every directed frame it carries was affected —
-    /// `commands::file`'s `file/request` and `file/chunk` (base64 payload
-    /// included) and `commands::pairing`'s pre-built envelope.
+    /// raw JSON — `commands::file`'s `file/request` and `file/chunk` (base64
+    /// payload included) and `commands::pairing`'s pre-built envelope.
     ///
-    /// Scope: this seals *exactly* what the LAN path seals and no more.
-    /// `sms`, `file`, `notification`, `clipboard`, `screen_mirror`,
-    /// `remote_input` and `audio` are plaintext-by-decision in
-    /// `PROTOCOL.md` §6.4, and this does not change that decision — it applies
-    /// the desktop's existing, already-per-connection policy to the second
-    /// transport instead of inventing a second policy. An `encrypted` frame is
-    /// still passed through unwrapped, so `send_encrypted_message` does not
-    /// gain a second layer.
-    async fn sealed_relay_route(
-        &self,
+    /// Scope: this seals *exactly* what the LAN path seals and no more, because
+    /// it calls the LAN path's own sealer. An `encrypted` frame still passes
+    /// through unwrapped, and a `pairing` frame still goes in the clear so a peer
+    /// can derive the secret it is about to be handed.
+    async fn build_sealed_route(
+        ctx: &WsContext,
         to_device_id: &str,
         message: &str,
         route_key: &[u8],
-    ) -> String {
-        let sealed = Self::seal_for_device(&self.ctx, to_device_id, message).await;
-        let from_device_id = self.ctx.device_id.as_str();
+    ) -> Option<String> {
+        let sealed = Self::seal_for_device(ctx, to_device_id, message).await;
+        // Fails **closed**, unlike the `unwrap_or(Value::Null)` this replaces. A
+        // null payload is not a harmless default: the relay does not inspect
+        // payloads, so it would forward the literal string `null`, count it as
+        // `messages_routed`, and the recipient — whose envelope parser requires
+        // a map — would drop it with no error on either side.
+        let payload: serde_json::Value = match serde_json::from_str(&sealed) {
+            Ok(value) => value,
+            Err(e) => {
+                error!("Refusing to route to {to_device_id}: the payload is not JSON ({e})");
+                return None;
+            }
+        };
+        let from_device_id = ctx.device_id.as_str();
         let route = RelayRoute::signed_with(
             from_device_id,
             route_key,
             from_device_id,
             to_device_id,
-            serde_json::from_str::<serde_json::Value>(&sealed).unwrap_or(serde_json::Value::Null),
+            payload,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as i64,
             uuid::Uuid::new_v4().to_string(),
         );
-        serde_json::to_string(&route).unwrap_or_default()
+        match serde_json::to_string(&route) {
+            Ok(wire) => Some(wire),
+            Err(e) => {
+                error!("Could not serialise a relay route for {to_device_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Route one frame to `device_id` through the relay, sealed for it.
+    ///
+    /// `false` is not an error: it means the relay is not connected, this
+    /// desktop has no route key yet, or `device_id` does not name a paired
+    /// device.
+    ///
+    /// That last one is a **gate, not a courtesy**, and it is the same predicate
+    /// the auth gate uses, so the two cannot disagree about who a device is.
+    /// Without it `send_error` — reachable from `not_authenticated` — would mint
+    /// a signed, encrypted route for *every stranger's junk*, turning "you are
+    /// not paired" into a cheap way to make this desktop sign and encrypt on
+    /// demand. It is also what keeps an unpaired peer out of the fan-out this
+    /// is the inner half of.
+    ///
+    /// The relay's own connection table is not visible from here, so whether
+    /// `device_id` is actually connected to the relay is not answerable: a route
+    /// to an absent device is queued and then dropped and counted by the relay
+    /// as `messages_dropped_not_found`.
+    ///
+    /// `try_send`, never `send().await`. The channel is bounded at 1024 and the
+    /// writer behind it can stall, and this is reached from broadcast paths that
+    /// hold `ctx.clients` and `ws_to_device_id` readers — parking on an await
+    /// there converts one slow relay into a hub-wide stall of registration,
+    /// pairing and every LAN broadcast, because tokio's `RwLock` is
+    /// write-preferring. Dropping is also the contract this path already has: the
+    /// LAN half of a fan-out uses `broadcast::Sender::send`, which returns `Err`
+    /// on a lagging subscriber and does not block. An off-LAN peer that misses
+    /// one notification re-syncs; the alternative is delivering to nobody.
+    async fn relay_route_to(ctx: &WsContext, device_id: &str, message: &str) -> bool {
+        if !handlers::is_trusted_peer(ctx, device_id).await {
+            debug!("Not routing to {device_id} through the relay: not a paired device");
+            return false;
+        }
+        let Some(relay_tx) = ctx.relay_tx.read().await.clone() else {
+            return false;
+        };
+        let from_device_id = ctx.device_id.as_str();
+        // Never the relay token: the token authenticates the connection, the
+        // route key proves which device is speaking.
+        let Some(route_key) = ctx.route_keys.signing_key(from_device_id) else {
+            error!(
+                "Cannot route through the relay: no route key is registered for this \
+                 desktop ({from_device_id})."
+            );
+            return false;
+        };
+        let Some(route) = Self::build_sealed_route(ctx, device_id, message, &route_key).await
+        else {
+            return false;
+        };
+        match relay_tx.try_send(route) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Relay queue full, dropping a frame for {device_id}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Fan `message` out to every paired device with **no socket on this
+    /// desktop**, and report how many routes were queued.
+    ///
+    /// # What the relay is, as a destination
+    ///
+    /// `relay_tx` is an `mpsc::Sender<String>`, not a `ctx.clients` entry: the
+    /// relay socket is outbound-only and is never in the connection map, which is
+    /// why every fan-out in this app used to skip it entirely. A phone reachable
+    /// only through the relay therefore received no clipboard, no notification,
+    /// no SMS, no call and no discovery update — silently, because iterating an
+    /// empty set looks exactly like success.
+    ///
+    /// # Who the recipients are
+    ///
+    /// `route_keys.routable_device_ids()`, minus three sets, and each exclusion
+    /// is load-bearing:
+    ///
+    ///   * **This desktop.** It registers itself under its own id
+    ///     (`DeviceRouteKeys::refresh`), so an unfiltered enumeration has the
+    ///     desktop route a frame to itself — which the relay delivers straight
+    ///     back, `unwrap_relay_delivery` accepts, `dispatch` re-enters, and
+    ///     *that* fans out again. Multiplicative, not linear, until the
+    ///     1024-slot queue fills and then hub-wide.
+    ///   * **Devices with a live socket here.** Those are served by the LAN loop
+    ///     that called us. Without this a phone that is on the LAN *and* joined
+    ///     to the relay — exactly what happens during a network transition —
+    ///     gets every notification twice, and file fan-out twice, which is worse
+    ///     than not at all.
+    ///   * **The sender**, passed as a **device id** because that is what the
+    ///     relay addresses. `sender_id` is overloaded in this hub: a
+    ///     per-connection UUID from the accept loop, or a relay-authenticated
+    ///     device id once `handle_message` has unwrapped the delivery. Comparing
+    ///     the raw string against device ids would exclude nothing for a relayed
+    ///     sender and hand a phone its own notification back.
+    ///
+    /// # Why the recipient set is the registry and not `SyncEngine`
+    ///
+    /// Because `SyncEngine` is where a relay-only phone *is not*. `handle_client`
+    /// removes a device from it when its LAN socket closes, so the flagship
+    /// scenario — pair on the LAN, walk out of range — would produce an empty
+    /// recipient set and a fix that does nothing.
+    ///
+    /// Locks: every guard is released before any `.await` that can block.
+    /// `relay_route_to` seals (which reads `SyncEngine`) and then `try_send`s,
+    /// and neither happens while `ws_to_device_id` or `SyncEngine` is held.
+    pub(crate) async fn fan_out_to_relay(
+        ctx: &WsContext,
+        exclude_device: Option<&str>,
+        message: &str,
+    ) -> usize {
+        // Size ceiling, and it is a *security* control rather than a courtesy.
+        //
+        // Sealing hex-encodes the payload, so a frame of `n` plaintext bytes
+        // leaves as roughly `2n` plus the envelope. The relay's read limit is
+        // 1 MiB, so anything over about half that crosses it — and crossing it
+        // does not drop one frame, it **closes the connection**, taking every
+        // relay-only peer offline for a whole backoff interval.
+        //
+        // Reachable because `validate_message` closes no field set for `sms`,
+        // `call`, `clipboard` or the re-broadcast `file` actions: a paired peer
+        // sends `{"type":"sms","action":"new","body":"x","pad":"<9 MB>"}` and it
+        // is accepted. Before this arm existed that frame cost only memory on a
+        // local `broadcast::Sender`; routing it turned a validation gap into an
+        // availability bug. Closing `validate_message` is the better fix and is
+        // tracked as W3.31; this is the part that has to hold regardless, since
+        // the relay leg is a shared resource and one oversized frame spends it
+        // all.
+        //
+        // Checked once per broadcast, not per recipient.
+        if message.len() > Self::MAX_RELAY_BROADCAST_BYTES {
+            warn!(
+                "Refusing to fan out a {}-byte frame through the relay: sealed it would \
+                 exceed the relay's frame ceiling and cost the whole connection. It was \
+                 still delivered on the LAN.",
+                message.len()
+            );
+            return 0;
+        }
+        // Checked up front so a desktop with no relay pays nothing per target and
+        // a misconfiguration logs once rather than once per device.
+        if ctx.relay_tx.read().await.is_none() {
+            return 0;
+        }
+        let targets: Vec<String> = {
+            let connected: Vec<String> =
+                ctx.ws_to_device_id.read().await.values().cloned().collect();
+            let own = ctx.device_id.as_str().to_string();
+            ctx.route_keys
+                .routable_device_ids()
+                .into_iter()
+                .filter(|d| *d != own)
+                .filter(|d| Some(d.as_str()) != exclude_device)
+                .filter(|d| !connected.contains(d))
+                .collect()
+        };
+        let mut sent = 0usize;
+        for device_id in targets {
+            sent += usize::from(Self::relay_route_to(ctx, &device_id, message).await);
+        }
+        sent
     }
 
     /// Dial a relay and keep the connection up.
@@ -1399,6 +1743,9 @@ impl WsServer {
                                     Self::handle_message(&text, Self::RELAY_CLIENT_ID, &ctx).await;
                                 }
                                 Message::Binary(bytes) => {
+                                    if !Self::admit_relay_binary(&ctx, &bytes).await {
+                                        continue;
+                                    }
                                     handlers::files::handle_binary_message(
                                         bytes.to_vec(),
                                         "relay_server",
@@ -1472,6 +1819,11 @@ impl WsServer {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         self.ctx.clients.write().await.remove(device_id);
         self.ctx.sync_engine.write().await.remove_client(device_id);
+        // Now, not at the next 5 s registry refresh: since `peer_secret` falls back
+        // to that registry, a device left in it stays both routable *and* trusted
+        // after a revoke — so `pairing/accept`'s copy would keep delivering
+        // clipboard and notification bodies to a phone the user just unpaired.
+        self.ctx.route_keys.forget(device_id);
         self.ctx.rate_limiter.remove_client(device_id).await;
         self.ctx.per_type_limiter.remove_client(device_id).await;
         self.ctx
@@ -1760,9 +2112,13 @@ async fn notification_post_allowed(ctx: &WsContext, msg: &Value) -> Result<(), &
 /// taken in the same order as everywhere else (`clients` then
 /// `ws_to_device_id`).
 ///
-/// `None` is the honest answer for a sender with no socket here at all: a
-/// relay-only peer can only be reached through the relay, which is a routing
-/// question for the relay, not something this map can answer.
+/// `None` means "no socket here", which is **not** the same as "undeliverable":
+/// a peer reachable only through the relay has no socket and is still reachable.
+/// [`answer`] is what turns this answer into a delivery.
+///
+/// Deliberately still answers *only* sockets. This is the question "which
+/// socket is this id on?", and a caller that wants the relay has to say so —
+/// `answer` does, and is the only thing that does.
 async fn answer_channel(ctx: &WsContext, id: &str) -> Option<ClientSender> {
     let clients = ctx.clients.read().await;
     if let Some(tx) = clients.get(id) {
@@ -1778,13 +2134,56 @@ async fn answer_channel(ctx: &WsContext, id: &str) -> Option<ClientSender> {
     clients.get(&connection).cloned()
 }
 
+/// Get `message` to whoever `id` names, by whichever route exists.
+///
+/// A socket if there is one, and otherwise a signed, sealed route through the
+/// relay. Reports whether it was handed to something.
+///
+/// This is the answer [`answer_channel`] deliberately could not give, and the
+/// gap it left was that **every refusal aimed at a relay-only peer was looked
+/// up, missed, and dropped**: `rate_limited`, `invalid_message`,
+/// `not_authenticated`, `unsupported_protocol_version`, a settings gate. The
+/// peer was refused and never told why, which from the far end is
+/// indistinguishable from a dropped socket — and, since fan-out also skipped
+/// those peers, the phone just went quiet.
+///
+/// Nothing about the wire format had to change for this. `relay_route`'s
+/// payload is an arbitrary JSON message and the relay forwards it without
+/// inspecting it, so an `error` is already a legal thing to route; the relay
+/// wraps it in `relay_delivery` exactly as it does any other payload.
+///
+/// A LAN socket still wins, so a device that has both keeps its existing
+/// behaviour and never pays for a round trip it does not need, and the two
+/// paths seal identically so a peer cannot tell which one delivered a frame.
+///
+/// `relay_route_to` gates on the same trust predicate as the auth gate, so this
+/// cannot be used to make the hub sign and encrypt for an unpaired id — see
+/// its doc comment.
+async fn answer(ctx: &WsContext, id: &str, message: &str) -> bool {
+    if let Some(tx) = answer_channel(ctx, id).await {
+        let _ = tx.send(message.to_string());
+        return true;
+    }
+    crate::server::WsServer::relay_route_to(ctx, id, message).await
+}
+
+/// Deliver an already-serialised refusal to whoever `id` names.
+///
+/// The same egress [`send_error`] uses, for callers that have built their own
+/// `ErrorMessage` with a domain-specific message — `handlers::files` declines a
+/// transfer with a `file_accept_disabled` code and the filename in the detail,
+/// which `send_error`'s signature has no room for.
+pub(crate) async fn send_error_to(ctx: &WsContext, client_id: &str, serialized: &str) -> bool {
+    answer(ctx, client_id, serialized).await
+}
+
 /// Tell the sender *why* its message was dropped, and say so in the log.
 ///
 /// A silent drop leaves the peer waiting for an ack that never arrives; an
 /// `error` frame with a stable `code` lets both sides record a meaningful
 /// reason. Unicast, so it also reaches a peer that is not paired yet — via
-/// [`answer_channel`], which also reaches a *relayed* sender that happens to
-/// have a LAN socket.
+/// [`answer`], which finds that peer's LAN socket if it has one and otherwise
+/// routes the refusal back through the relay.
 async fn send_error(ctx: &WsContext, client_id: &str, code: &str, detail: &str) {
     let err_resp = ErrorMessage {
         msg_type: "error".into(),
@@ -1793,10 +2192,10 @@ async fn send_error(ctx: &WsContext, client_id: &str, code: &str, detail: &str) 
         server_version: Some(PROTOCOL_VERSION),
     };
     let err_resp = serde_json::to_string(&err_resp).expect("ErrorMessage serializes");
-    if let Some(tx) = answer_channel(ctx, client_id).await {
-        let _ = tx.send(err_resp);
-    } else {
-        warn!("Cannot answer {code} to {client_id}: it has no socket on this desktop");
+    if !answer(ctx, client_id, &err_resp).await {
+        warn!(
+            "Cannot answer {code} to {client_id}: no socket on this desktop and no route to it through the relay"
+        );
     }
 }
 
@@ -2047,6 +2446,7 @@ async fn handle_discovery_remove(msg: Value, client_id: &str, ctx: &WsContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::handlers::test_helpers as th;
     use crate::server::handlers::test_helpers::{
         add_test_paired_client, add_test_unpaired_client, create_test_ctx,
     };
@@ -4316,15 +4716,14 @@ mod tests {
         );
     }
 
-    /// The half of that defect that is not a lookup, pinned so it cannot be
-    /// mistaken for fixed: a phone that is *only* reachable through the relay
-    /// has no socket here, so there is genuinely nowhere to send a refusal.
-    /// Reaching it needs the relay to route an `error` frame back to the device
-    /// it came from — a protocol and relay-side decision, not a map lookup.
+    /// `answer_channel` still answers only sockets, and that is not a limitation
+    /// any more — it is the deliberate half of the answer. Split out from the
+    /// test that used to sit here so the two claims cannot be confused: "this
+    /// map cannot reach a relay-only device" was true and stayed true; "so
+    /// nothing can" was the bug.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_relay_only_sender_has_no_socket_to_be_answered_on() {
+    async fn answer_channel_still_answers_sockets_only() {
         let ctx = create_test_ctx();
-        // Paired, but not connected: the state of every phone behind the relay.
         ctx.sync_engine.write().await.add_client(ConnectedClient {
             device_id: "dev_phone".to_string(),
             device_name: "Phone".to_string(),
@@ -4335,12 +4734,736 @@ mod tests {
         });
         assert!(
             answer_channel(&ctx, "dev_phone").await.is_none(),
-            "a device with no socket on this desktop cannot be answered; the \
-             relay is the only route to it"
+            "a device with no socket has no channel — `answer` is what routes \
+             around that, not a widened lookup"
         );
         assert!(
             answer_channel(&ctx, "ws_nobody").await.is_none(),
             "an unknown connection id has no channel either"
+        );
+    }
+
+    // ======================================================================
+    //  The relay is a destination, not a connection
+    //
+    //  `broadcast_to_others` and `WsServer::broadcast` both walked `ctx.clients`,
+    //  and the relay socket is outbound-only: `relay_tx` is an `mpsc::Sender`,
+    //  never a connection map entry. So a phone reachable only through the relay
+    //  received nothing from any of the seventeen handlers that fan out —
+    //  clipboard, notifications, SMS, calls, discovery/remove, and every
+    //  file-transfer control frame — and it failed *silently*, because
+    //  iterating an empty set is indistinguishable from success.
+    //
+    //  Directed sends already worked: `send_to` has had a relay arm. That
+    //  asymmetry is what made the feature look intermittent rather than broken.
+    // ======================================================================
+
+    const RELAY_PHONE_SECRET: &str =
+        "aa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899";
+
+    /// The flagship scenario, and the one the fix would silently skip: pair on
+    /// the LAN, then walk out of range. The device is in the registry and has
+    /// **no socket here**.
+    ///
+    /// That "no socket" part is the whole difficulty. `SyncEngine` — the map the
+    /// old code would have enumerated — has the device removed from it the moment
+    /// its LAN socket closes (`handle_client`), so a fan-out built on
+    /// `SyncEngine` would produce an empty recipient set for precisely this case
+    /// and appear to work in a test that models the device as connected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_peer_receives_a_broadcast() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+
+        let message = r#"{"type":"sms","action":"new","body":"481920"}"#;
+        broadcast_to_others(&ctx, "ws_desktop", message).await;
+
+        let route = th::only_relay_frame(&mut relay_rx);
+        assert_eq!(route["type"], "relay_route");
+        assert_eq!(
+            route["to_device_id"], "dev_phone",
+            "the route must name the device that has no socket here"
+        );
+        assert_eq!(
+            open_envelope(&ctx, RELAY_PHONE_SECRET, &route["payload"]),
+            message,
+            "and the phone must be able to open exactly what a LAN peer would"
+        );
+    }
+
+    /// A device with **both** a socket and a relay route is one device, and must
+    /// be served once.
+    ///
+    /// This is not hypothetical: it is exactly what a phone looks like during a
+    /// network transition, and it is the failure mode a fan-out fix introduces
+    /// most easily. Twice is worse than never — duplicate notifications,
+    /// duplicate clipboard rows, and duplicated file chunks corrupting a
+    /// transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_with_both_a_socket_and_a_relay_route_is_served_once() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+        // Same device, now also on the LAN.
+        let phone = add_test_paired_client(&ctx, "ws_phone", "dev_phone").await;
+        let mut phone_rx = phone.subscribe();
+
+        broadcast_to_others(&ctx, "ws_desktop", r#"{"type":"call","action":"ring"}"#).await;
+
+        assert!(
+            phone_rx.try_recv().is_ok(),
+            "the socket is the cheaper route and must still be served"
+        );
+        th::assert_relay_silent(&mut relay_rx);
+    }
+
+    /// The desktop registers itself under its own id
+    /// (`DeviceRouteKeys::refresh`), so an unfiltered recipient enumeration has
+    /// it route a frame to itself — which the relay delivers straight back,
+    /// `unwrap_relay_delivery` accepts, `dispatch` re-enters, and *that* fans out
+    /// again. Multiplicative, not linear, until the 1024-slot queue fills and
+    /// then the hub-wide stalls with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_desktop_is_never_its_own_relay_fan_out_recipient() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[]).await;
+        assert!(
+            ctx.route_keys
+                .routable_device_ids()
+                .iter()
+                .any(|id| id == ctx.device_id.as_str()),
+            "the fixture must really have registered this desktop, or the \
+             exclusion below is untested"
+        );
+
+        broadcast_to_others(&ctx, "ws_desktop", r#"{"type":"call","action":"ring"}"#).await;
+
+        th::assert_relay_silent(&mut relay_rx);
+    }
+
+    /// The sender exclusion has to be by **device id**, because that is what the
+    /// relay addresses — and for a relayed sender `sender_id` *is* the device id.
+    ///
+    /// Comparing the raw string against device ids would exclude nothing here
+    /// and hand the phone its own notification back. A phone that echoes its own
+    /// SMS into the desktop's clipboard history is a support ticket nobody
+    /// enjoys.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_sender_is_not_routed_its_own_broadcast_back() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(
+            &ctx,
+            &[
+                ("dev_sender", &"11".repeat(32)),
+                ("dev_other", &"22".repeat(32)),
+            ],
+        )
+        .await;
+
+        let inner = serde_json::to_string(&serde_json::json!({
+            "type": "clipboard", "action": "sync", "content": "secret", "mime": "text/plain"
+        }))
+        .unwrap();
+        let wire = relay_wire(&ctx, "dev_sender", &inner).await;
+        WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+
+        // The frame really was dispatched — otherwise "nothing routed" is
+        // trivially true because nothing happened.
+        assert_eq!(
+            ctx.storage.get_clipboard_history(10).await.unwrap().len(),
+            1,
+            "the relayed sync must have been handled, or this test proves nothing"
+        );
+        let route = th::only_relay_frame(&mut relay_rx);
+        assert_eq!(
+            route["to_device_id"], "dev_other",
+            "the only other peer must get it; the sender must not"
+        );
+    }
+
+    /// A relay-only frame must be **sealed**, not routed verbatim.
+    ///
+    /// The egress used to read the recipient's secret from `SyncEngine`, which
+    /// is a *liveness* map — the device is absent from it precisely when it is
+    /// relay-only — so every frame routed to that device fell through to
+    /// plaintext. That was already true of directed `file/chunk` frames, base64
+    /// payload and all, and it would have become true of clipboard and SMS
+    /// bodies the moment fan-out learned to reach the device.
+    ///
+    /// So this asserts the property that made the fix safe to ship, not just
+    /// that it works.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_frame_is_sealed_and_never_routed_in_the_clear() {
+        let ctx = create_test_ctx();
+        let secret = RELAY_PHONE_SECRET;
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", secret)]).await;
+
+        let message = r#"{"type":"clipboard","action":"sync","content":"my 2FA code is 481920"}"#;
+        broadcast_to_others(&ctx, "ws_desktop", message).await;
+
+        let route = th::only_relay_frame(&mut relay_rx);
+        assert_eq!(
+            route["payload"]["type"], "encrypted",
+            "a relay-only recipient has no socket, so `seal_for_peer` never runs \
+             for it; the relay egress must seal by device id or it sends cleartext"
+        );
+        assert!(
+            !serde_json::to_string(&route).unwrap().contains("481920"),
+            "the clipboard body must not appear on the relay wire in the clear"
+        );
+        assert_eq!(open_envelope(&ctx, secret, &route["payload"]), message);
+    }
+
+    /// The pairing filter that `broadcast_to_others` exists to enforce must hold
+    /// on the relay arm too, or the plaintext-leak class this function was
+    /// written for comes straight back through the second transport.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unpaired_or_revoked_device_is_never_a_fan_out_recipient() {
+        let ctx = create_test_ctx();
+        // A row that exists but is not paired, with a perfectly usable secret.
+        ctx.storage
+            .save_device(&crate::storage::StoredDevice {
+                id: "dev_revoked".to_string(),
+                name: "Old phone".to_string(),
+                device_type: "mobile".to_string(),
+                os: "android".to_string(),
+                public_key: "00".repeat(32),
+                shared_secret: "33".repeat(32),
+                paired_at: 0,
+                last_seen: 0,
+                battery: None,
+                signal: None,
+                status: "revoked".to_string(),
+            })
+            .await
+            .unwrap();
+        let mut relay_rx = th::add_test_relay(&ctx, &[]).await;
+        assert!(
+            !ctx.route_keys
+                .routable_device_ids()
+                .contains(&"dev_revoked".to_string()),
+            "a revoked row must not be routable at all"
+        );
+
+        broadcast_to_others(
+            &ctx,
+            "ws_desktop",
+            r#"{"type":"sms","action":"new","body":"x"}"#,
+        )
+        .await;
+
+        th::assert_relay_silent(&mut relay_rx);
+    }
+
+    // -----------------------------------------------------------------
+    //  One relayed frame, one count — against the device, not the socket
+    //
+    //  The audit recorded this as "every phone behind the relay shares one
+    //  transport bucket keyed on the literal `"relay_server"`, so one file
+    //  transfer throttles every other phone". The mechanism was wrong and the
+    //  defect was worse: `admit_frame` has exactly one caller — the LAN reader —
+    //  and the relay read loop calls `handle_message` directly, so the
+    //  `"relay_server"` bucket was **never created**. Relayed frames were charged
+    //  no count *and no bytes* by any phone, at all.
+    //
+    //  These tests pin the corrected invariant, which is strictly more accounting
+    //  than before rather than a repartition of an existing charge.
+    // -----------------------------------------------------------------
+
+    /// What a relay actually puts on the wire for one frame from `sender`: the
+    /// sender's sealed payload inside the `relay_delivery` envelope the relay
+    /// emits after verifying the route.
+    ///
+    /// Sealed by **device** id, the way the relay egress seals, so a sender with
+    /// no socket here still produces a real envelope. (Its predecessor went
+    /// through `seal_for_peer`, which returns plaintext for an unmapped id — so
+    /// it only ever sealed because both callers happened to pass a connection
+    /// id.)
+    async fn relay_wire(ctx: &WsContext, sender: &str, inner: &str) -> String {
+        let sealed = WsServer::seal_for_device(ctx, sender, inner).await;
+        serde_json::to_string(&RelayDelivery::new(
+            sender,
+            "test-device",
+            serde_json::from_str(&sealed).expect("sealed payload is JSON"),
+        ))
+        .expect("RelayDelivery serializes")
+    }
+
+    fn relayed_notification(id: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "notification", "action": "post", "id": id,
+            "app": "Slack", "title": "t", "body": "b", "timestamp": 1_700_000_000
+        }))
+        .unwrap()
+    }
+
+    /// REGRESSION: a relayed frame is charged to its **sender's** device budget,
+    /// once — and to the transport *not* at all, which is what makes this a
+    /// charge rather than the double-charge `admit_frame`'s doc warns about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_frame_costs_exactly_one_count_on_its_senders_budget() {
+        let budget = 6u32;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+
+        for i in 0..budget {
+            let wire = relay_wire(&ctx, "dev_phone", &relayed_notification(&format!("n{i}"))).await;
+            WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+        }
+        assert_eq!(
+            ctx.rate_limiter.window_messages("dev_phone").await,
+            budget,
+            "{budget} relayed frames must cost {budget} counts on the sender's \
+             budget — one each, and no more"
+        );
+        assert_eq!(
+            ctx.rate_limiter
+                .window_messages(WsServer::RELAY_CLIENT_ID)
+                .await,
+            0,
+            "the transport must not be charged for a frame a device can be named \
+             for, or every peer is throttled by every other one"
+        );
+        assert_eq!(
+            ctx.storage.get_notifications(50).await.unwrap().len(),
+            budget as usize,
+            "and every one of them must actually have been handled"
+        );
+    }
+
+    /// The fairness property the audit was reaching for, and the one that makes
+    /// per-device charging worth having: one relayed peer's budget is its own.
+    ///
+    /// Before the fix this was unreachable in the *good* direction — no peer was
+    /// charged anything — so a file transfer could not throttle a sibling. The
+    /// risk of the fix is that it reintroduces the sharing, in the other
+    /// direction. This is the test that says it did not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_relay_peer_exhausting_its_budget_does_not_throttle_another() {
+        let budget = 2u32;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        th::add_test_relay(
+            &ctx,
+            &[
+                ("dev_noisy", &"11".repeat(32)),
+                ("dev_quiet", &"22".repeat(32)),
+            ],
+        )
+        .await;
+
+        // The noisy peer saturates its own budget, and the frame past it is
+        // dropped.
+        for i in 0..=budget {
+            let wire = relay_wire(
+                &ctx,
+                "dev_noisy",
+                &relayed_notification(&format!("noisy{i}")),
+            )
+            .await;
+            WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+        }
+        assert_eq!(
+            ctx.storage.get_notifications(50).await.unwrap().len(),
+            budget as usize,
+            "the frame past the budget must be dropped, or this is not a budget"
+        );
+
+        // The quiet peer then gets through on its own untouched budget. This is
+        // the assertion that would fail if the charge were still keyed on the
+        // transport.
+        WsServer::handle_message(
+            &relay_wire(&ctx, "dev_quiet", &relayed_notification("quiet")).await,
+            WsServer::RELAY_CLIENT_ID,
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            ctx.rate_limiter.window_messages("dev_quiet").await,
+            1,
+            "a second peer must not be charged for the first one's traffic"
+        );
+        assert!(
+            ctx.storage
+                .get_notifications(50)
+                .await
+                .unwrap()
+                .iter()
+                .any(|n| n.id == "quiet"),
+            "a peer the other one could not throttle must still be served"
+        );
+    }
+
+    /// A frame this desktop *refuses* still costs its sender. Both halves have to
+    /// hold or the budget can be evaded by making the server reject your traffic
+    /// — the same reason `rejected_frames_still_consume_the_transport_budget`
+    /// exists for the LAN reader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_frame_this_desktop_refuses_still_costs_its_sender() {
+        let ctx = ctx_with_transport_budget(10, 1 << 20);
+        th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+
+        // A name the file handler rejects, so the frame is refused after the
+        // budget and before the handler does anything useful.
+        let inner = serde_json::to_string(&serde_json::json!({
+            "type": "file", "action": "request", "id": "t1", "name": "../escape"
+        }))
+        .unwrap();
+        WsServer::handle_message(
+            &relay_wire(&ctx, "dev_phone", &inner).await,
+            WsServer::RELAY_CLIENT_ID,
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            ctx.rate_limiter.window_messages("dev_phone").await,
+            1,
+            "a refused relayed frame must still be charged to the peer that sent it"
+        );
+    }
+
+    /// A relayed frame whose sender cannot be named — malformed, or claiming an
+    /// id this desktop has not paired — is charged to the transport instead, so
+    /// "refusal is free" does not become true on this path either. These are
+    /// precisely the frames that never reach a handler at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattributable_relayed_frame_is_charged_to_the_transport() {
+        let ctx = ctx_with_transport_budget(10, 1 << 20);
+        th::add_test_relay(&ctx, &[]).await;
+
+        for i in 0..3 {
+            let forged = serde_json::to_string(&serde_json::json!({
+                "type": "relay_delivery",
+                "from_device_id": format!("dev_stranger{i}"),
+                "payload": {"type": "sms", "action": "new", "body": "x"}
+            }))
+            .unwrap();
+            WsServer::handle_message(&forged, WsServer::RELAY_CLIENT_ID, &ctx).await;
+        }
+
+        assert_eq!(
+            ctx.rate_limiter
+                .window_messages(WsServer::RELAY_CLIENT_ID)
+                .await,
+            3,
+            "frames from senders this desktop does not know must still cost \
+             something, or an unauthenticated peer gets unlimited parse attempts"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    //  Telling a relay-only peer why it was refused
+    //
+    //  `answer_channel` resolved a device id through the pairing registry, so it
+    //  reached a relayed sender that *also* had a socket and missed every sender
+    //  that did not. Every refusal — `rate_limited`, `invalid_message`,
+    //  `not_authenticated`, a settings gate — was then looked up, missed, and
+    //  dropped. The peer was refused and never told why, which from the far end
+    //  is indistinguishable from a dropped socket.
+    //
+    //  Nothing about the wire format had to change: `relay_route`'s payload is an
+    //  arbitrary JSON message and the relay forwards it without inspecting it,
+    //  so an `error` was always a legal thing to route. The route simply was not
+    //  being taken. The previous version of this test asserted the *absence* of
+    //  the capability and called closing it "a protocol and relay-side decision".
+    // -----------------------------------------------------------------
+
+    /// REGRESSION, and the replacement for the test that used to pin this as
+    /// unfixable: a phone that is only reachable through the relay is told why it
+    /// was refused, in the same signed route every other relayed frame uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_sender_is_told_why_it_was_refused() {
+        let ctx = create_test_ctx();
+        let secret = RELAY_PHONE_SECRET;
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", secret)]).await;
+
+        // `pairing` is exempt from the auth gate and has the cheapest budget to
+        // exhaust (5/min), so this drives the real `rate_limited` arm without
+        // needing a stream to run.
+        let attempt = r#"{"type":"pairing","action":"request","token":"NOT-A-REAL-TOKEN"}"#;
+        for _ in 0..5 {
+            let wire = relay_wire(&ctx, "dev_phone", attempt).await;
+            WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+        }
+        let wire = relay_wire(&ctx, "dev_phone", attempt).await;
+        WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+
+        let route = th::only_relay_frame(&mut relay_rx);
+        assert_eq!(
+            route["to_device_id"], "dev_phone",
+            "the refusal must be addressed to the device that was refused"
+        );
+        let inner = open_envelope(&ctx, secret, &route["payload"]);
+        assert!(
+            inner.contains("rate_limited"),
+            "the peer must be told it was throttled, not left guessing: {inner}"
+        );
+    }
+
+    /// The same shape for a `ping`, because `handle_message` dispatches a
+    /// relayed delivery under its **device id**, which is in no connection map.
+    /// A relay-only peer could not even be probed for reachability.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_device_gets_its_pong() {
+        let ctx = create_test_ctx();
+        let secret = RELAY_PHONE_SECRET;
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", secret)]).await;
+
+        let wire = relay_wire(&ctx, "dev_phone", r#"{"type":"ping","seq":1}"#).await;
+        WsServer::handle_message(&wire, WsServer::RELAY_CLIENT_ID, &ctx).await;
+
+        let route = th::only_relay_frame(&mut relay_rx);
+        let inner = open_envelope(&ctx, secret, &route["payload"]);
+        assert!(
+            inner.contains("pong"),
+            "a relay-only device must still be probeable: {inner}"
+        );
+    }
+
+    /// A refusal aimed at an id that is not a paired device gets **no** signed
+    /// route.
+    ///
+    /// This does not fail before the fix — before the fix it also produced
+    /// nothing, for the wrong reason (the code simply dropped it). It is here
+    /// because the fix turns a previously-harmless drop into a pre-auth egress
+    /// that signs and encrypts on demand: `send_error` is reachable from
+    /// `not_authenticated`, so without the `is_trusted_peer` gate in
+    /// `relay_route_to` a stranger could make this desktop mint a signed, sealed
+    /// route per refused frame just by sending junk.
+    ///
+    /// Labelled as the guard it is, rather than dressed up as a regression.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_for_an_unknown_id_is_not_given_a_signed_relay_route() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[]).await;
+
+        send_error(&ctx, "ws_stranger", "not_authenticated", "nope").await;
+        th::assert_relay_silent(&mut relay_rx);
+
+        // And the transport id must never acquire peer authority, which is what
+        // would let a `relay_auth_rejected` frame on the relay socket mint one.
+        assert!(
+            !WsServer::RELAY_CLIENT_ID.eq(ctx.device_id.as_str()),
+            "the transport id must not collide with this desktop's own id"
+        );
+        send_error(&ctx, WsServer::RELAY_CLIENT_ID, "invalid_message", "nope").await;
+        th::assert_relay_silent(&mut relay_rx);
+    }
+
+    /// A relayed **binary** frame names its recipient, not its sender, so there is
+    /// no device id to charge a per-sender budget against — but the transport
+    /// budget is the only thing standing between that socket and a binary flood,
+    /// so it is charged. It used not to be: the text arm was charged and the
+    /// binary one was not, which made the cheapest flood the unaccounted one.
+    ///
+    /// Drives [`WsServer::admit_relay_binary`], which is the same function
+    /// `spawn_relay_client`'s read loop calls — not a restatement of what the
+    /// limiter does, which would pass whether or not the loop called it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relayed_binary_frame_is_charged_to_the_transport_budget() {
+        let budget = 3u32;
+        let ctx = ctx_with_transport_budget(budget, 1 << 20);
+        th::add_test_relay(&ctx, &[]).await;
+
+        for i in 0..budget {
+            assert!(
+                WsServer::admit_relay_binary(&ctx, &[0u8; 4]).await,
+                "relayed binary frame {} of a {budget}-frame budget must be admitted",
+                i + 1
+            );
+        }
+        assert!(
+            !WsServer::admit_relay_binary(&ctx, &[0u8; 4]).await,
+            "and the frame past the budget must be refused, or the budget is a \
+             formality and a binary flood is unmetered"
+        );
+        assert_eq!(
+            ctx.rate_limiter
+                .window_messages(WsServer::RELAY_CLIENT_ID)
+                .await,
+            budget + 1,
+            "a relayed binary frame costs one count on the transport, like a \
+             relayed text frame costs one on the sender"
+        );
+    }
+
+    /// The pairing filter has to hold on the relay arm too, or the plaintext-leak
+    /// class `broadcast_to_others` was written for comes straight back through
+    /// the second transport.
+    ///
+    /// Note what is *not* asserted: that `refresh()` skips a
+    /// `status != "paired"` row. That is the filter's job and
+    /// `relay::tests::an_unpaired_or_revoked_device_cannot_route` already pins it
+    /// against the real registry. Restating it here would only test the fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_fan_out_recipient_set_is_exactly_the_routable_devices() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[]).await;
+
+        // The set the fan-out draws from is the routing table and nothing else,
+        // so anything absent from it cannot be named — not an unpaired device, not
+        // a revoked one, not an id a peer made up.
+        assert_eq!(
+            ctx.route_keys.routable_device_ids(),
+            vec![ctx.device_id.as_str().to_string()],
+            "the fixture registers only this desktop; a device that is not routable \
+             is not a fan-out target"
+        );
+
+        broadcast_to_others(
+            &ctx,
+            "ws_desktop",
+            r#"{"type":"sms","action":"new","body":"x"}"#,
+        )
+        .await;
+
+        th::assert_relay_silent(&mut relay_rx);
+    }
+
+    /// An oversized frame is refused by the relay's read ceiling — and crossing
+    /// that ceiling **closes the connection** rather than dropping one frame, so a
+    /// single padded `sms` from one paired peer would otherwise take every
+    /// relay-only peer offline for a whole backoff interval.
+    ///
+    /// `validate_message` closes no field set for `sms`, so the frame below is
+    /// accepted by the dispatcher; the guard has to be here rather than upstream
+    /// or this is an availability bug reachable from a paired peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_oversized_broadcast_is_refused_before_it_can_kill_the_relay_leg() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+
+        let oversized = serde_json::json!({
+            "type": "sms", "action": "new", "body": "x",
+            "pad": "a".repeat(WsServer::MAX_RELAY_BROADCAST_BYTES + 1),
+        });
+        assert!(
+            oversized.to_string().len() > WsServer::MAX_RELAY_BROADCAST_BYTES,
+            "the fixture frame must exceed the guard, or this asserts nothing"
+        );
+
+        assert_eq!(
+            WsServer::fan_out_to_relay(&ctx, None, &oversized.to_string()).await,
+            0,
+            "an oversized frame must not be routed"
+        );
+        th::assert_relay_silent(&mut relay_rx);
+
+        // And the guard must not be a blanket ban: a normal frame still goes.
+        broadcast_to_others(
+            &ctx,
+            "ws_desktop",
+            r#"{"type":"sms","action":"new","body":"hi"}"#,
+        )
+        .await;
+        assert_eq!(
+            th::only_relay_frame(&mut relay_rx)["to_device_id"],
+            "dev_phone"
+        );
+    }
+
+    /// REGRESSION: `WsServer::broadcast` is the *other* half of the fan-out
+    /// defect, and it is the path every desktop-originated frame takes —
+    /// `commands::notifications::forward_to_peers_checked` reaches it for a
+    /// dismissal, a reply and a clipboard sync. A fix that taught only
+    /// `broadcast_to_others` about the relay would leave the desktop's own
+    /// notifications and clipboard on the LAN and nowhere else.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_desktops_own_broadcast_reaches_a_relay_only_peer() {
+        let ctx = create_test_ctx();
+        let mut relay_rx = th::add_test_relay(&ctx, &[("dev_phone", RELAY_PHONE_SECRET)]).await;
+        let server = server_over(ctx.clone());
+        let message = r#"{"type":"notification","action":"post","id":"n1"}"#;
+
+        server.broadcast(message.to_string()).await;
+
+        let route = th::only_relay_frame(&mut relay_rx);
+        assert_eq!(route["to_device_id"], "dev_phone");
+        assert_eq!(
+            route["payload"]["type"], "encrypted",
+            "a relay-only recipient has no socket, so the LAN writer's sealing \
+             never runs for it"
+        );
+        assert_eq!(
+            open_envelope(&ctx, RELAY_PHONE_SECRET, &route["payload"]),
+            message
+        );
+    }
+
+    /// REGRESSION: a relayed binary frame is attributed to the device the relay
+    /// authenticated.
+    ///
+    /// Two separate defects sat on this path and both had to go for a chunk to
+    /// arrive. `unwrap_relay_binary_frame` enumerated candidate senders from
+    /// `SyncEngine` — a *liveness* map, so a phone that paired on the LAN and
+    /// then moved networks was not in it and the frame was refused one layer
+    /// early. Then `handle_lan_chunk` received the device id the unwrapper had
+    /// correctly resolved and looked it up in `ws_to_device_id`, which is keyed
+    /// the *other* way round, so `unwrap_or_default()` produced `""` and the
+    /// chunk was dropped **after** the relay had verified its tag.
+    ///
+    /// Asserted on the attribution and on the secret resolution rather than on
+    /// the file engine's byte count: the engine assertion needs its own
+    /// temp-directory fixture, which would test the engine rather than the
+    /// identity resolution that was the defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relay_only_senders_binary_frame_is_attributed_to_it() {
+        use conduit_protocol::{CHUNK_HEADER_LEN, CHUNK_NONCE_LEN};
+        let ctx = create_test_ctx();
+        let secret = RELAY_PHONE_SECRET;
+        th::add_test_relay(&ctx, &[("dev_phone", secret)]).await;
+
+        let plaintext = b"chunk-bytes-from-a-phone".to_vec();
+        let (nonce, ciphertext) = ctx
+            .encryption
+            .encrypt_binary(secret, &plaintext)
+            .expect("chunk encryption");
+        let metadata =
+            serde_json::to_vec(&serde_json::json!({"id": "t_relay", "index": 0, "total": 2}))
+                .expect("metadata serialises");
+        let mut envelope = Vec::with_capacity(CHUNK_HEADER_LEN + metadata.len() + ciphertext.len());
+        envelope.extend_from_slice(&nonce[..CHUNK_NONCE_LEN]);
+        envelope.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        envelope.extend_from_slice(&metadata);
+        envelope.extend_from_slice(&ciphertext);
+
+        let frame = conduit_protocol::build_binary_frame(
+            &conduit_protocol::hmac::derive_route_key(&hex::decode(secret).unwrap(), "dev_phone"),
+            "dev_phone",
+            ctx.device_id.as_str(),
+            1,
+            &envelope,
+        );
+
+        let (attributed, payload) =
+            handlers::files::unwrap_relay_binary_frame_for_tests(&frame, &ctx)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("a tagged frame from a paired phone must be attributed: {e}")
+                });
+        assert_eq!(
+            attributed, "dev_phone",
+            "the sender is the device whose route key verified the tag"
+        );
+        assert_eq!(
+            payload, envelope,
+            "the payload is the chunk envelope, verbatim"
+        );
+
+        // And the step that was broken inside `handle_lan_chunk`: the device id
+        // the unwrapper just resolved must itself resolve to a secret, where
+        // before it was looked up in a connection-keyed map and came back `""`.
+        assert_eq!(
+            handlers::peer_secret(&ctx, &attributed).await.as_deref(),
+            Some(secret),
+            "a relay-only sender's device id must resolve to its pairing secret, \
+             or the chunk is dropped after authentication"
+        );
+        assert!(
+            handlers::peer_secret(&ctx, "ws_not_a_device")
+                .await
+                .is_none(),
+            "and a connection id must not resolve to one"
         );
     }
 }

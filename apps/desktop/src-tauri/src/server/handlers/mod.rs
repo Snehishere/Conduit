@@ -82,6 +82,36 @@ pub async fn mark_paired(ctx: &WsContext, client_id: &str, device_id: &str) {
         .insert(client_id.to_string(), device_id.to_string());
 }
 
+/// The shared secret for `device_id`, from whichever authority still has it.
+///
+/// **The one answer to "does this device id name a paired device, and what do I
+/// encrypt for it".** Three places used to ask this separately and disagreed,
+/// because they read two different maps that mean different things:
+///
+///   * [`crate::sync::SyncEngine`] is a **liveness** map. `handle_client` removes
+///     a device from it the instant its LAN socket closes, so a phone that
+///     paired on the LAN and then moved networks is *absent from it* while
+///     still paired, still registered with the relay, and still sending.
+///   * `ctx.route_keys` is the **pairing registry**, refreshed from the device
+///     table and refreshed again every [`KEY_REFRESH_INTERVAL`]. It outlives
+///     the socket, which is exactly the property a relay peer needs.
+///
+/// Order matters and is not arbitrary: `SyncEngine` is consulted first so that
+/// every device with a live socket keeps byte-identical behaviour to before,
+/// including the case where a re-pair has written a fresh secret there and the
+/// relay's copy is up to 5 s behind. `route_keys` is the fallback, not a
+/// replacement.
+///
+/// `None` for this desktop's own id: its route key is self-generated and has no
+/// pairing secret behind it. Callers that must not address it subtract it
+/// separately — see [`crate::server::WsServer::fan_out_to_relay`].
+pub async fn peer_secret(ctx: &WsContext, device_id: &str) -> Option<String> {
+    if let Some(client) = ctx.sync_engine.read().await.get_client(device_id) {
+        return Some(client.shared_secret.clone());
+    }
+    ctx.route_keys.secret_for(device_id)
+}
+
 /// Whether `client_id` holds *any* identity, i.e. an entry exists in the
 /// pairing registry.
 ///
@@ -101,33 +131,35 @@ pub async fn has_identity(ctx: &WsContext, client_id: &str) -> bool {
 /// the two writers of the registry — `mark_paired` always runs next to
 /// `SyncEngine::add_client`, and `mark_local_desktop` is the explicit
 /// no-secret case — but it means an entry on its own is never sufficient, so a
-/// half-finished pairing (or a device whose `ConnectedClient` was already
-/// reaped) is treated as untrusted instead of trusted.
+/// half-finished pairing is treated as untrusted instead of trusted.
 ///
 /// A relayed message arrives already attributed to a device that has no socket
 /// here, so `client_id` is a **device id** and there is no registry entry for
-/// it. That case is resolved against the device registry directly: the relay
-/// authenticated the sender during `relay_auth` and re-checked the route
-/// signature against that same id, so the device row plus its derived secret is
-/// the authority, and the absence of a LAN socket is not evidence of anything.
+/// it. That case resolves through [`peer_secret`]: the relay authenticated the
+/// sender during `relay_auth` and re-checked the route signature against that
+/// same id, so the device registry is the authority, and the absence of a LAN
+/// socket is not evidence of anything.
+///
+/// Resolved in two steps rather than under one guard, so `ws_to_device_id` is
+/// read and released before `SyncEngine` is taken. Two readers taking two locks
+/// in opposite orders cannot deadlock whatever else is queued — that was never
+/// the hazard here — but it does mean the two cannot be held simultaneously,
+/// which is worth preserving now that this function is on the auth gate for
+/// every protected frame.
 pub async fn is_trusted_peer(ctx: &WsContext, client_id: &str) -> bool {
-    let engine = ctx.sync_engine.read().await;
-
-    // A relayed sender: trusted iff it is a paired device with a derived secret.
-    // Tried first because a LAN connection id is never also a device id.
-    if let Some(client) = engine.get_client(client_id) {
-        return !client.shared_secret.is_empty();
+    // A relayed sender, or a device id. Tried first because a LAN connection id
+    // is never also a device id.
+    if let Some(secret) = peer_secret(ctx, client_id).await {
+        return !secret.is_empty();
     }
 
     let Some(stable_id) = paired_device_id(ctx, client_id).await else {
         return false;
     };
-    if stable_id == LOCAL_DESKTOP_ID {
-        return true;
-    }
-    engine
-        .get_client(&stable_id)
-        .is_some_and(|c| !c.shared_secret.is_empty())
+    stable_id == LOCAL_DESKTOP_ID
+        || peer_secret(ctx, &stable_id)
+            .await
+            .is_some_and(|s| !s.is_empty())
 }
 
 /// The stable device id bound to `client_id`, if any.
@@ -135,7 +167,8 @@ pub async fn paired_device_id(ctx: &WsContext, client_id: &str) -> Option<String
     ctx.ws_to_device_id.read().await.get(client_id).cloned()
 }
 
-/// Fan a message out to every **paired** connection except `sender_id`.
+/// Fan a message out to every **paired** peer except the sender, on whichever
+/// transport reaches each one.
 ///
 /// Unpaired connections are skipped. This is the fix for the plaintext-leak
 /// vulnerability: every accepted socket used to be in `ctx.clients`, so a peer
@@ -144,7 +177,41 @@ pub async fn paired_device_id(ctx: &WsContext, client_id: &str) -> Option<String
 /// and, having no `ws_to_device_id` entry, the per-socket encryption path could
 /// not even find a shared secret for it, so the **raw plaintext** was written
 /// to its socket.
+///
+/// # The relay arm
+///
+/// The loop below can only reach `ctx.clients`, and the relay socket is not in
+/// it — `relay_tx` is an `mpsc::Sender`, not a connection. So a phone reachable
+/// only through the relay received nothing from any of the seventeen handlers
+/// that call this: clipboard, notifications, SMS, calls, discovery/remove and
+/// every file-transfer control frame. It failed silently, because iterating an
+/// empty set is indistinguishable from success. That is what
+/// [`crate::server::WsServer::fan_out_to_relay`] is for, and it targets
+/// exactly the paired devices with **no** socket here, so a device that is on
+/// the LAN as well is served by this loop and never served twice.
+///
+/// # Lock order, which is why the relay arm runs first
+///
+/// The relay arm seals per recipient, which reads `SyncEngine`. This loop holds
+/// `clients` and `ws_to_device_id` readers, and `is_trusted_peer` takes
+/// `SyncEngine` then `ws_to_device_id` — the opposite order. Calling the arm
+/// while either guard is live would invert it, and tokio's `RwLock` is
+/// write-preferring, so a single queued writer would wedge both. Running it
+/// first, before either guard is taken, makes the two orders independent rather
+/// than nested.
 pub async fn broadcast_to_others(ctx: &WsContext, sender_id: &str, message: &str) {
+    // `sender_id` is a connection id on the LAN and a **device id** when the
+    // sender is relayed, and the relay arm excludes by device. Resolved through
+    // the registry so one comparison answers "is this the sender" on both
+    // transports. For a relayed sender the registry has no entry and the id is
+    // already a device id, so it stands — which is the case that matters: the
+    // raw string would have excluded nothing and handed the phone its own
+    // notification back.
+    let sender_device = paired_device_id(ctx, sender_id)
+        .await
+        .unwrap_or_else(|| sender_id.to_string());
+    crate::server::WsServer::fan_out_to_relay(ctx, Some(&sender_device), message).await;
+
     let clients = ctx.clients.read().await;
     let identities = ctx.ws_to_device_id.read().await;
     for (id, client_tx) in clients.iter() {
@@ -307,6 +374,122 @@ pub(crate) mod test_helpers {
                 battery_level: None,
             });
         tx
+    }
+
+    /// Make this desktop one that is hosting **and connected to** a relay, with
+    /// `devices` paired in the device registry, and hand back the receiving end
+    /// of the relay's egress queue.
+    ///
+    /// Every part of this is load-bearing, and the reason a relay-only peer is
+    /// hard to model in a test is that each piece of it used to be faked
+    /// separately:
+    ///
+    ///   * the registry row, because [`crate::server::WsServer::fan_out_to_relay`]
+    ///     enumerates the route keys, which are refreshed from the device table —
+    ///     and `create_test_ctx` never refreshes them, so `routable_device_ids()`
+    ///     is empty and the relay arm is dead code in every other test here;
+    ///   * this desktop's **own** id in that set, because it is what makes the
+    ///     self-exclusion test meaningful rather than vacuous: `relay_route_to`
+    ///     gates on `is_trusted_peer`, and the desktop has no pairing secret of
+    ///     its own, so without a seeded one the gate would mask a missing filter;
+    ///   * the channel, because without a connected relay the fan-out returns 0
+    ///     on its first line.
+    ///
+    /// The registry row and the route key are deliberately *not* the same thing,
+    /// and both are written: the row is what [`crate::handlers::is_trusted_peer`]
+    /// eventually consults and what a test asserting on storage sees, while the
+    /// key is what the fan-out enumerates. Seeding the keys directly rather than
+    /// calling `refresh()` keeps the fixture off the OS keyring.
+    ///
+    /// The returned receiver is what a test asserts *on*: it is the relay's
+    /// routing table from the desktop's point of view, so what lands in it is
+    /// exactly what a phone would have received.
+    ///
+    /// `devices` is `(device_id, shared_secret_hex)`. A device listed here has a
+    /// registry row but **no socket** — that is the relay-only state, and it is
+    /// not the state `add_test_paired_client` builds (that one also registers a
+    /// connection and a `ws_to_device_id` entry). The fixture asserts that
+    /// absence itself, so it cannot quietly grow a socket later and turn every
+    /// test here into a tautology.
+    pub async fn add_test_relay(
+        ctx: &WsContext,
+        devices: &[(&str, &str)],
+    ) -> tokio::sync::mpsc::Receiver<String> {
+        for (id, secret) in devices {
+            ctx.storage
+                .save_device(&crate::storage::StoredDevice {
+                    id: (*id).to_string(),
+                    name: (*id).to_string(),
+                    device_type: "mobile".to_string(),
+                    os: "android".to_string(),
+                    public_key: "00".repeat(32),
+                    shared_secret: (*secret).to_string(),
+                    paired_at: 0,
+                    last_seen: 0,
+                    battery: None,
+                    signal: None,
+                    status: "paired".to_string(),
+                })
+                .await
+                .expect("save paired device for the relay fixture");
+            let bytes = hex::decode(secret).expect("the fixture's secret must be hex");
+            ctx.route_keys.register_for_tests(
+                id,
+                conduit_protocol::hmac::derive_route_key(&bytes, id).to_vec(),
+                secret,
+            );
+        }
+        // This desktop registers itself under its own id in production. Seeded
+        // here with a secret it does not really have, so that a fan-out which
+        // failed to exclude it would be caught by `relay_route_to`'s trust gate
+        // rather than passing because the gate happened to refuse it.
+        let own = ctx.device_id.as_str();
+        ctx.route_keys
+            .register_for_tests(own, vec![0x5a; 32], &"5a".repeat(32));
+
+        // The fixture's whole purpose is a peer with *no* socket here. Assert it
+        // rather than trusting it: if this ever stops holding, every test using
+        // the fixture silently becomes a LAN test.
+        for (id, _) in devices {
+            assert!(
+                !ctx.clients.read().await.contains_key(*id),
+                "{id} must have no socket for this fixture to model a relay-only peer"
+            );
+            assert!(
+                ctx.ws_to_device_id.read().await.get(*id).is_none(),
+                "{id} must have no pairing-registry entry either"
+            );
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        *ctx.relay_tx.write().await = Some(tx);
+        rx
+    }
+
+    /// The single frame sitting in a relay queue, parsed.
+    ///
+    /// Asserts there is **exactly one**, because "served twice" is the failure
+    /// mode a fan-out fix introduces most easily and a fan-out that sends twice
+    /// is worse than one that sends never: duplicate notifications, duplicate
+    /// clipboard rows, and duplicated file chunks corrupting a transfer.
+    #[track_caller]
+    pub fn only_relay_frame(rx: &mut tokio::sync::mpsc::Receiver<String>) -> serde_json::Value {
+        let frame = rx.try_recv().expect("the relay queue must carry the frame");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one frame may be routed per recipient; a second one means \
+             the peer is served twice"
+        );
+        serde_json::from_str(&frame).expect("a relayed frame is JSON")
+    }
+
+    /// Nothing at all was routed.
+    #[track_caller]
+    pub fn assert_relay_silent(rx: &mut tokio::sync::mpsc::Receiver<String>) {
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be routed through the relay in this case"
+        );
     }
 }
 

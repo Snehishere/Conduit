@@ -96,6 +96,20 @@ pub struct DeviceRouteKeys {
     storage: Arc<Storage>,
     local_device_id: String,
     keys: std::sync::RwLock<StaticRouteKeys>,
+    /// The pairing secret each registered device's route key was derived from,
+    /// kept so the app can still *seal* for a device that has no socket here.
+    ///
+    /// Added because `SyncEngine` — which the hub's egress used to read the
+    /// secret from — is a **liveness** map: `handle_client` removes a device
+    /// from it the moment its LAN socket closes. A phone that paired on the LAN
+    /// and then moved networks is therefore still paired and still routing, but
+    /// absent from `SyncEngine`, and every frame sealed for it fell through to
+    /// plaintext. The registry outlives the socket; this is the registry.
+    ///
+    /// Hex, because that is what `EncryptionManager::encrypt` takes — keeping
+    /// the wire form avoids a decode on the egress hot path. Never printed; see
+    /// the hand-written `Debug`.
+    secrets: std::sync::RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for DeviceRouteKeys {
@@ -118,6 +132,7 @@ impl DeviceRouteKeys {
             storage,
             local_device_id,
             keys: std::sync::RwLock::new(StaticRouteKeys::new()),
+            secrets: std::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -153,13 +168,106 @@ impl DeviceRouteKeys {
         self.key_for(device_id)
     }
 
+    /// The pairing secret `device_id` last refreshed with, if it is registered.
+    ///
+    /// The half of the registry that outlives a socket. `SyncEngine` is the
+    /// half that does not, and the egress needs both answers: "may I address
+    /// this device" is answered by [`Self::routable_device_ids`], and "what do I
+    /// encrypt for it" by this.
+    ///
+    /// `None` for this desktop's own id, deliberately: its route key is
+    /// self-generated and has no pairing secret behind it, so there is nothing
+    /// to seal to and nothing should try.
+    pub fn secret_for(&self, device_id: &str) -> Option<String> {
+        self.secrets.read().ok()?.get(device_id).cloned()
+    }
+
+    /// Every device the relay will accept a route from, sorted.
+    ///
+    /// The authoritative answer to "which devices may I address through the
+    /// relay", and the reason it is not `SyncEngine::get_all_client_ids()`:
+    /// this set survives a LAN socket closing, and is exactly the set the relay
+    /// keys its own verification against — it hands this very object to
+    /// `RelayService::start`, and `route::handle_relay_route` refuses any sender
+    /// with no key here. Enumerating it cannot name a device the relay would
+    /// then drop.
+    ///
+    /// Includes this desktop's own id, so callers must subtract it: a route from
+    /// the desktop to the desktop is a loop.
+    pub fn routable_device_ids(&self) -> Vec<String> {
+        self.keys.read().map(|k| k.device_ids()).unwrap_or_default()
+    }
+
+    /// Register one device's route key and pairing secret directly, bypassing
+    /// [`Self::refresh`].
+    ///
+    /// Test-only, and it exists because `refresh()` is not usable from a test
+    /// fixture: it reads the **production** OS keyring account
+    /// `relay_route_key`, so a unit test that calls it both mutates the installed
+    /// app's real signing key and fails outright on a runner with no credential
+    /// store. Seeding both maps here keeps the desktop's tests hermetic — same
+    /// property `create_test_ctx` already has with in-memory SQLite and a random
+    /// `EncryptionManager` — and keeps `refresh()` itself under test in
+    /// [`Self::refresh`]'s own tests, where the keyring is the thing being exercised.
+    ///
+    /// `for_device` takes the already-derived route key, so a test states the key it
+    /// signed with rather than deriving one the code might derive differently.
+    #[cfg(test)]
+    pub(crate) fn register_for_tests(&self, device_id: &str, route_key: Vec<u8>, secret_hex: &str) {
+        self.keys
+            .write()
+            .expect("route key lock")
+            .insert(device_id.to_string(), route_key);
+        self.secrets
+            .write()
+            .expect("secret lock")
+            .insert(device_id.to_string(), secret_hex.to_string());
+    }
+
+    /// Stop routing for `device_id` **now**, rather than at the next refresh.
+    ///
+    /// Added because the fallback tier in `handlers::peer_secret` made this
+    /// registry an authority for the auth gate, and therefore made its staleness
+    /// a security window rather than a routing detail: `SyncEngine` removed a
+    /// revoked device synchronously, so unpairing used to take effect at once,
+    /// while this map would have carried on naming the device as both routable
+    /// and trusted for up to [`KEY_REFRESH_INTERVAL`].
+    ///
+    /// Both maps are cleared under the same write, so there is no window in which
+    /// the device is unroutable but still trusted. Idempotent, and a no-op for
+    /// an id that was never registered.
+    ///
+    /// Note what this does *not* do: it does not withdraw the device's route key
+    /// from the relay itself, which keeps its own copy and answers
+    /// `unknown_device` from that. That copy refreshes on the relay's schedule,
+    /// not this process's.
+    pub fn forget(&self, device_id: &str) {
+        if let Ok(mut keys) = self.keys.write() {
+            keys.remove(device_id);
+        }
+        if let Ok(mut secrets) = self.secrets.write() {
+            secrets.remove(device_id);
+        }
+    }
+
     /// Rebuild the key set from the device registry.
     ///
-    /// Called at relay start and whenever a device is paired, re-paired or
-    /// revoked, so the change takes effect without restarting the relay. A
-    /// device that leaves the registry loses its key here and can no longer sign.
+    /// Called at relay start, and then on a timer, so the change takes effect
+    /// without restarting the relay. A device that leaves the registry loses
+    /// its key here and can no longer sign.
+    ///
+    /// The timer is a floor, not the mechanism for correctness. A *revoke* is
+    /// applied synchronously by [`Self::forget`], which the revoke path calls
+    /// directly: since `handlers::peer_secret` falls back to this registry, a
+    /// device left in it for even one refresh interval would still be both
+    /// routable and trusted, and would keep receiving broadcasts it was
+    /// unpaired five seconds ago. Pair and re-pair are also covered
+    /// immediately, because a device that has just paired has no route key yet
+    /// and so is not addressable until the next refresh — which is a
+    /// missing-frame window, not a disclosure, and is left to the timer.
     pub async fn refresh(&self) -> Result<usize, String> {
         let mut keys = StaticRouteKeys::new();
+        let mut secrets = std::collections::HashMap::new();
 
         keys.insert(self.local_device_id.clone(), self.own_route_key()?.to_vec());
 
@@ -192,9 +300,24 @@ impl DeviceRouteKeys {
                 device.id.clone(),
                 derive_route_key(&secret, &device.id).to_vec(),
             );
+            // Kept alongside the derived key so the app can still seal for this
+            // device after its LAN socket closes and `SyncEngine` forgets it.
+            secrets.insert(device.id.clone(), device.shared_secret.clone());
         }
 
         let count = keys.len();
+        // Published in this order deliberately: `secrets` first, then `keys`.
+        //
+        // `routable_device_ids()` reads `keys` and `secret_for` reads `secrets`,
+        // and the egress uses both — enumerate a target, then seal for it. If
+        // `keys` went first, a reader landing between the two writes would see a
+        // device in the recipient set whose secret is not published yet, and
+        // `seal_for_device` would take its no-secret path and put the frame on
+        // the wire in **plaintext**. This order makes the transient state the
+        // safe one: a target whose secret is missing is simply never named,
+        // because `refresh` builds both maps from the same rows in one pass, so
+        // `keys ⊆ secrets` holds at every observable moment.
+        *self.secrets.write().map_err(|_| "secret lock poisoned")? = secrets;
         *self.keys.write().map_err(|_| "route key lock poisoned")? = keys;
         Ok(count)
     }
@@ -208,7 +331,7 @@ impl RouteKeys for DeviceRouteKeys {
     }
 
     fn device_ids(&self) -> Vec<String> {
-        self.keys.read().map(|k| k.device_ids()).unwrap_or_default()
+        self.routable_device_ids()
     }
 }
 
@@ -382,7 +505,10 @@ impl RelayHost {
     /// Pairing changes reach this through the registry rather than a callback:
     /// a re-pair, a revoke and a device that arrives over the LAN WebSocket all
     /// just write the table, and polling is the one thing that cannot miss any of
-    /// them. A revoked device stops being routable within [`KEY_REFRESH_INTERVAL`].
+    /// them. A revoked device stops being routable *immediately* — the revoke path
+    /// calls [`DeviceRouteKeys::forget`] rather than waiting for this — so this
+    /// poll is the backstop for the events nothing calls directly, not the
+    /// revocation mechanism.
     async fn spawn_key_refresh(&self) {
         let keys = self.route_keys.clone();
         let task = tokio::spawn(async move {

@@ -437,16 +437,21 @@ and `flutter` commands from their own component directory.
 
 | Suite | Working directory | Command | Current result |
 |---|---|---|---|
-| Relay | repository root | `cargo test -p conduit-relay` | 187 passed, 0 failed, plus 2 doctests |
-| Protocol | repository root | `cargo test -p conduit-protocol` | 275 passed, 0 failed |
-| Desktop Rust | repository root | `cargo test -p conduit` | 724 passed, 0 failed. Needs the vendored OpenSSL. |
+| Relay | repository root | `cargo test -p conduit-relay` | 247 passed, 0 failed, 1 ignored, plus 2 doctests |
+| Protocol | repository root | `cargo test -p conduit-protocol` | 281 passed, 0 failed, plus 1 doctest |
+| Desktop Rust | repository root | `cargo test -p conduit` | 817 passed, 0 failed. Needs the vendored OpenSSL. |
 | Desktop typecheck | `apps/desktop` | `npx tsc --noEmit` | exit 0 |
-| Desktop unit | `apps/desktop` | `npm test` | 222 passed, 20 files |
+| Desktop unit | `apps/desktop` | `npm test` | 249 passed, 22 files |
 | Desktop e2e | `apps/desktop` | `npm run test:e2e` | Playwright against a plain browser. Tauri IPC is unavailable, so it covers the shell and nothing behind it. |
-| Mobile unit | `apps/mobile` | `flutter test` | 87 passed |
-| Mobile analyze | `apps/mobile` | `dart analyze --fatal-infos` | 362 lint infos, 0 errors, 0 warnings. Exits non-zero because `--fatal-infos` treats infos as fatal, which is why the CI step is non-blocking. Plain `dart analyze` exits 0. |
+| Mobile unit | `apps/mobile` | `flutter test` | 194 passed |
+| Mobile analyze | `apps/mobile` | `dart analyze --fatal-infos` | 370 lint infos, 0 errors, 0 warnings. Exits non-zero because `--fatal-infos` treats infos as fatal, which is why the CI step is non-blocking. Plain `dart analyze` exits 0. |
 | Rust format | repository root | `cargo fmt --all -- --check` | clean |
 | Mobile integration | `apps/mobile` | `flutter test integration_test` | needs a connected device or a running emulator |
+
+Every figure in this table was re-measured. All of them were wrong before: the
+`0.1.0` release figures (187 / 275 / 724 / 222 / 87 / 362) had been carried here
+unchanged through three commits that added tests, and the relay row also omits
+the one `#[ignore]`d fixture generator.
 
 The coverage is not uniform, and the gaps are worth stating plainly rather
 than reading a green run as more than it is:

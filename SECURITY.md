@@ -39,6 +39,92 @@ What this project explicitly does **not** defend against, by design:
   [ADR 0005](docs/decisions/0005-same-user-local-access-is-not-a-boundary.md).
 - **A compromised operating system, or a keyboard logger.**
 - **Traffic analysis.** The existence and timing of messages is not hidden.
+- **Disclosure to anyone who reads the pairing code.** A pairing code — the QR
+  image, or the six characters a person reads aloud — is a bearer credential for
+  the whole relationship, and it is worth being blunt about what that now yields.
+  A peer that presents it becomes **a paired device**: trusted for every message
+  type the hub serves, including the whole automation surface and every user-facing
+  settings gate, and able to receive everything a paired device receives.
+  It also learns the **relay bearer token**, because the desktop delivers the
+  relay's address, token and certificate pin in `pairing/accept` — that delivery
+  is strictly downstream of a successful pairing, which requires a valid,
+  unexpired, single-use token and consumes it, so the token cannot be harvested
+  by guessing. The relay token matters because it is the way to reach the hub
+  from outside the local network.
+
+  This widening is inherent to hosting the relay in the same app that pairs
+  devices, and it is bounded in three specific ways:
+
+  - The relay token authenticates a **connection**, not a sender. Routing a frame
+    additionally requires a signature under the **sender's own route key**,
+    derived from that device's pairing secret and bound to its device id, so a
+    token holder cannot route as anyone else and cannot forge a frame as the
+    desktop. See [ADR 0011](docs/decisions/0011-per-device-relay-route-keys.md).
+  - A peer that reads the code and does not complete pairing is told nothing; the
+    token is delivered on the accept, not on the request.
+  - `relay_url` is always the relay's **TLS** listener and is never a loopback
+    address — a loopback host is refused outright and the field is omitted rather
+    than filled with a syntactically valid value that names the phone from the
+    phone.
+
+  If the pairing code is exposed, the remedy is to unpair the device from the
+  desktop (Settings → General). That deletes its `devices` row and calls
+  `DeviceRouteKeys::forget` synchronously, which is what both halves of its access
+  rest on: with no row it is not in the pairing registry, so it is neither a relay
+  fan-out recipient nor a trusted peer from that moment, and its route key is
+  dropped from the hub's copy immediately — the relay drops it from its own copy
+  at its next refresh, and answers `unknown_device` rather than routing for it.
+  With no row there is also no stored shared secret, so nothing it was sent is
+  decryptable. Rotating the relay token alone would not help against a peer that
+  already paired — which is why unpairing is the right primitive here and not
+  token rotation.
+
+  Protocol-level detail is in
+  [PROTOCOL.md §4.2](packages/protocol/PROTOCOL.md) under *The relay fields*,
+  and the egress that gives a paired device its reach is described below.
+
+## Broadcast scope
+
+The desktop sends **every broadcast it originates to every paired device in its
+registry** — not only to the devices that happen to be connected to it over the
+LAN right now.
+
+That is a real change in exposure and it is worth stating rather than leaving to
+be discovered:
+
+- **The recipient set is the pairing registry, not the set of live sockets.** A
+  phone that paired on the LAN and then walked out of range is still a recipient.
+  "It is not on my network at the moment" no longer implies "it does not get my
+  clipboard, my notifications, my SMS or my call state".
+- **Each recipient's copy is sealed for that recipient**, with that device's own
+  pairing secret, inside its own signed route. The relay forwards opaque
+  envelopes and holds no key material, so it cannot read any of them. The hub
+  still terminates each one — this is the hop encryption described below, not
+  end-to-end encryption, and the hub is a party to every clipboard body and every
+  SMS it forwards.
+- **What does not change:** no *kind* of data became reachable that a paired
+  device could not already obtain by asking. A paired device could always address
+  the hub directly. Fan-out changes who is *told*, not what is *knowable*.
+- **A device that is not `paired` is not a recipient.** The recipient set comes
+  from the pairing registry, and a row whose status is anything else — revoked, or
+  deleted entirely — is not routable at all, so withdrawing a device genuinely
+  withdraws it from every future broadcast. Unpairing takes effect **synchronously**
+  (`WsServer::disconnect_client` calls `DeviceRouteKeys::forget` directly rather
+  than waiting for the registry's 5 s refresh), because the same registry is the
+  fallback the auth gate reads — so a revoked device is not merely unroutable, it
+  is untrusted, from the moment the revoke lands. The relay keeps its **own** copy
+  of the key set and refreshes that on its own schedule, so for up to 5 s it will
+  still accept a route signed by a device this hub has already revoked.
+- **No device is served twice.** A device that is on the LAN *and* joined to the
+  relay — which is what a network transition looks like — is served by one path
+  only. Duplicated notifications are a nuisance; duplicated file chunks corrupt a
+  transfer.
+- **The hub gained a pre-auth-adjacent egress.** Routing a *refusal* back to a
+  peer that has no local socket means the desktop will sign and encrypt on behalf
+  of an id it is otherwise refusing. That path is gated on the same trust
+  predicate as the authentication gate, so an id that is not a paired device gets
+  no signed route — otherwise "you are not paired" would be a cheap way to make
+  the hub mint one per refused frame.
 
 ## Encryption — please read this before relying on it
 
@@ -133,6 +219,60 @@ passing:
   nothing
 - `e2e_client_cannot_forge_route_claiming_another_from_device_id`
 - `spki_extraction_matches_openssl_byte_for_byte`
+
+Added with the relay fan-out, because each of these is a control that the change
+could have removed:
+
+- `a_relay_only_frame_is_sealed_and_never_routed_in_the_clear` — a frame routed
+  to a device with **no local socket** must still be sealed for that device. This
+  is the one that matters most: the recipient set is the pairing registry, so the
+  secrets it needs are not in the map the egress used to read them from, and the
+  failure mode is cleartext.
+- `the_fan_out_recipient_set_is_exactly_the_routable_devices` — the recipient set
+  is the routing table and nothing else, so an unpaired device, a revoked one and
+  an id a peer made up are all unnameable. It replaced an earlier test that
+  asserted the `refresh()` `status != "paired"` filter, which `relay.rs`'s own
+  `an_unpaired_or_revoked_device_cannot_route` already pins against the real
+  registry; restating it in the fan-out suite tested the fixture.
+- `an_oversized_broadcast_is_refused_before_it_can_kill_the_relay_leg` — a paired
+  peer can pad `sms`, `call`, `clipboard` or a `file` control frame to any size,
+  because `validate_message` closes no field set for those types. Sealing
+  hex-encodes the payload, so an oversized frame crosses the relay's 1 MiB read
+  ceiling — and crossing that ceiling **closes the connection** rather than
+  dropping one frame, taking every relay-only peer offline for a reconnect
+  backoff. The fan-out refuses anything over 256 KiB. Closing the field sets is
+  the better fix and is still open (`REMAINING_WORK.md` W3.31).
+- `a_refusal_for_an_unknown_id_is_not_given_a_signed_relay_route` — routing a
+  refusal must not become a pre-auth signing oracle. `send_error` is reachable
+  from `not_authenticated`, so without this gate a stranger could make the hub
+  mint a signed, encrypted route per refused frame by sending junk.
+- `the_desktop_is_never_its_own_relay_fan_out_recipient` and
+  `a_device_with_both_a_socket_and_a_relay_route_is_served_once` — the first is
+  an amplification loop (the relay delivers a self-addressed route straight
+  back and it fans out again, multiplicatively, until the queue fills); the
+  second is duplicate delivery of file chunks, which corrupts a transfer.
+- `one_relay_peer_exhausting_its_budget_does_not_throttle_another` — relayed
+  frames are metered per authenticated sender. Before this the path was not
+  metered at all, so this asserts both halves of the fix.
+- `a_relayed_binary_frame_is_charged_to_the_transport_budget` — a relayed v2
+  frame names its recipient and not its sender, so the transport budget is the
+  only one available to it; it previously had none. This one is a **guard, not a
+  regression test**: the charge happens inside the relay read loop, that loop
+  needs a live WebSocket, so the accounting was extracted into
+  `admit_relay_binary` to be reachable — and a test on the extracted function
+  passes whether or not the loop calls it. It is listed here because the property
+  is a security control, not because it would catch the call site being deleted.
+- `answer_channel_still_answers_sockets_only` — pins that the socket lookup was
+  deliberately *not* widened. "This map cannot reach a relay-only device" is
+  still true and is not the bug; routing around it is.
+
+Two of the controls above have **no** test, and both are named in
+`REMAINING_WORK.md`: `DeviceRouteKeys::forget`, which makes a revoke take effect
+immediately instead of at the next 5 s registry refresh (W3.29 — with the
+`peer_secret` fallback, the stale window was a trust window, not a routing one),
+and the order in which `refresh` publishes its two maps, `secrets` before `keys`,
+which is what keeps a concurrent reader from seeing a routable device whose secret
+is not yet published (W3.30).
 
 If you change any of these and they start failing, that is a finding, not a test
 to update.

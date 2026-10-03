@@ -26,14 +26,14 @@ common source of "command not found" / "no such package" in this project.
 # repository root
 cargo test -p conduit-protocol     # 281 passed, 0 failed, plus 1 doctest
 cargo test -p conduit-relay        # 247 passed, 0 failed, 1 ignored, plus 2 doctests
-cargo test -p conduit              # 799 passed, 0 failed
+cargo test -p conduit              # 817 passed, 0 failed
 ```
 
 | Crate | `-p` name | Working directory | Result |
 |---|---|---|---|
 | `packages/protocol` | `conduit-protocol` | repository root | 281 passed, 0 failed, plus 1 doctest |
 | `services/relay` | `conduit-relay` | repository root | 247 passed, 0 failed, 1 ignored, plus 2 doctests |
-| `apps/desktop/src-tauri` | `conduit` | repository root | 799 passed, 0 failed |
+| `apps/desktop/src-tauri` | `conduit` | repository root | 817 passed, 0 failed |
 
 `cargo test -p conduit` requires the vendored OpenSSL — see
 [DEVELOPMENT.md §3](DEVELOPMENT.md#3-the-vendored-openssl-problem).
@@ -73,8 +73,8 @@ and a typecheck disagree.
 
 ```bash
 # apps/mobile
-flutter test                        # 190 passed
-dart analyze                       # 0 errors, 0 warnings (366 infos)
+flutter test                        # 194 passed
+dart analyze                       # 0 errors, 0 warnings (370 infos)
 dart format --output=none --set-exit-if-changed lib test integration_test
 flutter test integration_test       # needs a device or running emulator
 ```
@@ -177,19 +177,19 @@ rather than module by module; the doc comment at the top of `suite.rs` says so.
 module beside the code it exercises, for the cases where reaching through the
 suite would hide what is actually being tested. The desktop crate is
 `conduit-relay`'s only consumer,
-and it hosts the relay in-process — `src/relay.rs` has its own 16 tests for the
+and it hosts the relay in-process — `src/relay.rs` has its own 27 tests for the
 `Overrides` it builds and the `RouteKeys` it implements — but those live in the
 `conduit` crate, not here, so nothing in `conduit-relay`'s own suite exercises
 the crate the way that consumer does. See §3.
 
-### `conduit` (desktop Rust) — 799 tests, all passing
+### `conduit` (desktop Rust) — 817 tests, all passing
 
 Test count per module, as reported by `cargo test -p conduit -- --list`
-(799 total):
+(817 total):
 
 | Module | Tests | What it protects |
 |---|---|---|
-| `src/server/` | 227 | 145 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 82 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, **the authentication boundary**) |
+| `src/server/` | 244 | 158 in `server/handlers/*` (per-message-type handler behaviour, see §4) + 86 in `server/mod.rs` (connection lifecycle, pairing gates, broadcast filtering, protocol-version enforcement, the relay fan-out, its metering and its size ceiling, **the authentication boundary**) |
 | `src/commands/` | 123 | Every Tauri command, via `tauri::test::mock_builder` |
 | `src/automation.rs` | 104 | Rule evaluation, the shell allowlist gate, trigger dispatch, and **the honest reporting of actions with no implementation** — five of seven actions used to return `success: true` while doing nothing |
 | `src/encryption.rs` | 86 | Key resolution across keyring and 0600 key file, secret reuse, migration back into a recovered keyring |
@@ -203,6 +203,24 @@ Test count per module, as reported by `cargo test -p conduit -- --list`
 | `src/audio.rs` | 3 | Audio stream and playback state |
 | `src/error.rs` | 3 | Error mapping |
 | `src/tray.rs` | 2 | Tray setup |
+
+> The `src/server/` row was **already wrong before** the relay fan-out landed: it
+> read 227, split as "145 in `server/handlers/*` + 82 in `server/mod.rs`". The
+> total was right and the split was not — the handler tree has held 158 and
+> `server/mod.rs` held 69, both measured on the unmodified tree. All 17 of the
+> new tests are in `server/mod.rs`, so that row moved 227 → 244 while the handler
+> row did not move at all. Three of the 17 arrived in the fix round rather than
+> with the fan-out: `the_desktops_own_broadcast_reaches_a_relay_only_peer`,
+> `a_relay_only_senders_binary_frame_is_attributed_to_it` and
+> `an_oversized_broadcast_is_refused_before_it_can_kill_the_relay_leg`. One
+> earlier test was **replaced** rather than added —
+> `an_unpaired_or_revoked_device_is_never_a_fan_out_recipient` asserted a
+> `refresh()` filter that `relay.rs`'s own
+> `an_unpaired_or_revoked_device_cannot_route` already pins against the real
+> registry, so restating it here tested the fixture. It is now
+> `the_fan_out_recipient_set_is_exactly_the_routable_devices`, which asserts the
+> property that is actually load-bearing: the fan-out draws its recipients from
+> the routing table and nothing else.
 
 > The module in `src/main.rs` is **named** `integration_tests`. It is not a
 > Cargo integration test — it is an in-crate `#[cfg(test)]` module with
@@ -254,7 +272,7 @@ project, `chromium`. Its own header comment states the constraint:
 > Tauri IPC calls are not available in the browser environment, so the app
 > must gracefully degrade when `invoke()` fails.
 
-### Mobile — `flutter test`, 190 tests in 26 files
+### Mobile — `flutter test`, 194 tests in 27 test files
 
 All under `apps/mobile/test/`:
 
@@ -262,8 +280,15 @@ All under `apps/mobile/test/`:
 |---|---|
 | `test/screens/` | 13 — one per screen (`automation_rules`, `calls`, `clipboard`, `discovery`, `files`, `home`, `messages`, `notifications`, `pairing`, `remote_input`, `screen_mirror`, `search`, `settings`) |
 | `test/widgets/` | 5 — `ContextMenu`, `EmptyState`, `SearchBar`, `Skeleton`, `StatusBadge` |
-| `test/services/` | 6 — `relay_route`, `websocket_service_relay`, `native_screen_capture`, `ios_screen_capture_contract`, `discovery_service`, `sms_service`, `notification_read_state` |
+| `test/services/` | 8 — `relay_route`, `websocket_service_relay`, `native_screen_capture`, `native_event_channels`, `ios_screen_capture_contract`, `discovery_service`, `sms_service`, `notification_read_state` (plus `native_event_bus.dart`, a shared helper rather than a suite — 9 `.dart` files in the directory) |
 | `test/theme/` | 1 — `theme_provider` |
+
+> The counts in this table were **already stale before** the relay fix: the
+> directory has held 8 service suites, and the old row said "6" while listing
+> seven names. `websocket_service_relay_test.dart` gained a group covering what
+> the phone does with a frame the relay pushes *at* it — unwrap, decrypt,
+> dispatch, and surface a routed `error` — which is the first coverage of that
+> direction from this side.
 
 The service layer is no longer bare. The largest gap — that nothing tested the
 WebSocket path — is now partly closed by
@@ -320,21 +345,26 @@ tests stop.
 
 It is worth being precise about this, because the coverage above is not uniform.
 
-### Every `server/handlers/*.rs` has a populated test module — 145 tests
+### Every `server/handlers/*.rs` has a populated test module — 158 tests
 
 All eight files under `apps/desktop/src-tauri/src/server/handlers/` carry a
 `mod tests` with real tests:
 
 | File | Tests |
 |---|---|
-| `screen_mirror.rs` | 31 |
+| `screen_mirror.rs` | 37 |
 | `remote_input.rs` | 32 |
 | `auto_rules.rs` | 18 |
-| `files.rs` | 18 |
-| `pairing.rs` | 19 |
+| `files.rs` | 23 |
+| `pairing.rs` | 21 |
 | `mod.rs` | 11 |
 | `notifications.rs` | 9 |
 | `audio.rs` | 7 |
+
+`screen_mirror.rs`, `files.rs` and `pairing.rs` were also over-counted or
+under-counted before the relay fix — the table said 31, 18 and 19 against 37, 23
+and 21 measured. Only `remote_input.rs`, `auto_rules.rs`, `mod.rs`,
+`notifications.rs` and `audio.rs` were right.
 
 Every one of those modules was **empty** at one point. That is precisely how a
 set of critical bugs survived: the handler was the only place the bug lived, and
@@ -427,14 +457,56 @@ the mirror: `ws_bind_addr_matches_ws_port`,
 
 ## 5. Test-helper conventions
 
-`src/server/handlers/mod.rs` exposes three constructors for adding a client in
+`src/server/handlers/mod.rs` exposes four constructors for adding a client in
 tests, and they are not interchangeable:
 
 | Helper | Models | Use when |
 |---|---|---|
 | `add_test_unpaired_client` | connected, **no identity** in `ws_to_device_id` | asserting the auth gate rejects something |
 | `add_test_client` | identity registered, shared secret **not yet** derived | the transient state a real connection passes through before `local_auth` |
-| `add_test_paired_client` | fully paired | asserting delivery / broadcast |
+| `add_test_paired_client` | fully paired, **with a socket** | asserting delivery / broadcast |
+| `add_test_relay` | paired in the device registry, **with no socket**, plus a connected relay and a receiver for its egress queue | asserting anything about the relay as a *destination* |
+
+`add_test_relay(ctx, &[(device_id, secret_hex)])` exists because the last row is a
+state none of the first three can build, and picking the wrong one fails in a way
+that looks like a product regression: `add_test_paired_client` also registers a
+connection **and** a `ws_to_device_id` entry, so a relay-only device modelled with
+it is a device that is on the LAN — and the fan-out, the sealing and the refusal
+routing all behave differently for one. It writes a real `devices` row, seeds the
+route keys through the `#[cfg(test)]` registrar
+(`DeviceRouteKeys::register_for_tests`, `relay.rs:216`), and hands back the
+receiving end of the relay queue. Assert on that receiver with
+`only_relay_frame`, which also asserts there is **exactly one** frame — "served
+twice" is the failure a fan-out fix introduces most easily, and a fan-out that
+sends twice is worse than one that sends never, because duplicated file chunks
+corrupt a transfer.
+
+Two things about that fixture are worth knowing before trusting a test that uses
+it.
+
+- **It seeds the keys; it does not call `refresh()`.** `refresh()` reads the
+  **production** OS keyring account `relay_route_key` through
+  `DeviceRouteKeys::own_route_key` (`relay.rs:145`), so a fixture that called it
+  would both mutate the installed app's real signing key and fail outright on a
+  runner with no credential store. The registrar writes the same two maps
+  directly, which keeps every test that models a relay-only peer off the keyring —
+  the same property `create_test_ctx` already has with in-memory SQLite and a
+  random `EncryptionManager`. `refresh()` itself is still tested, in `relay.rs`'s
+  own `mod tests`, where the keyring genuinely is the thing being exercised:
+  `an_unpaired_or_revoked_device_cannot_route` and
+  `a_device_that_is_not_in_the_registry_cannot_route` both call it, alongside four
+  more. So `cargo test -p conduit` as a whole is **not** keyring-free — six tests
+  in that one file are, by design.
+- **It asserts the absence it depends on.** The fixture's whole purpose is a peer
+  with *no* socket here, so it checks that each seeded device has neither a
+  `clients` entry nor a `ws_to_device_id` entry, and fails if that ever stops
+  holding (`handlers/mod.rs:453-462`). Without that check a future edit that
+  quietly gave the fixture device a socket would turn every test using it into a
+  LAN test that passes for the wrong reason.
+
+Seeding the keys is still load-bearing: `create_test_ctx` never populates the
+registry, so without it `routable_device_ids()` is empty and the relay arm is dead
+code in every other test in the file.
 
 This exists because a single original helper had contradictory callers, and a
 test that picks the wrong one fails in a way that looks like a product
@@ -504,12 +576,13 @@ Ordered by the risk each one leaves uncovered. All are also tracked in
 
 | # | Gap | Why it ranks here |
 |---|---|---|
-| 1 | **`src/hooks/useMessageHandlers.ts` has no tests** | This is the desktop's client protocol dispatcher — the direct counterpart to the Rust `server/handlers/*` modules that now have 145 tests. `useWebSocket.tsx` is covered by `src/__tests__/hooks/useWebSocket.test.tsx`, but the handler module next to it is not, so a malformed or mistyped message handler can still fail silently in the UI. |
+| 1 | **`src/hooks/useMessageHandlers.ts` has no tests** | This is the desktop's client protocol dispatcher — the direct counterpart to the Rust `server/handlers/*` modules that now have 158 tests. `useWebSocket.tsx` is covered by `src/__tests__/hooks/useWebSocket.test.tsx`, but the handler module next to it is not, so a malformed or mistyped message handler can still fail silently in the UI. |
 | 2 | **No cross-language conformance test** (`types.rs` ↔ `websocket.ts` ↔ `protocol.dart`) | The only guarantee is codegen discipline. The `codegen` CI job regenerates and runs `git diff --exit-code`, which catches a stale artifact; a real conformance suite that validates the runtime behaviour of both generated clients is still missing. |
 | 3 | **No test exercises real Tauri IPC** | `__mocks__/tauri.ts` returns `undefined` for every command. A richer mock — or a Tauri-driver-based test against a built app — would cover the 123 command tests' actual return shapes. |
-| 4 | **Almost no tests for mobile `lib/services/` (14 files) or `lib/models/` (5 files)** | `test/services/relay_route_test.dart` covers one service; the other 13 and all 5 models have no unit tests. The bulk of `flutter test` is still 13 screens, 5 widget suites and the theme — presentation only. |
-| 5 | **No single-process relay round-trip against a real client** | The relay's own frame tests build input by hand. The end-to-end lifecycle tests assert the wire format a real client depends on, and the desktop crate drives the real `"relay_server"` path, but no single test puts a real encoder on a real socket and runs phone → relay → desktop in one process. That is the gap that let a non-functional relay ship. |
+| 4 | **Most of mobile `lib/services/` (16 files) and all of `lib/models/` (5 files) are untested** | `test/services/` now holds 8 suites covering `relay_route`, `websocket_service` (relay paths), `native_screen_capture`, the native event channels, the iOS capture contract, `discovery_service`, `sms_service` and notification read state. The other 8 services — including `pairing_service`, `file_service`, `encryption_service`, `automation_service` and `database_service` — and all 5 models have no unit tests. The bulk of `flutter test` is still 13 screens, 5 widget suites and the theme: presentation only. |
+| 5 | **No single-process relay round-trip against a real client** | The relay's own frame tests build input by hand. The end-to-end lifecycle tests assert the wire format a real client depends on, and the desktop crate drives the real `"relay_server"` path, but no single test puts a real encoder on a real socket and runs phone → relay → desktop in one process. That is the gap that let a non-functional relay ship. It is now narrower than it was: the desktop side models a relay-only peer with `add_test_relay`, and the phone side has coverage of what arrives *from* a relay, but the two are still separate processes asserting against independently hand-built envelopes. |
 | 6 | ~~**No certificate-pinning tests**~~ — **closed** | The SPKI pin is now computed and asserted on both sides against a shared fixture, cross-checked against `openssl` on the Rust side. This is the test whose absence let the mobile client hash `cert.der` for a year. A live TLS handshake through the mobile client still needs a device. |
 | 7 | **No Rust integration tests** (no `tests/` directory) | Every Rust test is an in-crate unit test. Crate-level behaviour — the public API as a consumer sees it, and the `conduit-protocol` → `conduit` / `conduit-relay` boundary — has no coverage. |
 | 8 | **Playwright cannot reach Tauri** | Structural, not fixable without a Tauri-aware harness. Documented so nobody reads a green Playwright run as backend coverage. |
 | 9 | **`dart format` is checked but non-blocking; 63 of 74 files unformatted** | Both `scripts/lint-all.ps1` and the CI `flutter` job run the check and neither fails on it. Mechanical to fix, but until one does, every Dart diff carries unrelated churn. |
+| 10 | **Three relay controls have no test of their own** | `DeviceRouteKeys::forget` — the synchronous revocation that makes a revoke take effect now rather than at the next 5 s refresh (`REMAINING_WORK.md` W3.29); the `file_accept_disabled` refusal on the relay-only path, where `handlers/files.rs` used a bare `clients.get` that never matched a device id (W3.27); and the order in which `refresh` publishes its two maps, `secrets` before `keys`, which is what stops a concurrent reader from seeing a routable device whose secret is not published and taking the plaintext egress (W3.30). The first two are short tests and are simply missing; the third is not observable from outside without a hook between the two writes, so it is documented on the code instead. `relay.rs`'s 27 tests pin the `refresh()` `status` filter, which is a different property from all three. |

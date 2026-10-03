@@ -1433,6 +1433,75 @@ hashed are the bytes the verifier reconstructs.
   per device to `MAX_NONCES_PER_DEVICE`, never globally.
 * A refusal is answered with `replay_detected`.
 
+##### 4.15.2.4 A fan-out is N routes, and that is visible in two places
+
+There is **no group, broadcast or multicast construct**. When one peer addresses
+every paired device it knows about, the desktop emits one complete
+`relay_route` per recipient: separately signed under the sender's own route key,
+separately timestamped and nonced, and sealed for each recipient wherever sealing
+applies (§6.4 — so a `pairing` payload still goes in the clear, which is what
+lets a peer derive the secret it is about to be handed). **Nothing on the wire
+distinguishes that from N unrelated directed sends**, and a client cannot tell
+from a single route whether it was part of a fan-out.
+
+Two consequences *are* observable, and both are per route rather than per
+broadcast:
+
+* **Nonce quota.** Each route spends one entry of the **sender's**
+  `MAX_NONCES_PER_DEVICE` (4096) budget independently, so a fan-out to five
+  devices costs five. This cannot damage another device's replay protection —
+  eviction is oldest-first within the sender's own queue, and a device still
+  under quota is never a victim of the process-wide `MAX_NONCES` ceiling — but a
+  sender that fans out heavily consumes its own quota faster than one that does
+  not, and once at quota it begins evicting its own oldest in-window nonces.
+* **Size ceiling.** Each route is an independent frame and is independently
+  subject to `MAX_TEXT_SIZE` (§2.5). There is no aggregate budget for a
+  broadcast, and an over-size message is refused by the relay **once per route**
+  rather than once per broadcast — so a sender sees N `message_too_large`
+  answers for one logical message. Because sealing is length-preserving and the
+  only per-recipient variation is the length of a device id, a message that fits
+  for one recipient fits for all of them. The desktop hub does not rely on that:
+  because sealing hex-encodes the payload, it declines to build **any** route for
+  a broadcast whose plaintext exceeds 256 KiB
+  (`apps/desktop/src-tauri/src/server/mod.rs:1459`), so a hub-originated fan-out
+  cannot reach the ceiling in the first place. The N-answers case is therefore one
+  a *client* can produce — the phone applies no such bound of its own.
+
+#### `relay_delivery`
+
+Relay → client. The envelope the relay forwards a verified payload in, and the
+only shape in which a routed message ever reaches a client. It is produced **only
+by the relay**, and only after `handle_relay_route` has returned `Ok` — that is,
+after the signature verified under the sender's own route key and the signed
+`from_device_id` matched the identity `relay_auth` established on this
+connection.
+
+```json
+{
+  "type": "relay_delivery",
+  "from_device_id": "a1b2c3d4e5f6a7b8",
+  "to_device_id": "b2c3d4e5f6a7b8c9",
+  "payload": { "type": "encrypted", "nonce": "...", "hmac": "...", "data": "..." }
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `type` | string | yes | Always `"relay_delivery"`. |
+| `from_device_id` | string | **yes** | The device the relay authenticated on the **sending** connection. Not a sender-chosen claim, and not overridable by any `source_device` inside `payload`. |
+| `to_device_id` | string | no | The device this delivery is addressed to. Carried so a recipient can reject a misroute before parsing `payload`. |
+| `payload` | object | **yes** | The forwarded message, verbatim. Normally an `encrypted` envelope (§4.16). |
+
+**It is deliberately not signed.** It carries no `hmac` and needs none: the
+attribution in it is the relay's statement about a connection the relay itself
+authenticated, so a client that could mint one could only be asserting something
+the relay never verified. A recipient that trusts `from_device_id` from anywhere
+other than a `relay_delivery` is trusting a self-report.
+
+The consequence for clients is that **every** message routed to you arrives in
+this envelope, whatever its type — including a refusal. See §9.2 item 8 for
+handling `error` here, and §8.1 for the codes the hub emits inside it.
+
 ---
 
 ### 4.16 Encrypted Envelope
@@ -1785,7 +1854,7 @@ code as a generic failure rather than a protocol violation.
 | `unsupported_protocol_version` | `protocol_version` greater than 1 |
 | `invalid_message` | Failed `security::validate_message`: unknown `type`, bad field bounds, or a field the handler does not read |
 | `not_authenticated` | Any non-`pairing`/`ping`/`pong` message from a connection that is not a trusted peer — including `discovery` |
-| `rate_limited` | Per-message-type rate limit exceeded for this connection |
+| `rate_limited` | Per-message-type rate limit exceeded **for the sending device**, not for the connection. The budget is keyed on the device id, so a relayed frame is charged against the sender the relay authenticated (`apps/desktop/src-tauri/src/server/mod.rs:866`) and lands in the same bucket whether that device sent it over its LAN socket or through the relay. A device with both transports is charged once per frame, not once per transport. |
 | `command_not_allowed` | `automation/rule`, `automation/sync` or `automation/triggered` would run a shell command that is not on the allowlist |
 | `unknown_action` | Unrecognised `automation` action |
 | `unsupported_message` | `type` is protocol-valid but has no handler on the desktop — includes `tv`, `watch`, and an inbound `pairing/revoke` |
@@ -1895,25 +1964,48 @@ is intended — the old forms are the vulnerability the change fixed.
    reserved for the **relay's** certificate rather than the hub's. When they are
    absent — which is normal — keep whatever relay configuration you already had
    and carry on; absence is not an error and must not clear a working relay.
+8. **Handle `error` inside `relay_delivery`, not only at the top level.** The
+   relay wraps **every** payload it forwards, so a refusal addressed to you
+   arrives as `relay_delivery` → `payload`, not as a bare `error` frame — and it
+   may arrive **sealed or in the clear**, because `pairing` is exempt from sealing
+   (§6.4) and nothing else is, so which shape carries a given refusal depends on
+   what the refusal is about. Attribute the frame to the envelope's
+   `from_device_id`, never to a `source_device` inside the payload (§4.16), and
+   surface `code` and `message`. A client that only handles a top-level `error`
+   discards every refusal routed to it, and from the far end that is
+   indistinguishable from a dropped connection: the peer is being throttled or
+   refused while still reporting itself connected.
 
 ### 9.3 Known gaps
 
 Documented, not fixed here:
 
-* **`protocol_version` is not enforced by the relay** (§1.1), so the §9.1
-  changes are not detectable through version negotiation.
-* **The mobile client does not pin correctly.** It hashes the whole DER
-  certificate where the pin is over the SPKI (§2.3), so a pinned phone cannot
-  complete a connection. The desktop has no pin configuration target at all.
-  This is live rather than hypothetical now that the relay runs by default.
 * **`sms/new` and `sms/sent` still have two incompatible shapes** (§4.11).
-* **The mobile client still compares the whole target field against its whole
-  device id** (`websocket_service.dart`, `_handleRelayBinary`). §5.1.5 says the
-  check is against the first 16 bytes of the id, so a frame the relay correctly
-  resolved to the phone is dropped on arrival. The producer side
-  (`relay_route.dart`, `buildBinaryFrame`) already writes the canonical prefix and
-  needs no change.
 * **Mobile-side drift could not be verified** from this crate. The Dart client
   was read only for the port constants that `types.rs` asserts against; whether
   it has adopted the `remote_input/key` message, the `fps` field, or
   `actionType: "move"` is **[unverified]**.
+
+Three bullets that used to be in this list have been removed because they are no
+longer true of the code, not because anyone decided they were unimportant:
+
+* *"`protocol_version` is not enforced by the relay."* It is: read off the raw
+  `Value` before the typed parse (`services/relay/src/connection.rs:937`), because
+  neither `RelayAuth` nor `RelayRoute` declares the field and serde would drop
+  it. A declared value above the relay's own is answered
+  `unsupported_protocol_version` — during auth followed by a close, afterwards
+  the frame alone. See §8.2.
+* *"The mobile client does not pin correctly … the desktop has no pin
+  configuration target at all."* The client computes the pin over the SPKI
+  (`apps/mobile/lib/services/relay_route.dart:516` `extractSpkiDer`, `:617`
+  `computeSpkiPin`), pinned against `openssl` on the Rust side, and the desktop
+  has the `relay_cert_pin` setting, enforced at relay startup and refusing to
+  start on a mismatch (`services/relay/src/service.rs:355`). Two real residual
+  gaps remain and are tracked in `REMAINING_WORK.md` W7.2: the phone re-pins on
+  mismatch during pairing instead of failing, and the desktop's own relay client
+  joins over loopback plaintext.
+* *"The mobile client still compares the whole target field against its whole
+  device id."* It compares against its own canonical field via
+  `binaryTargetMatches` (`apps/mobile/lib/services/websocket_service.dart:899`),
+  the same definition §5.1.4/§5.1.5 gives the relay's router and the desktop
+  receiver.

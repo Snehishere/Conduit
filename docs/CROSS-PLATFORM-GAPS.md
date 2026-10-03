@@ -32,7 +32,7 @@ reported in.
 | **G-R16** — no way to point a phone at a relay | `da66802` (mobile) + follow-up (desktop delivers it at pairing) |
 | **G-R17** — the phone could not produce a real `ping`/`pong` on a relay socket | `da66802` |
 | **B-F3 / G-R3** — the relay could not route a binary frame to anybody | `da66802` (relay + desktop); phone receiver in the follow-up |
-| **B-F4** — `handle_lan_chunk` looked a device id up in a client-id-keyed map | `da66802` (covered by the target-field work + tests) |
+| **B-F4** — `handle_lan_chunk` looked a device id up in a client-id-keyed map | `da66802` — **that closure claim was wrong**; see the second B-F4 row below |
 | **C-F9** — no `error` handler on the phone | `da66802` |
 | **D-F1** — `relay_enabled` defaulted to off; a fresh install never started the relay | `da66802` |
 | **D-F4** — the clipboard history table was never written | `da66802` |
@@ -40,6 +40,18 @@ reported in.
 | **G-R8** — directed frames were not sealed on the relay egress | `da66802` |
 | **E-F1** — three EventChannel subscribers shared one channel name, so two were dead | `da66802` |
 | **Global limiter double-charge** — ~5 msg/s ceiling on all types | follow-up commit |
+| **G-R9** — no fan-out handler reached a relay-only peer; the relay socket is an `mpsc::Sender`, not a `ctx.clients` entry | uncommitted |
+| **G-R9's egress half** — the relay egress read the recipient's secret from a *liveness* map, so every frame routed to a socket-less device went out in the clear | uncommitted |
+| **G-R11** — corrected: relayed frames were charged **no count and no bytes** by anyone, not a shared `"relay_server"` bucket | uncommitted |
+| **B-F1, second half** — `send_error` wrote nothing for a peer with no socket, so every refusal aimed at a relay-only device was looked up, missed and dropped | uncommitted |
+| **B-F4** — `handle_lan_chunk` looked a device id up in a connection-keyed map and dropped every relayed binary chunk, *after* the relay had verified its tag | uncommitted |
+| **The phone discarded a routed `error`** — `_handleMessage` had no `error` arm on the `relay_delivery` path, so a refusal sent through the relay was received and silently dropped | uncommitted |
+| **A revoked device stayed routable *and* trusted for up to 5 s** — the route-key registry refreshes on a timer, and the `peer_secret` fallback had just made it an authority for the auth gate | uncommitted |
+| **The registry could publish a device as routable before its secret** — `keys` was written before `secrets`, so a reader in between took `seal_for_device`'s plaintext path | uncommitted |
+| **One padded broadcast could close the relay leg** — the fan-out had no size ceiling, sealing doubles the size, and crossing the relay's 1 MiB read ceiling closes the connection rather than dropping a frame | uncommitted |
+| **A declined file request told a relay-only sender nothing** — `handle_file_request` resolved the `file_accept_disabled` refusal with a bare `clients.get`, which never matches a device id | uncommitted |
+| **A relayed binary chunk was refused one layer above the chunk path** — `unwrap_relay_binary_frame` enumerated candidate senders from `SyncEngine`, a liveness map, so a relay-only sender's frame never reached the id resolution | uncommitted |
+| **`build_sealed_route` substituted `Value::Null`** on an unparseable payload; the relay would have forwarded it and counted it as `messages_routed` | uncommitted |
 
 ### Refuted or corrected before any code was written
 
@@ -62,14 +74,61 @@ reported in.
   the current Flutter template (deployment target 15.0). So §F's "three
   independent reasons" is the accurate count, not four.
 
+### Corrected during the fix round — the audit's mechanism was wrong
+
+One finding in this document was **half wrong in a way that made it look less bad,
+not more**: it named a mechanism the code never had, and the real defect was the
+opposite shape. The finding row in §G is left as the historical record.
+
+- **G-R11 — the shared `"relay_server"` bucket never existed.** The row says
+  *"All phones behind the relay share **one** rate-limit bucket keyed on the
+  literal `"relay_server"`"*, and infers a cross-phone throttle from it.
+  `admit_frame` has exactly one caller — `handle_client`, the LAN reader
+  (`server/mod.rs:527`) — and the relay read loop calls `handle_message`
+  directly (`server/mod.rs:1760` → `:790`). So no `"relay_server"` bucket was
+  ever created: **relayed frames were charged no count and no bytes** by the
+  transport limiter, by any phone, at all. The per-type limiter was already
+  per-device, because the same re-entry dispatches under the sender
+  (`server/mod.rs:878` → `:1069`), so one phone could not throttle another —
+  and neither could be throttled. `max_bytes`, the field
+  `security::RateLimitConfig` documents as "the budget that bounds CPU", did not
+  exist on this path. The consequence for the fix is recorded on the code:
+  charging per sender is **strictly more** accounting than before, not a
+  repartition of an existing charge (`server/mod.rs:838-864`).
+
 ### Still open
 
 Everything else in this document, plus the items listed at the end. The largest
 remaining are the ones no single boundary could see: **iOS cannot build or
 launch** (three independent blockers), **`remote_input` into the phone is
-unreachable on both platforms**, **screen capture and remote input into the
-desktop are broken on Linux**, and **all phones behind a relay share one
-rate-limit bucket**.
+unreachable on both platforms**, and **screen capture and remote input into the
+desktop are broken on Linux**.
+
+The relay is in better shape than this section used to say, and the residual is
+narrower than "phones behind it are unaccounted for". What is left there:
+
+- **A _directed_ request to a relay-only device still needs a socket to resolve
+  against.** `fan_out_to_relay` covers frames the desktop originates; a
+  `screen_mirror/start` addressed to an off-LAN phone is still refused with
+  `capture_stopped`, because `resolve_target_client` reads `ws_to_device_id`
+  (`handlers/screen_mirror.rs:106`, pinned by
+  `known_gap_a_relay_only_target_cannot_be_asked_to_start`).
+- **Two listeners in one process still want TCP 9531** (G-R1) — a portability
+  risk on Linux/macOS, not a live bug on Windows.
+- **Four unfiltered fan-out loops on the LAN path are untouched** (B-F5):
+  `handlers/audio.rs:45-50`, `:69-74` and `:153-160` push live system-audio PCM,
+  and `handlers/files.rs:197-203` broadcasts a `file/request`, to every entry in
+  `ctx.clients` without the pairing filter. The relay arm does not touch these,
+  so the plaintext-leak class they represent is untouched on both transports.
+- **`validate_message` still closes no field set for the types that fan out.**
+  `sms`, `call`, `screen_mirror` and `remote_input` have no validation arm at all
+  (`security.rs:748-750`), and `clipboard`, `notification` and every `file`
+  action bound the fields they know without ever calling `reject_unknown_fields`.
+  A paired peer can therefore pad any of them arbitrarily. The relay fan-out now
+  refuses anything over 256 KiB, which bounds the shared leg — but the guard is
+  downstream of the gap, not a replacement for it, and the same padded frame
+  still reaches every paired socket on the LAN. The fix is tracked as
+  `REMAINING_WORK.md` W3.31's *Left to do*.
 
 ## How to read this
 
@@ -634,8 +693,9 @@ callback on API 34) and H-F31 (Wayland `Enigo::new` error-vs-no-op).
 
 ## What is worth doing next
 
-The first six items below are **done**. What remains, in dependency order —
-because several of the rest are one root cause wearing different clothes.
+Items 2 and 5 below are **done** — see the `Fixed` table and the correction
+above. What remains, in dependency order — because several of the rest are one
+root cause wearing different clothes.
 
 1. **iOS cannot build or launch.** Three independent blockers: the pbxproj has no
    `PBXNativeTarget` (a stub someone wrote and committed — one commit has ever
@@ -647,10 +707,12 @@ because several of the rest are one root cause wearing different clothes.
    `NEHotspotNetwork` availability error for free. **This is the single largest
    block of functionality in the project and none of it is subtle once you know
    to look.**
-2. **All phones behind a relay share one rate-limit bucket** (G-R11), keyed on
-   the literal `"relay_server"`. One relayed file transfer throttles every other
-   phone's relayed traffic. Needs a per-device key, which means the relay must
-   attribute the frame before it spends the budget.
+2. ~~**All phones behind a relay share one rate-limit bucket** (G-R11)~~ —
+   **done, and the stated mechanism was wrong.** There was no shared bucket;
+   relayed frames were charged nothing by anyone. They are now charged against
+   the authenticated **sender's** device id, with the transport budget reserved
+   for frames no device can be named for. One peer can no longer throttle
+   another, and a peer's frames can no longer go unaccounted.
 3. **`remote_input` into the phone is unreachable on both platforms** (E-F5,
    F-F13). On Android the accessibility service is declared but nothing ever
    walks the user to enabling it; on iOS there is no public injection API at all.
@@ -658,14 +720,14 @@ because several of the rest are one root cause wearing different clothes.
 4. **Screen capture and remote input into the desktop are broken on Linux**
    (H-F31, H-F32): `xcap` is X11-only, and `Enigo::new(...).unwrap()` *panics*
    inside the tokio task on Wayland.
-5. **A relay-only peer cannot be told why it was refused** (G-R11 follow-up). A
-   device with no local socket has nowhere to receive an `error` frame, so
-   `PROTOCOL.md` §8.3's "relay-side limiting is silent" is currently accurate by
-   necessity rather than by choice. Routing refusals back is a protocol change.
+5. ~~**A relay-only peer cannot be told why it was refused**~~ — **done, and it
+   was never a protocol change.** `relay_route.payload` is an arbitrary JSON
+   message and the relay forwards it without inspecting it, so an `error` was
+   always legal to route; the route simply was not being taken.
 6. **The structural finding** (top of this document). Nothing enforces agreement
    between the four representations, which is why three rounds of fixes produced
    ~40 findings. Wiring the generated Dart model up, or deleting it and admitting
-  there are three representations, would stop the class recurring.
+   there are three representations, would stop the class recurring.
 
 Two things are *not* worth doing, and the reasons are recorded above: narrowing
 `is_desktop_executable` (trades five false successes for seven), and simply

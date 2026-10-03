@@ -849,4 +849,162 @@ void main() {
       expect(delivered.length, 1, reason: 'delivered over LAN, unwrapped');
     });
   });
+
+  // What the phone does with a frame the *relay* pushes at it.
+  //
+  // Every other group in this file is about what leaves the phone. This one is
+  // about what arrives, and it exists because that direction had no coverage at
+  // all: outbound signing, inbound v2 binary frames, ping/pong and
+  // `relay_auth_rejected` were all pinned, and the `relay_delivery` envelope
+  // — the shape the relay actually delivers — was not. So the two properties the
+  // desktop's fan-out and refusal-routing depend on were both untested from this
+  // side.
+  group('what the phone does with a relayed frame', () {
+    /// Wrap [payload] the way the relay does, after verifying a route.
+    ///
+    /// Built by hand rather than by importing the Rust shape, for the same
+    /// reason `_relayCanonical` is: the relay re-serialises and re-wraps on its
+    /// way through, so the only useful oracle is an independent statement of the
+    /// envelope's shape.
+    Map<String, dynamic> relayDelivery(
+      Map<String, dynamic> payload, {
+      String fromId = hubId,
+    }) {
+      return <String, dynamic>{
+        'type': 'relay_delivery',
+        'from_device_id': fromId,
+        'to_device_id': phoneId,
+        'payload': payload,
+      };
+    }
+
+    /// Seal [message] for this phone, the way the desktop's relay egress does.
+    Future<Map<String, dynamic>> sealed(Map<String, dynamic> message) async {
+      final secret = EncryptionService.hexToBytes(vectorSecret);
+      // `encrypt` takes the plaintext as a String and does its own UTF-8
+      // encoding, exactly as the phone's own egress path does; passing bytes
+      // would need `encryptBinary` instead, which is the same call one level
+      // down.
+      final (nonce, ciphertext) =
+          await EncryptionService().encrypt(secret, jsonEncode(message));
+      final dataHex = hexEncode(ciphertext);
+      return <String, dynamic>{
+        'type': 'encrypted',
+        'nonce': hexEncode(nonce),
+        'hmac': EncryptionService.generateHmac(secret, dataHex),
+        'data': dataHex,
+        'source_device': hubId,
+      };
+    }
+
+    test('unwraps, decrypts and dispatches a relayed clipboard sync',
+        () async {
+      // This is the desktop's fan-out, end to end from the far end: one sealed
+      // clipboard body inside a relay delivery. If this regresses, a phone
+      // behind the relay silently stops receiving clipboards — which is exactly
+      // what it did, with no error anywhere.
+      final received = Completer<Map<String, dynamic>>();
+      service.registerHandler('clipboard', (message) {
+        if (message['action'] == 'sync' && !received.isCompleted) {
+          received.complete(message);
+        }
+      });
+
+      await peer.send(
+        relayDelivery(
+          await sealed(<String, dynamic>{
+            'type': 'clipboard',
+            'action': 'sync',
+            'content': 'pasted on the desktop',
+            'mime': 'text/plain',
+          }),
+        ),
+      );
+
+      final message = await received.future.timeout(const Duration(seconds: 5));
+      expect(message['content'], 'pasted on the desktop');
+    });
+
+    test('surfaces a refusal the desktop routed back through the relay',
+        () async {
+      // The relay wraps every payload it forwards, so a refusal addressed to this
+      // phone arrives as `relay_delivery` → decrypt → dispatch — not as the bare
+      // `error` frame the socket-level listener handles. There was no arm for it
+      // on that path, so a phone behind the relay was throttled, refused and
+      // told nothing: no screen, no log, and it still reported itself connected.
+      final seen = service.lastError;
+      expect(seen, isNull, reason: 'nothing has been refused yet');
+
+      await peer.send(
+        relayDelivery(
+          await sealed(<String, dynamic>{
+            'type': 'error',
+            'code': 'rate_limited',
+            'message': "Rate limit exceeded for message type 'clipboard'",
+          }),
+        ),
+      );
+
+      await _until(() => service.lastError != null);
+      expect(
+        service.lastError,
+        contains('rate_limited'),
+        reason: 'the peer must be told why it was refused, not left guessing',
+      );
+    });
+
+    test('surfaces an unsealed refusal too — pairing is never wrapped',
+        () async {
+      // `pairing` is exempt from sealing because it is what establishes the
+      // secret, so a refusal about pairing arrives unwrapped. Both shapes have to
+      // work, and only the sealed one goes through the decrypt path.
+      await peer.send(
+        relayDelivery(<String, dynamic>{
+          'type': 'error',
+          'code': 'not_authenticated',
+          'message': 'Device must complete pairing',
+        }),
+      );
+
+      await _until(() => service.lastError != null);
+      expect(service.lastError, contains('not_authenticated'));
+    });
+
+    test('attributes the frame to the sender the relay authenticated',
+        () async {
+      // Not the self-reported `source_device` inside the payload: that is
+      // attacker-influenced and is exactly what the envelope's own field exists
+      // to override.
+      final received = Completer<void>();
+      service.registerHandler('clipboard', (_) {
+        if (!received.isCompleted) received.complete();
+      });
+
+      await peer.send(
+        relayDelivery(
+          await sealed(<String, dynamic>{
+            'type': 'clipboard',
+            'action': 'sync',
+            'content': 'x',
+            'source_device': 'somebody-else',
+          }),
+          fromId: hubId,
+        ),
+      );
+      await received.future.timeout(const Duration(seconds: 5));
+
+      expect(service.relayPeerDeviceId, hubId);
+    });
+  });
+}
+
+/// Poll until [condition] holds, so a test does not depend on how many event
+/// turns the decrypt-and-dispatch path needs.
+Future<void> _until(bool Function() condition) async {
+  final deadline = DateTime.now().add(const Duration(seconds: 5));
+  while (DateTime.now().isBefore(deadline)) {
+    if (condition()) return;
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+  }
+  fail('condition did not hold within 5s');
 }

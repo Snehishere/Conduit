@@ -85,9 +85,9 @@ nothing to overlap and the ring is complexity in search of a problem.
 
    | Device | Source of its route key |
    |---|---|
-   | A paired phone | `derive_route_key(device.shared_secret, device.id)`, from the `devices` row, recomputed on every refresh (`DeviceRouteKeys::refresh`, `relay.rs:161-201`). Only `status == "paired"` rows are registered. |
-   | The desktop itself | Generated once as 32 random bytes and kept in the OS keyring under account **`relay_route_key`** (`relay.rs:54`, `:130-144`). It has no pairing with itself, so there is no secret to derive from. |
-   | The bearer token | Generated once and kept in the OS keyring under account **`relay_token`** (`relay.rs:48`, `:417-426`). Never configured by hand. |
+   | A paired phone | `derive_route_key(device.shared_secret, device.id)`, from the `devices` row, recomputed on every refresh (`DeviceRouteKeys::refresh`, `relay.rs:258-313`). Only `status == "paired"` rows are registered. |
+   | The desktop itself | Generated once as 32 random bytes and kept in the OS keyring under account **`relay_route_key`** (`relay.rs:54`, `:145-159`). It has no pairing with itself, so there is no secret to derive from. |
+   | The bearer token | Generated once and kept in the OS keyring under account **`relay_token`** (`relay.rs:48`, `:691-700`). Never configured by hand. |
 
    Both credentials live beside the SQLCipher key and the X25519 identity under
    service `conduit_app`, and are covered by the same
@@ -109,12 +109,24 @@ nothing to overlap and the ring is complexity in search of a problem.
 rather than by a follow-up comparison. A stolen relay token yields a connection
 that can be authenticated but cannot forge a route, because the token is not in
 the verification path at all. Revocation becomes real: revoking or unpairing a
-device drops its key within `KEY_REFRESH_INTERVAL` (5 s) via the refresh task
-(`relay.rs:79`, `:364-381`), and no key is ever accepted in a second slot
-alongside its replacement. There is no operator to provision a key, no `.env`
-to get wrong, and no deployment where the host and the relay can disagree about
-secrets. And the host is the only party that holds keys, so the desktop's own
-route key is derived, stored and re-derived in exactly one place.
+device drops its key from the host's registry **synchronously**
+(`DeviceRouteKeys::forget`, `relay.rs:244-251`, called from
+`WsServer::disconnect_client`, `server/mod.rs:1843`), and the relay's own copy
+follows at the next `KEY_REFRESH_INTERVAL` (5 s) via the refresh task
+(`relay.rs:79`, `:499-516`), after which it answers `unknown_device`. No key is
+ever accepted in a second slot alongside its replacement. There is no operator to
+provision a key, no `.env` to get wrong, and no deployment where the host and the
+relay can disagree about secrets. And the host is the only party that holds keys,
+so the desktop's own route key is derived, stored and re-derived in exactly one
+place.
+
+> **The synchronous half was added after this record was written**, and it is
+> load-bearing rather than tidy. The host's registry doubles as the fallback tier
+> of `handlers::peer_secret`, which is what the auth gate reads, so its staleness
+> became a trust window: without `forget`, a revoked device stayed both routable
+> and trusted for up to `KEY_REFRESH_INTERVAL`. The immediate part is the host's;
+> the relay's copy is on the relay's own schedule and is not something the host
+> can shorten from this process.
 
 **Unwelcome, and carried over from ADR-0004: this is still a breaking wire
 change.** A client that signs with anything else is rejected, and there is no

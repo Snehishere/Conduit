@@ -224,7 +224,7 @@ deliberately **not** inheritable from the environment.
 ```bash
 # repository root
 cargo build -p conduit
-cargo test  -p conduit               # 799 tests: all passing
+cargo test  -p conduit               # 817 tests: all passing
 cargo clippy -p conduit -- -D warnings
 ```
 
@@ -532,7 +532,7 @@ binary frame layout.
    # repository root
    cargo test -p conduit-protocol
    cargo test -p conduit-relay
-   cargo test -p conduit          # 799 tests, all passing
+   cargo test -p conduit          # 817 tests, all passing
    cd apps/desktop && npx tsc --noEmit && npm test
    cd apps/mobile && flutter test && dart analyze --fatal-infos
    ```

@@ -11,7 +11,101 @@ source tree, and the entries describe what the code in this tree does. Read
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+#### A broadcast now reaches a phone that is only behind the relay
+
+- Every frame the desktop fans out — clipboard, notifications, SMS, calls,
+  discovery and removal, and every file-transfer control frame — is now also sent
+  to each paired device with **no socket on this machine**, as one signed and
+  sealed `relay_route` per recipient. The fan-out previously walked local
+  connections only, and the relay connection is not one of those, so a
+  relay-only phone received nothing from any of those handlers and failed
+  silently: iterating an empty set looks exactly like success.
+- The recipient set is the pairing registry, not the set of connected devices. A
+  phone that paired on the LAN and then walked out of range is still paired while
+  being absent from the latter, which is the case this feature exists for.
+- Each recipient's copy is sealed for that device with its own shared secret. The
+  relay egress previously read that secret from the connected-device map, which
+  does not contain off-LAN devices — so a clipboard body or SMS routed to one
+  would have gone out in the clear.
+- A device that is on the LAN *and* joined to the relay — what a network
+  transition looks like — is served once, not twice. The desktop is never its own
+  relay recipient.
+- A relayed refusal, a relayed `pong`, and a relayed clipboard body all arrive at
+  the phone as `relay_delivery` → decrypt → dispatch, which the mobile client
+  now handles; it previously handled only a bare `error` on the socket and
+  silently dropped the same frame when it arrived wrapped.
+
+#### A device behind the relay is told when it is refused
+
+- Rate limits, invalid messages, failed authentication, refused settings and
+  `pong` are now answered to a device that has no local socket, by routing the
+  `error` back through the relay. Previously every refusal aimed at such a device
+  was looked up in the local connection table, missed, and was discarded — so the
+  peer was refused and never told why, which from the far end is
+  indistinguishable from a dropped connection.
+- This is **not** a protocol change. A routed payload is an arbitrary JSON
+  message and the relay forwards it without inspecting it, so an `error` was
+  always legal to route; the route simply was not being taken.
+
+#### Relayed traffic is rate-limited, and relayed file chunks arrive
+
+- A relayed frame is charged to the **sending device's** budget, once. The relay
+  connection never passed through the limiter at all, so relayed traffic was
+  charged neither a count nor a byte, by any device. Frames that name no trusted
+  sender are charged to the relay connection instead, so an unauthenticated peer
+  cannot obtain unlimited free parse attempts.
+- Relayed binary frames are charged to the relay connection's budget. A v2 frame
+  names its recipient rather than its sender, so the transport is the only budget
+  available to it, and it previously had none.
+- A relayed binary file chunk is no longer discarded. Two separate defects sat on
+  that path: the receiver looked the sender's device id up in a map keyed by
+  connection id and missed, and the unwrapper that has to name the sender first
+  drew its candidates from that same connection-liveness map, so a relay-only
+  sender was refused one layer above the delivery — after the relay had already
+  verified the tag.
+- The desktop now answers "what secret do I encrypt for this device" in one
+  place, instead of five call sites reading a connection-liveness map as though
+  it were a trust registry.
+
+#### Defects the fan-out introduced, and one it exposed
+
+- **Unpairing takes effect immediately.** The route-key registry refreshes on a
+  5 s timer, and making it the fallback the authentication gate reads turned that
+  into a trust window rather than a routing detail: a revoked device stayed both
+  routable and trusted for up to five seconds, so `pairing/accept`'s copy kept
+  delivering clipboard and notification bodies to a phone the user had just
+  unpaired. `disconnect_client` now clears the registry synchronously. The relay
+  keeps its own copy of the key set and refreshes that on its own schedule.
+- **The registry publishes its two maps in a safe order.** A reader landing
+  between the two writes could previously see a device in the recipient set whose
+  pairing secret was not yet published, and the egress would have put that frame
+  on the wire in plaintext. Secrets are now published before route keys, so the
+  only reachable intermediate state is a device that is simply never named.
+- **An oversized broadcast no longer takes the relay down.** Sealing hex-encodes
+  the payload, and the relay's read ceiling is 1 MiB — and crossing that ceiling
+  closes the connection rather than dropping one frame. A paired peer could send
+  a multi-megabyte `sms`, `call`, `clipboard` or `file` frame (those types close
+  no field set in validation) and take every relay-only peer offline for a
+  reconnect backoff. The fan-out now refuses anything over 256 KiB. The
+  validation gap itself is still open.
+- **A declined file request now reaches a relay-only sender.** With
+  `auto_accept_files` off, the `file_accept_disabled` refusal was looked up in
+  the local connection table using a *device* id, never matched, and dropped — so
+  a phone behind the relay pushing a file was declined and told nothing, while
+  waiting for an ack that now arrives.
+- **A relay route that cannot be built is refused rather than sent empty.** The
+  route builder substituted a null payload on a parse failure, which the relay
+  would have forwarded and counted as delivered, and the recipient would have
+  dropped. It now declines to build the route.
+
+### Changed
+
+- Test counts re-measured rather than carried over: `conduit` 799 → 817,
+  `conduit-relay` 247 (1 ignored) plus 2 doctests, `conduit-protocol` 281 plus 1
+  doctest, desktop frontend 249 across 22 files, mobile 190 → 194, and
+  `flutter analyze` 370 infos with no errors and no warnings.
 
 ## [0.1.0] - 2026-09-28
 

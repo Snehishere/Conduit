@@ -22,6 +22,28 @@ async fn unwrap_relay_binary_frame(
     bytes: &[u8],
     ctx: &WsContext,
 ) -> Result<(String, Vec<u8>), String> {
+    unwrap_relay_binary_frame_inner(bytes, ctx).await
+}
+
+/// The attribution step, exposed for tests.
+///
+/// `handle_binary_message` folds this into the chunk path, so a failure there is
+/// indistinguishable from a decrypt or an assembly failure. This is the seam
+/// where a relay-only sender used to be refused outright — the candidate set was
+/// `SyncEngine`, which does not contain a device that has no socket — and it
+/// needs a test of its own to say so.
+#[cfg(test)]
+pub(crate) async fn unwrap_relay_binary_frame_for_tests(
+    bytes: &[u8],
+    ctx: &WsContext,
+) -> Result<(String, Vec<u8>), String> {
+    unwrap_relay_binary_frame_inner(bytes, ctx).await
+}
+
+async fn unwrap_relay_binary_frame_inner(
+    bytes: &[u8],
+    ctx: &WsContext,
+) -> Result<(String, Vec<u8>), String> {
     if bytes.len() < BINARY_HEADER_LEN {
         return Err(format!(
             "frame is {} bytes; v2 requires at least {BINARY_HEADER_LEN}",
@@ -68,18 +90,27 @@ async fn unwrap_relay_binary_frame(
     //
     // Trying candidates is safe precisely because the sender id is inside the MAC
     // input: a frame from `dev_b` cannot verify under `dev_a`'s key.
-    let candidates: Vec<String> = {
-        let engine = ctx.sync_engine.read().await;
-        engine
-            .get_all_client_ids()
-            .into_iter()
-            .filter(|id| {
-                engine
-                    .get_client(id)
-                    .is_some_and(|c| !c.shared_secret.is_empty())
-            })
-            .collect()
-    };
+    // The candidate set is the **pairing registry**, not `SyncEngine`.
+    //
+    // `SyncEngine` is a liveness map — `handle_client` drops a device from it
+    // when its LAN socket closes — so it does not contain a phone that paired on
+    // the LAN and then moved networks. Enumerating it here meant the frame was
+    // refused with "no paired device to attribute this frame to" one layer
+    // *before* `handle_lan_chunk`, so the id-resolution fix below never ran for
+    // exactly the sender it was written for.
+    //
+    // The registry is the right set on its own terms too: these are the devices
+    // whose route keys the relay will verify, and the loop below skips any id
+    // with no key, so it cannot widen what is accepted.
+    //
+    // This desktop's own id is excluded because it is registered too, and a frame
+    // signed by this desktop is not something arriving from a phone.
+    let candidates: Vec<String> = ctx
+        .route_keys
+        .routable_device_ids()
+        .into_iter()
+        .filter(|id| id != ctx.device_id.as_str())
+        .collect();
     if candidates.is_empty() {
         return Err("no paired device to attribute this frame to".to_string());
     }
@@ -134,10 +165,11 @@ pub async fn handle_file_request(msg: Value, client_id: &str, ctx: &WsContext) {
             server_version: Some(PROTOCOL_VERSION),
         };
         let err = serde_json::to_string(&err).expect("ErrorMessage serializes");
-        let clients_lock = ctx.clients.read().await;
-        if let Some(tx) = clients_lock.get(client_id) {
-            let _ = tx.send(err);
-        }
+        // `send_error`, not a bare `clients.get(client_id)`. `client_id` is a
+        // **device** id for a relayed sender, so this lookup never matched and
+        // the phone was told nothing — the same defect as the dispatcher's other
+        // refusals, on the one path where the peer is actively waiting for an ack.
+        crate::server::send_error_to(ctx, client_id, &err).await;
         return;
     }
 
@@ -204,16 +236,30 @@ pub async fn handle_binary_message(bytes: Vec<u8>, client_id: &str, ctx: &WsCont
 
 /// A LAN chunk envelope: nonce, metadata, ciphertext.
 async fn handle_lan_chunk(bytes: Vec<u8>, client_id: &str, ctx: &WsContext) {
+    // `client_id` is a **connection** id on the LAN and a **device** id when the
+    // frame was relayed in. Resolving the connection id through the pairing
+    // registry and then falling back to the id itself handles both, and is the
+    // same one-line resolution `persist_inbound_clipboard` and
+    // `handle_status_update` use.
+    //
+    // It used to be `.unwrap_or_default()`, which is `""` — so for a relay-only
+    // sender, the one device this whole mechanism exists for, the lookup missed,
+    // the secret came back `None`, and the chunk was dropped *after* the relay
+    // had verified its tag. The text path got this right
+    // (`unwrap_relay_binary_frame` returns the authenticated device id and
+    // `resolve_sender_secret` has an explicit relayed tier); the binary path
+    // threw that id away and re-resolved it against a connection-keyed map.
     let stable_id = ctx
         .ws_to_device_id
         .read()
         .await
         .get(client_id)
         .cloned()
-        .unwrap_or_default();
-    let shared_secret = if let Some(client) = ctx.sync_engine.read().await.get_client(&stable_id) {
-        client.shared_secret.clone()
-    } else {
+        .unwrap_or_else(|| client_id.to_string());
+    // `peer_secret` rather than `SyncEngine`, for the same reason the egress
+    // uses it: a paired device whose LAN socket has closed is absent from a
+    // liveness map and still perfectly able to decrypt what we send it.
+    let Some(shared_secret) = super::peer_secret(ctx, &stable_id).await else {
         warn!(
             "Received binary message but no shared secret found for {}",
             client_id

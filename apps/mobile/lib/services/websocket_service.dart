@@ -1229,6 +1229,32 @@ class WebSocketService extends ChangeNotifier {
       }
     }
 
+    // A refusal that arrived *through* the relay, as opposed to on the socket.
+    //
+    // The socket-level listener intercepts a bare `type == 'error'` and returns,
+    // so a LAN peer is already handled before it reaches here, and the two are
+    // mutually exclusive rather than overlapping — the outer check short-circuits,
+    // so a frame like this is surfaced exactly once. But the relay wraps every
+    // payload it forwards, so the outer type is `relay_delivery` and the
+    // socket-level check never sees it: a refusal the desktop routes back to this
+    // device arrives as `relay_delivery` → unwrap → this function. This function
+    // had no arm for it, so it was silently dropped, and a phone behind the relay
+    // was refused with nothing on screen and nothing in the log — which is
+    // indistinguishable from a dropped connection.
+    //
+    // Placed here because this is the single funnel every *inner* message passes
+    // through: `_handleAttributed` for an unwrapped relayed payload and
+    // `_handleEncrypted` for a sealed one. An arm in either would cover one path
+    // and quietly miss the other, and both are live — the desktop seals its
+    // ordinary outbound traffic (everything except `pairing`), so a refusal
+    // arrives through `_handleEncrypted`, while a `pairing`-adjacent refusal is
+    // exempt from sealing and arrives through `_handleAttributed`. Only a
+    // funnel-wide arm is right.
+    if (type == 'error') {
+      _handlePeerError(message);
+      return;
+    }
+
     final handlers = _messageHandlers[type];
     if (type != null && handlers != null) {
       for (final h in List<MessageHandler>.from(handlers)) {
