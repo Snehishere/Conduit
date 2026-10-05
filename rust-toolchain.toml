@@ -4,6 +4,6 @@
 # .tools/openssl-win64, and `cargo update` on a different toolchain can
 # silently change the musl/glibc baseline that SQLCipher links against.
 [toolchain]
-channel = "1.98"
+channel = "1.99"
 components = ["rustfmt", "clippy"]
 profile = "minimal"
