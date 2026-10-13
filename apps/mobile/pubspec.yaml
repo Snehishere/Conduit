@@ -24,7 +24,7 @@ dependencies:
   sqflite_sqlcipher: ^3.4.1
   shared_preferences: ^2.2.0
   flutter_secure_storage: ^11.2.0
-  record: ^7.1.1
+  record: ^7.1.2
   just_audio: ^0.10.6
   audio_session: ^0.2.4
   mobile_scanner: ^7.4.2
